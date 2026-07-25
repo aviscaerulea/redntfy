@@ -1,4 +1,4 @@
-# redmntfy
+# rdmntfy
 
 Redmine の更新チケットを Windows Toast 通知で知らせ、未処理チケットをシステムトレイから一覧できる軽量常駐アプリ。
 
@@ -25,7 +25,7 @@ Redmine の更新チケットを Windows Toast 通知で知らせ、未処理チ
 
 ## インストール方法
 
-任意フォルダで zip を展開して redmntfy.exe を実行。
+任意フォルダで zip を展開して rdmntfy.exe を実行。
 
 ## 使用方法
 
@@ -33,7 +33,7 @@ Redmine の更新チケットを Windows Toast 通知で知らせ、未処理チ
    - 特定プロジェクト配下で保存したクエリは API から参照できないため、必ずグローバルクエリとして作成する
    - 保存後の URL `/issues?query_id=N` の `N` を控える
 2. Redmine の「個人設定」→「API アクセスキー」でキーを取得する
-3. exe 同フォルダに `redmntfy.local.toml` を作成して接続情報を記載する
+3. exe 同フォルダに `rdmntfy.local.toml` を作成して接続情報を記載する
 
    ```toml
    [redmine]
@@ -42,10 +42,10 @@ Redmine の更新チケットを Windows Toast 通知で知らせ、未処理チ
    query_id = 12
    ```
 
-4. redmntfy.exe を起動する
+4. rdmntfy.exe を起動する
 
-動作設定は exe 同フォルダの `redmntfy.toml` を参照。
-`redmntfy.local.toml` を置くと同名キーをキー単位で上書きできる。（接続情報はこちらに書く）
+動作設定は exe 同フォルダの `rdmntfy.toml` を参照。
+`rdmntfy.local.toml` を置くと同名キーをキー単位で上書きできる。（接続情報はこちらに書く）
 検知済み状態は `state.json`、ピン留めは `pins.json` に保存され、再起動しても保持される。
 
 ## ビルド方法
@@ -53,7 +53,7 @@ Redmine の更新チケットを Windows Toast 通知で知らせ、未処理チ
 Visual Studio Build Tools、vcpkg、go-task、PowerShell 7、git が必要。
 
 ```powershell
-task build      # 通常ビルド（out/redmntfy.exe）
+task build      # 通常ビルド（out/rdmntfy.exe）
 task release    # リリースビルドと zip 作成
 ```
 

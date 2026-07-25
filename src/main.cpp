@@ -1,8 +1,8 @@
 // vi: ts=4 sw=4 ff=unix fenc=utf-8
 /**
- * redmntfy - Redmine の更新チケットを Windows Toast 通知で知らせる常駐アプリ
+ * rdmntfy - Redmine の更新チケットを Windows Toast 通知で知らせる常駐アプリ
  *
- * exe 同フォルダの redmntfy.toml（redmntfy.local.toml がキー単位で上書き）から設定を読み込み、
+ * exe 同フォルダの rdmntfy.toml（rdmntfy.local.toml がキー単位で上書き）から設定を読み込み、
  * [redmine] で指定したグローバル保存クエリ（query_id）を schedule に従ってポーリングする。
  * schedule は 0 時〜23 時の 24 要素配列。（回/時、0 でその時間帯は休止）
  * 追跡集合への新規流入と既知チケットの updated_on 進行を Toast 通知と音声で知らせる。
@@ -82,7 +82,7 @@
 #include "version.h"  // ビルド時生成（APP_VERSION を定義）
 
 // アプリケーション識別子（Toast 通知に使用）
-static const wchar_t* APP_AUMID = L"com.redmntfy";
+static const wchar_t* APP_AUMID = L"com.rdmntfy";
 
 // エラー時のリトライ待機時間（ミリ秒）
 static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
@@ -101,9 +101,9 @@ static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリ
 static constexpr UINT IDM_OPEN_QUERY          = 40009; // Redmine の保存クエリ画面を開く
 static constexpr UINT IDM_STARTUP             = 40010; // Windows スタートアップ登録トグル
 
-static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/redmntfy";
-static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/redmntfy/releases";
-static constexpr wchar_t GITHUB_API_RELEASES_LATEST[] = L"https://api.github.com/repos/aviscaerulea/redmntfy/releases/latest";
+static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/rdmntfy";
+static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/rdmntfy/releases";
+static constexpr wchar_t GITHUB_API_RELEASES_LATEST[] = L"https://api.github.com/repos/aviscaerulea/rdmntfy/releases/latest";
 
 // 左クリック一覧のチケット項目（IDM_ISSUE_BASE + index で最大 50 件）
 static constexpr UINT IDM_ISSUE_BASE = 41000;
@@ -133,8 +133,8 @@ static constexpr ULONGLONG STALE_POLL_THRESHOLD_MS = 3'600'000ULL;
 static constexpr wchar_t NO_ISSUES[] = L"チケットはありません";
 
 // 設定ファイル名（exe 同フォルダ。local が同名キーをキー単位で上書きする）
-static constexpr wchar_t CONFIG_FILENAME[]       = L"redmntfy.toml";
-static constexpr wchar_t CONFIG_LOCAL_FILENAME[] = L"redmntfy.local.toml";
+static constexpr wchar_t CONFIG_FILENAME[]       = L"rdmntfy.toml";
+static constexpr wchar_t CONFIG_LOCAL_FILENAME[] = L"rdmntfy.local.toml";
 
 // 検知済み状態の永続化ファイル名（exe 同フォルダに保存）
 static constexpr wchar_t STATE_FILENAME[] = L"state.json";
@@ -458,7 +458,7 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
     const std::wstring& authHeader, DWORD* outStatusCode = nullptr)
 {
     if (outStatusCode) *outStatusCode = 0;
-    HINTERNET hSession = WinHttpOpen(L"redmntfy/1.0",
+    HINTERNET hSession = WinHttpOpen(L"rdmntfy/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return "";
@@ -757,7 +757,7 @@ static std::optional<std::vector<int>> readSchedule(const std::optional<toml::ta
     return sched;
 }
 
-// redmntfy.toml と redmntfy.local.toml を読み込んで Config を構築する
+// rdmntfy.toml と rdmntfy.local.toml を読み込んで Config を構築する
 //
 // local.toml のキーが優先。（キー単位でオーバーライド）
 // 配列は「local にキーが存在するか」で採否を決める。（空配列でも local を採用）
@@ -765,7 +765,7 @@ static std::optional<std::vector<int>> readSchedule(const std::optional<toml::ta
 static Config loadConfig(const std::wstring& exeDir) {
     auto base  = loadToml(exeDir + L"\\" + CONFIG_FILENAME);
     auto local = loadToml(exeDir + L"\\" + CONFIG_LOCAL_FILENAME);
-    if (local) writeLog("Loaded redmntfy.local.toml (override active)");
+    if (local) writeLog("Loaded rdmntfy.local.toml (override active)");
 
     // duck_targets 配列の読み込み（キーが存在する側を採用。local 優先）
     auto readDuckTargets = [&](const std::optional<toml::table>& tbl)
@@ -1118,14 +1118,14 @@ static void unduckAudioSessions(std::vector<winrt::com_ptr<ISimpleAudioVolume>>&
 // ==================== レジストリ設定 ====================
 
 // レジストリパス（ユーザー設定の永続化先）
-static constexpr const wchar_t* REG_KEY_PATH        = L"SOFTWARE\\redmntfy";
+static constexpr const wchar_t* REG_KEY_PATH        = L"SOFTWARE\\rdmntfy";
 static constexpr const wchar_t* REG_SOUND_ENABLED     = L"SoundEnabled";
 static constexpr const wchar_t* REG_MUTE_IN_MEETING   = L"MuteInMeeting";
 static constexpr const wchar_t* REG_NOTIFIED_VERSION  = L"NotifiedUpdateVersion";
 
 // Windows スタートアップ登録用レジストリ（HKCU Run キー）
 static constexpr const wchar_t* REG_RUN_KEY_PATH    = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-static constexpr const wchar_t* REG_RUN_VALUE_NAME  = L"redmntfy";
+static constexpr const wchar_t* REG_RUN_VALUE_NAME  = L"rdmntfy";
 
 // レジストリ DWORD 値の読み取り
 // キーまたは値が存在しない場合は defaultVal を返す
@@ -1184,7 +1184,7 @@ static void writeRegString(const wchar_t* valueName, const std::wstring& value) 
 }
 
 // スタートアップ登録の有無判定
-// HKCU Run キーに redmntfy 値が存在すれば登録済みとみなす
+// HKCU Run キーに rdmntfy 値が存在すれば登録済みとみなす
 static bool isStartupRegistered() {
     return RegGetValueW(HKEY_CURRENT_USER, REG_RUN_KEY_PATH, REG_RUN_VALUE_NAME,
         RRF_RT_REG_SZ, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
@@ -1212,7 +1212,7 @@ static void registerStartup() {
 }
 
 // スタートアップ登録を解除
-// HKCU Run キーから redmntfy 値を削除する。値が存在しない場合はエラーを無視
+// HKCU Run キーから rdmntfy 値を削除する。値が存在しない場合はエラーを無視
 static void unregisterStartup() {
     HKEY hKey = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY_PATH, 0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) {
@@ -1774,7 +1774,7 @@ static void ensureShortcut() {
     if (!GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH)) return;
 
     std::wstring linkPath = std::wstring(appData)
-        + L"\\Microsoft\\Windows\\Start Menu\\Programs\\redmntfy.lnk";
+        + L"\\Microsoft\\Windows\\Start Menu\\Programs\\rdmntfy.lnk";
 
     if (GetFileAttributesW(linkPath.c_str()) != INVALID_FILE_ATTRIBUTES) return;
 
@@ -2299,7 +2299,7 @@ static void checkForUpdates() {
 
 // 更新通知メニュー項目のサイズを計算する
 static BOOL measureVersionMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
-    std::wstring prefix = std::wstring(L"Redmntfy v") + APP_VERSION + L" → ";
+    std::wstring prefix = std::wstring(L"Rdmntfy v") + APP_VERSION + L" → ";
     std::wstring latest;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
@@ -2325,7 +2325,7 @@ static BOOL measureVersionMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
 // 更新通知メニュー項目を描画する
 // プレフィックス部分を通常色、新バージョン部分を赤色で描く
 static BOOL drawVersionMenuItem(DRAWITEMSTRUCT* dis) {
-    std::wstring prefix = std::wstring(L"Redmntfy v") + APP_VERSION + L" → ";
+    std::wstring prefix = std::wstring(L"Rdmntfy v") + APP_VERSION + L" → ";
     std::wstring latest;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
@@ -2375,7 +2375,7 @@ static void showTrayContextMenu(HWND hWnd) {
         return;
     }
     if (g_updateAvailable.load()) {
-        // 新版あり：オーナードローで "Redmntfy vX.Y.Z → vNew" を赤文字で表示する
+        // 新版あり：オーナードローで "Rdmntfy vX.Y.Z → vNew" を赤文字で表示する
         MENUITEMINFOW mii = { sizeof(mii) };
         mii.fMask = MIIM_FTYPE | MIIM_ID;
         mii.fType = MFT_OWNERDRAW;
@@ -2383,7 +2383,7 @@ static void showTrayContextMenu(HWND hWnd) {
         InsertMenuItemW(hMenu, 0, TRUE, &mii);
     }
     else {
-        AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"Redmntfy v" APP_VERSION);
+        AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"Rdmntfy v" APP_VERSION);
     }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
@@ -2701,9 +2701,9 @@ static HWND createTrayWindow() {
     wc.cbSize        = sizeof(wc);
     wc.lpfnWndProc   = trayWndProc;
     wc.hInstance     = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"redmntfy_tray";
+    wc.lpszClassName = L"rdmntfy_tray";
     RegisterClassExW(&wc);
-    return CreateWindowExW(0, L"redmntfy_tray", nullptr, 0,
+    return CreateWindowExW(0, L"rdmntfy_tray", nullptr, 0,
         0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
 }
 
@@ -2980,14 +2980,14 @@ int wmain() {
     // 多重起動制御（新プロセス優先）
     // 名前付き Job Object で旧プロセスをまとめて終了させる。
     // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE により hJob は閉じずプロセス終了まで保持する。
-    HANDLE hJob = CreateJobObjectW(nullptr, L"Local\\redmntfy_job");
+    HANDLE hJob = CreateJobObjectW(nullptr, L"Local\\rdmntfy_job");
     if (hJob && GetLastError() == ERROR_ALREADY_EXISTS) {
         writeLog("terminating previous instance");
         TerminateJobObject(hJob, 0);
         CloseHandle(hJob);
         // カーネルが Job Object 名を解放するまで待機
         Sleep(100);
-        hJob = CreateJobObjectW(nullptr, L"Local\\redmntfy_job");
+        hJob = CreateJobObjectW(nullptr, L"Local\\rdmntfy_job");
         // 旧プロセスがまだ終了していない場合の競合対策（警告のみで続行）
         if (hJob && GetLastError() == ERROR_ALREADY_EXISTS) {
             writeLog("warning: previous instance still alive");
@@ -3033,10 +3033,10 @@ int wmain() {
         // http(s) 以外が ShellExecuteW に渡らないことを保証する
         if (cfg.redmineUrl.empty() || !isHttpUrl(cfg.redmineUrl)
             || cfg.apiKey.empty() || cfg.queryId <= 0) {
-            writeLog("config error: [redmine] url (must start with http:// or https://) / api_key / query_id must be set in redmntfy.local.toml");
+            writeLog("config error: [redmine] url (must start with http:// or https://) / api_key / query_id must be set in rdmntfy.local.toml");
             try {
                 showToast(L"設定エラー",
-                          L"redmntfy.local.toml の [redmine] url / api_key / query_id を設定してください",
+                          L"rdmntfy.local.toml の [redmine] url / api_key / query_id を設定してください",
                           L"", false);
             }
             catch (...) {}

@@ -3,7 +3,7 @@ $schema: https://taskfile.dev/schema.json
 version: '3'
 
 vars:
-  APP_NAME: redmntfy
+  APP_NAME: rdmntfy
   VERSION:
     sh: git describe --tags --always --dirty | sed 's/^v//'
   ARCH: x64
@@ -42,7 +42,7 @@ tasks:
         ignore_error: true
 
   build:
-    desc: 通常ビルド（out/redmntfy.exe）
+    desc: 通常ビルド（out/rdmntfy.exe）
     deps: [kill]
     cmds:
       - mkdir -p {{.OUT_DIR}}
