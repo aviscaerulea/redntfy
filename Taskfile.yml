@@ -1,0 +1,71 @@
+# vim: set ft=yaml fenc=utf-8 ff=unix sw=2 ts=2 et :
+$schema: https://taskfile.dev/schema.json
+version: '3'
+
+vars:
+  APP_NAME: redmntfy
+  VERSION:
+    sh: git describe --tags --always --dirty | sed 's/^v//'
+  ARCH: x64
+  OUT_DIR: '{{.OUT_DIR | default "out"}}'
+
+tasks:
+  default:
+    desc: クリーンビルドを実行
+    cmds:
+      - task clean
+      - task build
+
+  kill:
+    desc: 実行中のアプリケーションを強制終了（起動していない場合は無視）
+    cmds:
+      - cmd: taskkill /IM {{.APP_NAME}}.exe /F
+        ignore_error: true
+
+  clean:
+    desc: ビルド成果物を削除
+    deps: [kill]
+    preconditions:
+      - sh: '[ "{{.OUT_DIR}}" != "" ] && [ "{{.OUT_DIR}}" != "/" ]'
+        msg: "OUT_DIR が空、またはルートディレクトリである。"
+    cmds:
+      - rm -rf {{.OUT_DIR}}
+
+  copy-assets:
+    desc: ビルド成果物ディレクトリへのアセットコピー
+    internal: true
+    cmds:
+      - cp {{.APP_NAME}}.toml {{.OUT_DIR}}/
+      - cp src/sound.wav {{.OUT_DIR}}/
+      - cp src/app.ico {{.OUT_DIR}}/
+      - cmd: cp -f *.local.* {{.OUT_DIR}}/
+        ignore_error: true
+
+  build:
+    desc: 通常ビルド（out/redmntfy.exe）
+    deps: [kill]
+    cmds:
+      - mkdir -p {{.OUT_DIR}}
+      - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}}
+      - task: copy-assets
+
+  rebuild:
+    desc: 実行中のバイナリを停止し、クリーンビルドして再起動する
+    cmds:
+      - task: clean
+      - task: build
+      - pwsh.exe -NoProfile -Command "Start-Process '{{.OUT_DIR}}/{{.APP_NAME}}.exe'"
+
+  release:
+    desc: リリースビルド（デバッグ情報なし＋最適化）と zip 作成
+    deps: [clean]
+    cmds:
+      - mkdir -p {{.OUT_DIR}}
+      - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}} -Release
+      - task: copy-assets
+      - >-
+        pwsh -NonInteractive -Command '
+        Compress-Archive
+        -Path out\{{.APP_NAME}}.exe, {{.APP_NAME}}.toml, out\sound.wav, out\app.ico
+        -DestinationPath "out\{{.APP_NAME}}-{{.VERSION}}-{{.ARCH}}.zip"
+        -Force'

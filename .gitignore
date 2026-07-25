@@ -1,0 +1,12 @@
+# ビルド成果物
+out/
+
+# ユーザ環境固有ファイル（*.local.* は環境依存のため全て除外）
+.env
+*.local.*
+**/*.local.*
+
+# git ワークツリー
+.worktrees/
+# Added by code-review-graph
+.code-review-graph/

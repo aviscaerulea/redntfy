@@ -1,0 +1,6 @@
+// vi: ts=4 sw=4 ff=unix fenc=utf-8
+// リソーススクリプト: アイコンをバイナリとして埋め込む
+
+#include "resource.h"
+
+IDI_APP_ICON    ICON    "app.ico"
