@@ -1,8 +1,8 @@
 // vi: ts=4 sw=4 ff=unix fenc=utf-8
 /**
- * rdmntfy - Redmine の更新チケットを Windows Toast 通知で知らせる常駐アプリ
+ * redntfy - Redmine の更新チケットを Windows Toast 通知で知らせる常駐アプリ
  *
- * exe 同フォルダの rdmntfy.toml（rdmntfy.local.toml がキー単位で上書き）から設定を読み込み、
+ * exe 同フォルダの redntfy.toml（redntfy.local.toml がキー単位で上書き）から設定を読み込み、
  * [redmine] で指定したグローバル保存クエリ（query_id）を schedule に従ってポーリングする。
  * schedule は 0 時〜23 時の 24 要素配列。（回/時、0 でその時間帯は休止）
  * 追跡集合への新規流入と既知チケットの updated_on 進行を Toast 通知と音声で知らせる。
@@ -53,6 +53,14 @@
 #include <netioapi.h>
 #pragma comment(lib, "iphlpapi.lib")
 
+// ピンマーカー（📌）のカラー絵文字描画に使う DirectWrite / Direct2D。
+// GDI の DrawTextW はフォントリンクで字形自体は出るが、カラーフォント（Segoe UI Emoji の
+// COLR/CPAL レイヤ）を解釈せず単色になるため、マーカー列だけ D2D で描画する。
+#include <dwrite.h>
+#pragma comment(lib, "dwrite.lib")
+#include <d2d1_1.h>   // ID2D1Factory1 / ID2D1DeviceContext（d2d1.h も取り込まれる）
+#pragma comment(lib, "d2d1.lib")
+
 #include "toml.hpp"
 
 #include <string>
@@ -82,7 +90,7 @@
 #include "version.h"  // ビルド時生成（APP_VERSION を定義）
 
 // アプリケーション識別子（Toast 通知に使用）
-static const wchar_t* APP_AUMID = L"com.rdmntfy";
+static const wchar_t* APP_AUMID = L"com.redntfy";
 
 // エラー時のリトライ待機時間（ミリ秒）
 static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
@@ -100,10 +108,11 @@ static constexpr UINT IDM_OPEN_LOG            = 40007;
 static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリページを開く
 static constexpr UINT IDM_OPEN_QUERY          = 40009; // Redmine の保存クエリ画面を開く
 static constexpr UINT IDM_STARTUP             = 40010; // Windows スタートアップ登録トグル
+static constexpr UINT IDM_ASSIGNED_TO_ME      = 40011; // 担当がグループのチケットを一覧・tooltip・通知から除外するトグル
 
-static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/rdmntfy";
-static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/rdmntfy/releases";
-static constexpr wchar_t GITHUB_API_RELEASES_LATEST[] = L"https://api.github.com/repos/aviscaerulea/rdmntfy/releases/latest";
+static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/redntfy";
+static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/redntfy/releases";
+static constexpr wchar_t GITHUB_API_RELEASES_LATEST[] = L"https://api.github.com/repos/aviscaerulea/redntfy/releases/latest";
 
 // 左クリック一覧のチケット項目（IDM_ISSUE_BASE + index で最大 50 件）
 static constexpr UINT IDM_ISSUE_BASE = 41000;
@@ -133,8 +142,8 @@ static constexpr ULONGLONG STALE_POLL_THRESHOLD_MS = 3'600'000ULL;
 static constexpr wchar_t NO_ISSUES[] = L"チケットはありません";
 
 // 設定ファイル名（exe 同フォルダ。local が同名キーをキー単位で上書きする）
-static constexpr wchar_t CONFIG_FILENAME[]       = L"rdmntfy.toml";
-static constexpr wchar_t CONFIG_LOCAL_FILENAME[] = L"rdmntfy.local.toml";
+static constexpr wchar_t CONFIG_FILENAME[]       = L"redntfy.toml";
+static constexpr wchar_t CONFIG_LOCAL_FILENAME[] = L"redntfy.local.toml";
 
 // 検知済み状態の永続化ファイル名（exe 同フォルダに保存）
 static constexpr wchar_t STATE_FILENAME[] = L"state.json";
@@ -153,6 +162,13 @@ static std::atomic<bool> g_soundEnabled{true};
 
 // マイク/カメラ使用中の音声自動ミュートフラグ（レジストリで永続化）
 static std::atomic<bool> g_muteInMeeting{true};
+
+// 担当者が自分個人のチケットだけを対象とするフラグ（レジストリで永続化、トレイメニュー）
+// グループ担当のチケットを一覧・tooltip・通知から外すためのもの。
+// 取得と state.json は常に全件のまま扱い、表示と通知の直前だけで絞る。
+// 追跡集合そのものを絞ると、OFF に戻したとき state.json に無い id が「新規」と誤検知される。
+// 対価として、ON 中に抑止した更新は state.json に記録済みのため OFF に戻しても再通知されない。
+static std::atomic<bool> g_assignedToMeOnly{false};
 
 // トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングループと通知スレッドが参照）
 static HWND g_hWnd = nullptr;
@@ -183,6 +199,9 @@ struct Issue {
     std::string subject;
     std::string updatedOn;
     int         authorId  = 0;     // 自分の起票を通知対象から外すために保持する
+    int         assignedToId = 0;  // 担当者 id（0 = 未割当）
+                                   // Redmine はユーザとグループが同一 id 空間のため、自分の id と
+                                   // 一致するかを見るだけでグループ担当を弾ける。型の判別は不要。
     bool        closed    = false; // closed_on が非 null（一覧で打ち消し線表示）
 };
 
@@ -236,14 +255,22 @@ static std::vector<PinEntry>   g_pins;     // ピン留め（g_mtx で保護、�
 // ホットリロードしないため、スレッド起動後は全スレッドからロック無しで読み取ってよい）
 static Config                  g_currentConfig;
 
-// 保存クエリの総件数（total_count。tooltip と一覧フッタの表示用）
-static std::atomic<int>        g_totalCount{0};
-
 // 未読件数（前回一覧を開いてから検知した通知対象の累計。一覧を開くと 0 に戻す。永続化しない）
 static std::atomic<int>        g_unreadCount{0};
 
 // 自分の Redmine user id（起動時に /users/current.json で確定。0 = 取得失敗＝自分除外判定なし）
-static int                     g_myUserId = 0;
+// ポーリングスレッドが書き込み、担当者フィルタのため WndProc スレッドも読むので atomic とする。
+static std::atomic<int>        g_myUserId{0};
+
+// 一覧・tooltip・通知に出す対象かを判定する（トレイメニューの「担当がグループのチケットを除外」）
+// user id が未取得（0）の間はフィルタを一時的に無効化して全件通す。判定不能を理由に
+// 一覧が空になる方が実害が大きいため、既存の「判定できないものは通知側に倒す」方針と揃える。
+static bool passesAssigneeFilter(const Issue& is) {
+    int me = g_myUserId.load();
+    if (!g_assignedToMeOnly.load() || me == 0) return true;
+    return is.assignedToId == me;
+}
+
 // トレイアイコンのバッジ状態
 // NIM_MODIFY の無駄な呼び出しを抑制するために直前のバッジ有無を保持する
 static bool                    g_trayBadgeActive  = false;
@@ -458,7 +485,7 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
     const std::wstring& authHeader, DWORD* outStatusCode = nullptr)
 {
     if (outStatusCode) *outStatusCode = 0;
-    HINTERNET hSession = WinHttpOpen(L"rdmntfy/1.0",
+    HINTERNET hSession = WinHttpOpen(L"redntfy/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return "";
@@ -699,6 +726,17 @@ static void savePins(const std::wstring& dir) {
     }
 }
 
+// 件名の全角空白（U+3000、UTF-8 では E3 80 80）を半角空白に置換する
+// Toast と一覧の表示幅を無駄にしないため、取込時点で正規化する。
+static std::string normalizeSubject(std::string s) {
+    size_t pos = 0;
+    while ((pos = s.find("\xE3\x80\x80", pos)) != std::string::npos) {
+        s.replace(pos, 3, " ");
+        ++pos;
+    }
+    return s;
+}
+
 // ピン留めの読み込み
 // 起動時に 1 回呼び出し、PIN_LIMIT 件を上限に g_pins へ復元する。
 // ファイル不在・パースエラー時は何もしない。（ピンなしで開始する）
@@ -715,7 +753,7 @@ static void loadPins(const std::wstring& dir) {
             auto o = item.GetObject();
             PinEntry p;
             p.id        = static_cast<int>(o.GetNamedNumber(L"id", 0));
-            p.subject   = winrt::to_string(o.GetNamedString(L"subject", L""));
+            p.subject   = normalizeSubject(winrt::to_string(o.GetNamedString(L"subject", L"")));
             p.updatedOn = winrt::to_string(o.GetNamedString(L"updated_on", L""));
             p.closed    = o.GetNamedBoolean(L"closed", false);
             if (p.id > 0) g_pins.push_back(std::move(p));
@@ -757,7 +795,7 @@ static std::optional<std::vector<int>> readSchedule(const std::optional<toml::ta
     return sched;
 }
 
-// rdmntfy.toml と rdmntfy.local.toml を読み込んで Config を構築する
+// redntfy.toml と redntfy.local.toml を読み込んで Config を構築する
 //
 // local.toml のキーが優先。（キー単位でオーバーライド）
 // 配列は「local にキーが存在するか」で採否を決める。（空配列でも local を採用）
@@ -765,7 +803,7 @@ static std::optional<std::vector<int>> readSchedule(const std::optional<toml::ta
 static Config loadConfig(const std::wstring& exeDir) {
     auto base  = loadToml(exeDir + L"\\" + CONFIG_FILENAME);
     auto local = loadToml(exeDir + L"\\" + CONFIG_LOCAL_FILENAME);
-    if (local) writeLog("Loaded rdmntfy.local.toml (override active)");
+    if (local) writeLog("Loaded redntfy.local.toml (override active)");
 
     // duck_targets 配列の読み込み（キーが存在する側を採用。local 優先）
     auto readDuckTargets = [&](const std::optional<toml::table>& tbl)
@@ -868,11 +906,16 @@ static Issue parseIssueObject(const winrt::Windows::Data::Json::JsonObject& obj)
     using namespace winrt::Windows::Data::Json;
     Issue is;
     is.id        = static_cast<int>(obj.GetNamedNumber(L"id", 0));
-    is.subject   = winrt::to_string(obj.GetNamedString(L"subject", L""));
+    is.subject   = normalizeSubject(winrt::to_string(obj.GetNamedString(L"subject", L"")));
     is.updatedOn = winrt::to_string(obj.GetNamedString(L"updated_on", L""));
     if (obj.HasKey(L"author")) {
         auto author = obj.GetNamedObject(L"author", nullptr);
         if (author) is.authorId = static_cast<int>(author.GetNamedNumber(L"id", 0));
+    }
+    // assigned_to はキー自体が無ければ未割当。ユーザとグループで形は同じ。（id と name のみ）
+    if (obj.HasKey(L"assigned_to")) {
+        auto assignee = obj.GetNamedObject(L"assigned_to", nullptr);
+        if (assignee) is.assignedToId = static_cast<int>(assignee.GetNamedNumber(L"id", 0));
     }
     if (obj.HasKey(L"closed_on")) {
         auto v = obj.GetNamedValue(L"closed_on", nullptr);
@@ -906,10 +949,9 @@ static int fetchMyUserId(const Config& cfg) {
 // 保存クエリの結果を total_count に達するまでページングして取得する
 // 成功時 true。outIssues は updated_on 降順にソート済みで返す。
 // API の sort には依存しない。（query_id 側のソート設定に左右されないため取得後にローカルでソートする）
-static bool fetchIssues(const Config& cfg, std::vector<Issue>& outIssues, int& outTotalCount) {
+static bool fetchIssues(const Config& cfg, std::vector<Issue>& outIssues) {
     using namespace winrt::Windows::Data::Json;
     outIssues.clear();
-    outTotalCount = 0;
 
     int offset = 0;
     int total  = 0;
@@ -955,7 +997,6 @@ static bool fetchIssues(const Config& cfg, std::vector<Issue>& outIssues, int& o
     std::sort(outIssues.begin(), outIssues.end(), [](const Issue& a, const Issue& b) {
         return a.updatedOn > b.updatedOn;
     });
-    outTotalCount = total;
     return true;
 }
 
@@ -1118,14 +1159,15 @@ static void unduckAudioSessions(std::vector<winrt::com_ptr<ISimpleAudioVolume>>&
 // ==================== レジストリ設定 ====================
 
 // レジストリパス（ユーザー設定の永続化先）
-static constexpr const wchar_t* REG_KEY_PATH        = L"SOFTWARE\\rdmntfy";
+static constexpr const wchar_t* REG_KEY_PATH        = L"SOFTWARE\\redntfy";
 static constexpr const wchar_t* REG_SOUND_ENABLED     = L"SoundEnabled";
 static constexpr const wchar_t* REG_MUTE_IN_MEETING   = L"MuteInMeeting";
+static constexpr const wchar_t* REG_ASSIGNED_TO_ME    = L"AssignedToMeOnly";
 static constexpr const wchar_t* REG_NOTIFIED_VERSION  = L"NotifiedUpdateVersion";
 
 // Windows スタートアップ登録用レジストリ（HKCU Run キー）
 static constexpr const wchar_t* REG_RUN_KEY_PATH    = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-static constexpr const wchar_t* REG_RUN_VALUE_NAME  = L"rdmntfy";
+static constexpr const wchar_t* REG_RUN_VALUE_NAME  = L"redntfy";
 
 // レジストリ DWORD 値の読み取り
 // キーまたは値が存在しない場合は defaultVal を返す
@@ -1184,7 +1226,7 @@ static void writeRegString(const wchar_t* valueName, const std::wstring& value) 
 }
 
 // スタートアップ登録の有無判定
-// HKCU Run キーに rdmntfy 値が存在すれば登録済みとみなす
+// HKCU Run キーに redntfy 値が存在すれば登録済みとみなす
 static bool isStartupRegistered() {
     return RegGetValueW(HKEY_CURRENT_USER, REG_RUN_KEY_PATH, REG_RUN_VALUE_NAME,
         RRF_RT_REG_SZ, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
@@ -1212,7 +1254,7 @@ static void registerStartup() {
 }
 
 // スタートアップ登録を解除
-// HKCU Run キーから rdmntfy 値を削除する。値が存在しない場合はエラーを無視
+// HKCU Run キーから redntfy 値を削除する。値が存在しない場合はエラーを無視
 static void unregisterStartup() {
     HKEY hKey = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY_PATH, 0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) {
@@ -1774,7 +1816,7 @@ static void ensureShortcut() {
     if (!GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH)) return;
 
     std::wstring linkPath = std::wstring(appData)
-        + L"\\Microsoft\\Windows\\Start Menu\\Programs\\rdmntfy.lnk";
+        + L"\\Microsoft\\Windows\\Start Menu\\Programs\\redntfy.lnk";
 
     if (GetFileAttributesW(linkPath.c_str()) != INVALID_FILE_ATTRIBUTES) return;
 
@@ -1939,7 +1981,7 @@ static void addTrayIcon(HWND hWnd) {
 }
 
 // バッジ付きトレイアイコンの生成
-// ベースアイコンの右下に赤い円バッジを合成した HICON を返す。
+// ベースアイコンの右下に白リング付きの赤い円バッジを合成した HICON を返す。
 // 32bpp DIBSection にピクセルを直接書き込むことで alpha=255 を確実に設定する。
 // GDI Ellipse では alpha バイトが 0 のままになり DWM 合成で透明化されるため使わない。
 // 呼び出し側が DestroyIcon で解放する責務を持つ。失敗時は nullptr を返す。
@@ -1979,25 +2021,46 @@ static HICON createBadgedIcon() {
     DrawIconEx(hdcMem, 0, 0, hBase, cx, cy, 0, nullptr, DI_NORMAL);
     DestroyIcon(hBase);
 
-    // バッジ円のパラメータ（アイコンを十字 4 等分した右下領域にマージン 1px で収める）
+    // バッジ円のパラメータ（赤丸をアイコン十字 4 等分の右下領域に収める。
+    // 白リングが 1px、外周 AA がさらに 1px、中心から最大 r + 1.5px まで掛かる）
+    // 原点の +1 オフセットは白リング導入時に廃止した。リング拡張分（+1.5px）を
+    // アイコン下端に収めるため。
     int badgeSize = (std::max)(cx / 2 - 2, 3);
     int ox   = cx / 2;
-    int oy   = cy / 2 + 1;
+    int oy   = cy / 2;
     float midX = ox + badgeSize / 2.0f;
     float midY = oy + badgeSize / 2.0f;
     float r    = badgeSize / 2.0f;
 
+    // 赤丸の外側に 1px の白リングを足す。アイコンが Redmine ロゴ（レンガ色）のため、
+    // 純赤バッジは同系色で埋没する。赤丸は従来と同寸・同色のまま残す。
+    // 赤と白の境界は AA せず硬いエッジとする。AA を挟むと 16px では 1px 幅のリングが
+    // 内外の AA に食われ、不透明な白画素が 1 つも残らないため。（外周の透明境界のみ AA）
+    float rOuter = r + 1.0f;  // 白リング外周の半径
+
     // 距離ベースのアルファブレンドで円エッジを滑らかに描画（アンチエイリアス）
-    int scanPad = static_cast<int>(r) + 1;
+    int scanPad = static_cast<int>(rOuter) + 1;
     for (int y = oy - scanPad; y < oy + scanPad + badgeSize; ++y) {
         if (y < 0 || y >= cy) continue;
         for (int x = ox - scanPad; x < ox + scanPad + badgeSize; ++x) {
             if (x < 0 || x >= cx) continue;
             float d     = sqrtf((x - midX) * (x - midX) + (y - midY) * (y - midY));
-            float alpha = (d <= r - 0.5f) ? 1.0f : (d <= r + 0.5f) ? (r + 0.5f - d) : 0.0f;
+            float alpha = (d <= rOuter - 0.5f) ? 1.0f : (d <= rOuter + 0.5f) ? (rOuter + 0.5f - d) : 0.0f;
             if (alpha <= 0.0f) continue;
-            UINT32 a = static_cast<UINT32>(alpha * 255.0f + 0.5f);
-            pixels[y * cx + x] = (a << 24) | 0x00FF0000u;
+            // 赤丸（d <= r - 0.5）の外側は白リング（G/B 成分を立てて白にする）
+            float w = (d <= r - 0.5f) ? 0.0f : 255.0f;
+            // 外周 AA 帯は代入でなく src-over 合成にする。代入だと半透明の白画素が
+            // ロゴ画素を置き換えて透過の欠けになり、バッジ周囲のロゴが削れて見えるため。
+            // ベース・バッジとも straight alpha。（DrawIconEx / CreateIconIndirect と同じ扱い）
+            // alpha = 1 の画素は da = 0 で結果が代入と同値になるため、不透明側の分岐は設けない。
+            UINT32 dst = pixels[y * cx + x];
+            float da = ((dst >> 24) & 0xFF) / 255.0f * (1.0f - alpha);  // 合成後に残るベースの寄与
+            float oa = alpha + da;  // 合成後のアルファ（alpha > 0 なので 0 除算はない）
+            UINT32 a  = static_cast<UINT32>(oa * 255.0f + 0.5f);
+            UINT32 rr = static_cast<UINT32>((255.0f * alpha + ((dst >> 16) & 0xFF) * da) / oa + 0.5f);
+            UINT32 gg = static_cast<UINT32>((w * alpha + ((dst >> 8) & 0xFF) * da) / oa + 0.5f);
+            UINT32 bb = static_cast<UINT32>((w * alpha + (dst & 0xFF) * da) / oa + 0.5f);
+            pixels[y * cx + x] = (a << 24) | (rr << 16) | (gg << 8) | bb;
         }
     }
 
@@ -2049,6 +2112,18 @@ static void clearTrayTooltip(HWND hWnd) {
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+// tooltip に出す未処理件数
+// 担当者フィルタ ON なら自分担当のみを数える。ピン留めは対象外。
+// （明示の意思表示であって未処理件数ではないため、フィルタで外れたピンを件数に足し戻さない）
+static int visibleIssueCount() {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    int n = 0;
+    for (const auto& is : g_issues) {
+        if (passesAssigneeFilter(is)) ++n;
+    }
+    return n;
+}
+
 // トレイアイコンのツールチップを更新する
 // 「未処理 N 件」に未読があれば「（未読 M 件）」を続けて表示し、赤バッジは未読ありを表す。
 // ポップアップメニュー表示中は更新しない
@@ -2057,9 +2132,8 @@ static void updateTrayTooltip(HWND hWnd) {
     if (g_tooltipUpdating) return;
     g_tooltipUpdating = true;
 
-    int total  = g_totalCount.load();
     int unread = g_unreadCount.load();
-    std::wstring tip = L"未処理 " + std::to_wstring(total) + L" 件";
+    std::wstring tip = L"未処理 " + std::to_wstring(visibleIssueCount()) + L" 件";
     if (unread > 0) tip += L"（未読 " + std::to_wstring(unread) + L" 件）";
 
     auto nid = makeTrayNid(hWnd);
@@ -2096,7 +2170,131 @@ struct IssueItem {
 static std::vector<IssueItem> g_issueItems;
 
 // ピンマーカーの文字列（一覧行の先頭マーカー列。全行で同じ幅を確保し、ピン留め行のみ描く）
-static constexpr wchar_t PIN_MARK[] = L"● ";
+// 📌 は非 BMP でフォントリンク（Segoe UI Emoji へのフォールバック）に頼る。
+// 列幅の計測は GDI に一本化する。GDI のフォントリンクは GetTextExtentPoint32W にも効き、
+// 実描画幅と一致するため DT_CALCRECT は不要。（メニューフォント Yu Gothic UI で実測確認済み）
+// 実描画は drawPinMarkColor（DirectWrite/Direct2D）で行い、GDI はカラーフォントを解釈せず
+// 単色になるため、D2D が使えない場合のみ従来の GDI DrawTextW にフォールバックする。
+static constexpr wchar_t PIN_MARK[] = L"📌 ";
+
+// ピンマーカーのカラー絵文字描画資源（初回描画時に遅延生成し、以降は再利用する）
+// 明示解放はしない。プロセス終了まで保持する。（g_hMenuFont と同じ扱い）
+// アクセスは WndProc スレッド（WM_DRAWITEM）のみでロック不要。
+static ID2D1Factory1*        g_pD2DFactory  = nullptr;  // デバイス非依存（作り直し不要）
+static IDWriteTextFormat*    g_pPinFormat   = nullptr;  // 同上（メニューフォント由来）
+static ID2D1DCRenderTarget*  g_pPinRT       = nullptr;  // BindDC / BeginDraw / EndDraw 用
+static ID2D1DeviceContext*   g_pPinCtx      = nullptr;  // g_pPinRT の QI。カラー描画に必須
+static ID2D1SolidColorBrush* g_pPinBrush    = nullptr;
+static bool                  g_pinD2DFailed = false;    // 失敗を記憶して行ごとの再試行を避ける
+
+// COLORREF を D2D の正規化 RGB へ変換する
+// D2D1::ColorF(UINT32) は 0xRRGGBB 前提で COLORREF（0x00BBGGRR）とバイト順が逆のため成分指定で作る。
+static D2D1_COLOR_F toD2DColor(COLORREF c) {
+    return D2D1::ColorF(GetRValue(c) / 255.0f, GetGValue(c) / 255.0f, GetBValue(c) / 255.0f);
+}
+
+// ピンマーカー描画のデバイス依存資源の解放
+// EndDraw が D2DERR_RECREATE_TARGET（表示構成変更等）を返した際に作り直すため一括で解放する。
+static void releasePinD2DTarget() {
+    if (g_pPinBrush) { g_pPinBrush->Release(); g_pPinBrush = nullptr; }
+    if (g_pPinCtx)   { g_pPinCtx->Release();   g_pPinCtx   = nullptr; }
+    if (g_pPinRT)    { g_pPinRT->Release();    g_pPinRT    = nullptr; }
+}
+
+// ピンマーカー描画資源の遅延初期化
+// hdc は描画先のメニュー DC で、DirectWrite のフォントサイズをメニューフォントの
+// 実効 em 高（px）へ合わせる計測にのみ使う。戻り値 false は GDI フォールバックを表す。
+static bool ensurePinD2D(HDC hdc) {
+    if (g_pinD2DFailed) return false;
+    if (g_pPinCtx)      return true;
+
+    // デバイス非依存資源（初回のみ）
+    if (!g_pD2DFactory) {
+        if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_pD2DFactory))) {
+            g_pinD2DFailed = true;
+            writeLog("pin marker: D2D1CreateFactory failed, fallback to GDI");
+            return false;
+        }
+        // フェイス名と em 高は実際に GDI が描画に使う g_hMenuFont 自身から引く。（二重管理を避ける）
+        // RT を 96 DPI 固定にするため 1 DIP = 1 px。lfHeight の符号解釈を避け、
+        // GDI の実効 em 高（セル高 - internal leading）を渡して送り幅を GDI 計測値と揃える。
+        LOGFONTW    lf = {};
+        TEXTMETRICW tm = {};
+        GetObjectW(g_hMenuFont, sizeof(lf), &lf);
+        HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
+        GetTextMetricsW(hdc, &tm);
+        SelectObject(hdc, oldFont);
+        float emSize = static_cast<float>(tm.tmHeight - tm.tmInternalLeading);
+
+        IDWriteFactory* pDWrite = nullptr;
+        HRESULT hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                                         reinterpret_cast<IUnknown**>(&pDWrite));
+        if (SUCCEEDED(hr)) {
+            hr = pDWrite->CreateTextFormat(lf.lfFaceName, nullptr,
+                     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                     DWRITE_FONT_STRETCH_NORMAL, emSize, L"", &g_pPinFormat);
+            pDWrite->Release();  // テキストフォーマットが内部でファクトリを保持するため手放して良い
+        }
+        if (FAILED(hr)) {
+            g_pinD2DFailed = true;
+            writeLog("pin marker: CreateTextFormat failed, fallback to GDI");
+            return false;
+        }
+        g_pPinFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        g_pPinFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        // 行矩形内での縦センタリング（GDI 側 DrawTextW の DT_VCENTER と揃える）
+        g_pPinFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+
+    // デバイス依存資源（D2DERR_RECREATE_TARGET 後はここから作り直す）
+    // 96 DPI 固定で 1 DIP = 1 px とし、GDI 計測の px 矩形・フォントサイズと揃える。
+    // SOFTWARE 指定は、20 px 程度の矩形に GPU 経路は無駄で、RDP 等での初期化失敗も避けるため。
+    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+        96.0f, 96.0f);
+    HRESULT hr = g_pD2DFactory->CreateDCRenderTarget(&props, &g_pPinRT);
+    // ENABLE_COLOR_FONT を解釈するのは D2D 1.1 のデバイスコンテキストのみ。
+    // レガシー RT を QI して同一オブジェクトを 1.1 インタフェースとして扱う。
+    if (SUCCEEDED(hr)) {
+        hr = g_pPinRT->QueryInterface(__uuidof(ID2D1DeviceContext),
+                                      reinterpret_cast<void**>(&g_pPinCtx));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = g_pPinRT->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), &g_pPinBrush);
+    }
+    if (FAILED(hr)) {
+        releasePinD2DTarget();
+        g_pinD2DFailed = true;
+        writeLog("pin marker: DC render target setup failed, fallback to GDI");
+        return false;
+    }
+    return true;
+}
+
+// ピンマーカー（📌）をカラー絵文字で描画する
+// rect はマーカー列の矩形。（幅は GDI 計測値）bgColor はメニュー背景色（AA の合成先を実背景に
+// 一致させる）、fgColor はカラーフォント非対応で単色描画に落ちた場合の文字色。
+// 戻り値 false は GDI フォールバックが必要なことを表す。
+static bool drawPinMarkColor(HDC hdc, const RECT& rect, COLORREF bgColor, COLORREF fgColor) {
+    if (!ensurePinD2D(hdc)) return false;
+    // BindDC のサブ矩形でマーカー列だけを描画対象にする。RT 原点が rect 左上に対応し、
+    // EndDraw のブリット範囲もこの矩形に限られるためラベル側の描画を壊さない。
+    if (FAILED(g_pPinRT->BindDC(hdc, &rect))) return false;
+    g_pPinBrush->SetColor(toD2DColor(fgColor));
+    g_pPinRT->BeginDraw();
+    g_pPinRT->Clear(toD2DColor(bgColor));  // BindDC は DC の既存内容を引き継がないため下地を塗る
+    D2D1_RECT_F layout = D2D1::RectF(0.0f, 0.0f,
+        static_cast<float>(rect.right - rect.left),
+        static_cast<float>(rect.bottom - rect.top));
+    g_pPinCtx->DrawText(PIN_MARK, static_cast<UINT32>(wcslen(PIN_MARK)), g_pPinFormat,
+                        layout, g_pPinBrush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+    if (FAILED(g_pPinRT->EndDraw())) {
+        releasePinD2DTarget();  // ターゲット失効時は解放し、次回描画で作り直す
+        return false;
+    }
+    return true;
+}
 
 // フォアグラウンド権限を確実に取得するユーティリティ
 // 起動直後は自プロセスがフォアグラウンド権限を持たないため SetForegroundWindow が失敗する。
@@ -2133,10 +2331,12 @@ static std::wstring buildIssueLabel(int id, const std::string& subject) {
 // 左クリック時のチケット一覧ポップアップ表示
 //
 // 表示リストの組み立て：
-//   1. g_issues（updated_on 降順）の先頭 list_limit 件を採る
+//   1. g_issues（updated_on 降順）から担当者フィルタを通った先頭 list_limit 件を採る
+//      （フィルタで外れてもピン留め済みなら残す。ピンはフィルタより優先する）
 //   2. 1 に含まれないピンを追加する（保存クエリの集合外ピンはキャッシュ内容で表示）
 //   3. 全体を updated_on 降順で再ソートする（ピンも本来の位置に置く）
 // 行の左クリックでチケットを開き、右クリックでピン留めをトグルする。
+// フッタの「未処理 N 件」はフィルタを通った件数で、フィルタで外れたピンは数えない。
 static void showIssuePopup(HWND hWnd) {
     std::vector<Issue>    issues;
     std::vector<PinEntry> pins;
@@ -2157,10 +2357,20 @@ static void showIssuePopup(HWND hWnd) {
     // first = updated_on（ソートキー）、second = 表示行
     std::vector<std::pair<std::string, IssueItem>> rows;
     std::unordered_set<int> shown;
+    int visible = 0;
     for (const auto& is : issues) {
-        if (rows.size() >= static_cast<size_t>(cfg.listLimit)) break;
+        // 担当者フィルタで外れた行は出さない。ただしピン留め済みは明示の意思表示として常に残す
+        // （クローズ済・集合外でも表示する既存のピン仕様と揃える）
+        bool pinned = isPinned(is.id);
+        if (!passesAssigneeFilter(is)) {
+            if (!pinned) continue;
+        }
+        else {
+            ++visible;
+        }
+        if (rows.size() >= static_cast<size_t>(cfg.listLimit)) continue;
         rows.push_back({is.updatedOn,
-            {is.id, issueUrl(cfg, is.id), buildIssueLabel(is.id, is.subject), isPinned(is.id), is.closed}});
+            {is.id, issueUrl(cfg, is.id), buildIssueLabel(is.id, is.subject), pinned, is.closed}});
         shown.insert(is.id);
     }
     for (const auto& p : pins) {
@@ -2196,7 +2406,7 @@ static void showIssuePopup(HWND hWnd) {
             ++idx;
         }
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-        std::wstring footer = L"未処理 " + std::to_wstring(g_totalCount.load())
+        std::wstring footer = L"未処理 " + std::to_wstring(visible)
             + L" 件（クリックでウェブ表示 ／ 右クリックでピン留め）";
         AppendMenuW(hMenu, MF_STRING, IDM_OPEN_QUERY, footer.c_str());
     }
@@ -2299,7 +2509,7 @@ static void checkForUpdates() {
 
 // 更新通知メニュー項目のサイズを計算する
 static BOOL measureVersionMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
-    std::wstring prefix = std::wstring(L"Rdmntfy v") + APP_VERSION + L" → ";
+    std::wstring prefix = std::wstring(L"Redntfy v") + APP_VERSION + L" → ";
     std::wstring latest;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
@@ -2325,7 +2535,7 @@ static BOOL measureVersionMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
 // 更新通知メニュー項目を描画する
 // プレフィックス部分を通常色、新バージョン部分を赤色で描く
 static BOOL drawVersionMenuItem(DRAWITEMSTRUCT* dis) {
-    std::wstring prefix = std::wstring(L"Rdmntfy v") + APP_VERSION + L" → ";
+    std::wstring prefix = std::wstring(L"Redntfy v") + APP_VERSION + L" → ";
     std::wstring latest;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
@@ -2375,7 +2585,7 @@ static void showTrayContextMenu(HWND hWnd) {
         return;
     }
     if (g_updateAvailable.load()) {
-        // 新版あり：オーナードローで "Rdmntfy vX.Y.Z → vNew" を赤文字で表示する
+        // 新版あり：オーナードローで "Redntfy vX.Y.Z → vNew" を赤文字で表示する
         MENUITEMINFOW mii = { sizeof(mii) };
         mii.fMask = MIIM_FTYPE | MIIM_ID;
         mii.fType = MFT_OWNERDRAW;
@@ -2383,9 +2593,13 @@ static void showTrayContextMenu(HWND hWnd) {
         InsertMenuItemW(hMenu, 0, TRUE, &mii);
     }
     else {
-        AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"Rdmntfy v" APP_VERSION);
+        AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"Redntfy v" APP_VERSION);
     }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+
+    // 担当者フィルタ（レジストリ永続化。一覧・tooltip・通知のすべてに効く）
+    AppendMenuW(hMenu, MF_STRING | (g_assignedToMeOnly ? MF_CHECKED : MF_UNCHECKED),
+        IDM_ASSIGNED_TO_ME, L"担当がグループのチケットを除外");
 
     // 音声通知（親：レジストリ永続化）
     AppendMenuW(hMenu, MF_STRING | (g_soundEnabled ? MF_CHECKED : MF_UNCHECKED),
@@ -2444,6 +2658,17 @@ static void handleTrayCommand(UINT id) {
     if (id == IDM_EXIT) {
         g_shutdownRequested = true;
         PostQuitMessage(0);
+        return;
+    }
+    if (id == IDM_ASSIGNED_TO_ME) {
+        g_assignedToMeOnly.store(!g_assignedToMeOnly.load());
+        writeRegDword(REG_ASSIGNED_TO_ME, g_assignedToMeOnly.load() ? 1u : 0u);
+        // 未読を仕切り直す。未読は通知時点のフィルタで数えた累計のため、切り替え後は
+        // 一覧に出ないチケットの分が残り「未処理 10 件（未読 3 件）」のような矛盾表示になる。
+        g_unreadCount.store(0);
+        // 一覧は次に開いた時点で g_issues から組み直されるが、tooltip とバッジは即時に更新する。
+        // 取得済みの全件を保持しているため再ポーリングは不要。
+        if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
         return;
     }
     if (id == IDM_SOUND_ENABLED) {
@@ -2512,6 +2737,9 @@ static BOOL measureIssueMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
     GetTextExtentPoint32W(hdc, item.label.c_str(),
         static_cast<int>(item.label.size()), &sz);
     // ピンマーカー列の幅（ピン有無で行幅が変わらないよう全行に確保する）
+    // 実描画は D2D だが幅計測は GDI に一本化する。フォールバック先の Segoe UI Emoji と em
+    // サイズが GDI・DirectWrite で同一のため送り幅は一致し、末尾スペース分が丸め差を吸収する。
+    // ここを DWrite 計測に替えると、GDI フォールバック時に行幅と描画幅が食い違う。
     SIZE markSz = {};
     GetTextExtentPoint32W(hdc, PIN_MARK, static_cast<int>(wcslen(PIN_MARK)), &markSz);
     SelectObject(hdc, old);
@@ -2542,14 +2770,26 @@ static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
     COLORREF textColor = GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT);
     SetTextColor(dis->hDC, textColor);
     HFONT oldFont = static_cast<HFONT>(SelectObject(dis->hDC, g_hMenuFont));
-    // ピンマーカー列（measureIssueMenuItem と同じ幅を全行に確保し、ピン留め行のみ ● を描く）
+    // ピンマーカー列（measureIssueMenuItem と同じ幅を全行に確保し、ピン留め行のみ 📌 を描く）
     SIZE markSz = {};
     GetTextExtentPoint32W(dis->hDC, PIN_MARK, static_cast<int>(wcslen(PIN_MARK)), &markSz);
-    if (item.pinned)
-        DrawTextW(dis->hDC, PIN_MARK, -1, &textRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    if (item.pinned) {
+        // マーカー列だけ Direct2D で描いてカラー絵文字にする。列幅は GDI 計測値のまま使い、
+        // 行幅・インデント・取消線の座標計算（measureIssueMenuItem と共有）を変えない。
+        RECT markRect  = textRect;
+        markRect.right = markRect.left + markSz.cx;
+        COLORREF bgColor = GetSysColor(selected ? COLOR_HIGHLIGHT : COLOR_MENU);
+        if (!drawPinMarkColor(dis->hDC, markRect, bgColor, textColor)) {
+            // D2D が使えない環境では従来どおり GDI で単色の 📌 を描く
+            DrawTextW(dis->hDC, PIN_MARK, -1, &textRect,
+                DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+        }
+    }
     textRect.left += markSz.cx;
+    // DT_NOPREFIX がないと件名中の & がニーモニック指定として食われ、次の文字に下線が付く
+    // （幅は & を 1 文字として計測するため、描画幅とのずれで取消線も伸び過ぎる）
     DrawTextW(dis->hDC, item.label.c_str(), -1, &textRect,
-        DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
     if (item.closed) {
         SIZE sz = {};
         GetTextExtentPoint32W(dis->hDC, item.label.c_str(),
@@ -2701,9 +2941,9 @@ static HWND createTrayWindow() {
     wc.cbSize        = sizeof(wc);
     wc.lpfnWndProc   = trayWndProc;
     wc.hInstance     = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"rdmntfy_tray";
+    wc.lpszClassName = L"redntfy_tray";
     RegisterClassExW(&wc);
-    return CreateWindowExW(0, L"rdmntfy_tray", nullptr, 0,
+    return CreateWindowExW(0, L"redntfy_tray", nullptr, 0,
         0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
 }
 
@@ -2777,16 +3017,16 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
 // 前回状態（state.json）と突合して「新規流入」と「updated_on の進行」を検知する。
 // 自分が起票したチケットの流入は author.id で、自分の操作による更新は最終 journal の
 // 更新者 id で除外する。（g_myUserId == 0 のときはどちらの除外も行わず通知側に倒す）
+// 担当者フィルタ ON なら、自分が担当でないチケットもあわせて除外する。
 // ベースライン未確立（初回起動・state.json 破損）の場合は通知せず状態保存のみ行う。
 static void deliverPollResults(const std::wstring& exeDir, const Config& cfg,
-                               const std::vector<Issue>& issues, int totalCount)
+                               const std::vector<Issue>& issues)
 {
     // 一覧・tooltip 用の共有状態を更新する
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         g_issues = issues;
     }
-    g_totalCount.store(totalCount);
 
     std::unordered_map<int, std::string> prev;
     bool baseline = loadState(exeDir, prev);
@@ -2806,6 +3046,9 @@ static void deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         // 更新判定は 1 件ごとに journals の同期 HTTP を伴い件数上限もないため、中断可能にする。
         // ここで抜けると state.json は前回のまま残り、次回ポーリングで再検知される（通知は失われない）
         if (g_shutdownRequested) return;
+        // 担当者フィルタで外れたチケットは通知しない
+        // prev の照合より前に置くことで、除外分の journals 取得（同期 HTTP）も省ける
+        if (!passesAssigneeFilter(is)) continue;
         auto it = prev.find(is.id);
         if (it == prev.end()) {
             // 新規流入（自分の起票は通知しない）
@@ -2895,7 +3138,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             // 休止時間帯の判定より後に置き、休止中はネットワークに一切触れない
             if (g_myUserId == 0) {
                 g_myUserId = fetchMyUserId(cfg);
-                if (g_myUserId != 0) writeLog("my user id: " + std::to_string(g_myUserId));
+                if (g_myUserId != 0) writeLog("my user id: " + std::to_string(g_myUserId.load()));
             }
 
             // 即時ポーリング判定。（forcePoll フラグ or 1 時間以上未ポーリング）
@@ -2921,9 +3164,8 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
                 writeLog("stale poll triggered (" + std::to_string((tickNow - lastTick) / 1000) + "s since last poll)");
 
             std::vector<Issue> issues;
-            int totalCount  = 0;
             ULONGLONG t0    = GetTickCount64();
-            bool ok = fetchIssues(cfg, issues, totalCount);
+            bool ok = fetchIssues(cfg, issues);
             ULONGLONG elapsed = GetTickCount64() - t0;
 
             // 取得試行をもって「起動直後の 1 回」は消費とする（成功を待たない）。
@@ -2941,7 +3183,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             writeLog("poll: " + std::to_string(issues.size()) + " issues ("
                 + std::to_string(elapsed) + "ms), next: " + nextPollTimeStr(pollsPerHour));
 
-            deliverPollResults(exeDir, cfg, issues, totalCount);
+            deliverPollResults(exeDir, cfg, issues);
             refreshPins(exeDir, cfg, issues);
 
             g_lastPollTick.store(GetTickCount64());
@@ -2980,14 +3222,14 @@ int wmain() {
     // 多重起動制御（新プロセス優先）
     // 名前付き Job Object で旧プロセスをまとめて終了させる。
     // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE により hJob は閉じずプロセス終了まで保持する。
-    HANDLE hJob = CreateJobObjectW(nullptr, L"Local\\rdmntfy_job");
+    HANDLE hJob = CreateJobObjectW(nullptr, L"Local\\redntfy_job");
     if (hJob && GetLastError() == ERROR_ALREADY_EXISTS) {
         writeLog("terminating previous instance");
         TerminateJobObject(hJob, 0);
         CloseHandle(hJob);
         // カーネルが Job Object 名を解放するまで待機
         Sleep(100);
-        hJob = CreateJobObjectW(nullptr, L"Local\\rdmntfy_job");
+        hJob = CreateJobObjectW(nullptr, L"Local\\redntfy_job");
         // 旧プロセスがまだ終了していない場合の競合対策（警告のみで続行）
         if (hJob && GetLastError() == ERROR_ALREADY_EXISTS) {
             writeLog("warning: previous instance still alive");
@@ -3033,10 +3275,10 @@ int wmain() {
         // http(s) 以外が ShellExecuteW に渡らないことを保証する
         if (cfg.redmineUrl.empty() || !isHttpUrl(cfg.redmineUrl)
             || cfg.apiKey.empty() || cfg.queryId <= 0) {
-            writeLog("config error: [redmine] url (must start with http:// or https://) / api_key / query_id must be set in rdmntfy.local.toml");
+            writeLog("config error: [redmine] url (must start with http:// or https://) / api_key / query_id must be set in redntfy.local.toml");
             try {
                 showToast(L"設定エラー",
-                          L"rdmntfy.local.toml の [redmine] url / api_key / query_id を設定してください",
+                          L"redntfy.local.toml の [redmine] url / api_key / query_id を設定してください",
                           L"", false);
             }
             catch (...) {}
@@ -3053,6 +3295,7 @@ int wmain() {
         // レジストリから設定を復元（キー未作成時はデフォルト値）
         g_soundEnabled  = readRegDword(REG_SOUND_ENABLED, 1u) != 0;
         g_muteInMeeting = readRegDword(REG_MUTE_IN_MEETING, 1u) != 0;
+        g_assignedToMeOnly = readRegDword(REG_ASSIGNED_TO_ME, 0u) != 0;
 
         writeLog("started");
         logSchedule(cfg.schedule);

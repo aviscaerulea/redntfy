@@ -1,10 +1,10 @@
 # vim: set ft=toml fenc=utf-8 ff=unix sw=4 ts=4 et :
 ##################################################
-# rdmntfy 設定ファイル
+# redntfy 設定ファイル
 ##################################################
 # このファイルは VCS にコミットするため、社内 URL や API キーを書かない。
-# 環境固有の値はすべて rdmntfy.local.toml（コミットしない）に記載する。
-# rdmntfy.local.toml のキーは本ファイルの同名キーをキー単位で上書きする。
+# 環境固有の値はすべて redntfy.local.toml（コミットしない）に記載する。
+# redntfy.local.toml のキーは本ファイルの同名キーをキー単位で上書きする。
 #
 # 注意：セクションなしのキー（schedule など）は、TOML の仕様上
 # [redmine] などのセクションより前に書く必要がある。
@@ -32,7 +32,7 @@ schedule = [0, 0, 0, 0, 0, 0, 0, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 1, 0, 0, 0,
 # duck_targets = ["chrome.exe", "msedge.exe"]
 
 # Redmine 接続設定（必須）
-# 3 キーとも rdmntfy.local.toml に記載する。いずれかが欠けると起動しない。
+# 3 キーとも redntfy.local.toml に記載する。いずれかが欠けると起動しない。
 # url      ：Redmine の URL（http:// または https:// で始まる、末尾スラッシュなし）
 # api_key  ：Redmine の「個人設定」→「API アクセスキー」で取得した値
 # query_id ：プロジェクトを指定せずに保存したグローバル保存クエリの id

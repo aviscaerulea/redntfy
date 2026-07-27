@@ -3,7 +3,7 @@ $schema: https://taskfile.dev/schema.json
 version: '3'
 
 vars:
-  APP_NAME: rdmntfy
+  APP_NAME: redntfy
   VERSION:
     sh: git describe --tags --always --dirty | sed 's/^v//'
   ARCH: x64
@@ -38,11 +38,13 @@ tasks:
       - cp {{.APP_NAME}}.toml {{.OUT_DIR}}/
       - cp src/sound.wav {{.OUT_DIR}}/
       - cp src/app.ico {{.OUT_DIR}}/
-      - cmd: cp -f *.local.* {{.OUT_DIR}}/
+      # 接続情報を書いたローカル設定。VCS 管理外で存在しない環境があるためエラーを無視する。
+      # ワイルドカード（*.local.*）にすると CLAUDE.local.md まで混入するため明示指定とする。
+      - cmd: cp -f {{.APP_NAME}}.local.toml {{.OUT_DIR}}/
         ignore_error: true
 
   build:
-    desc: 通常ビルド（out/rdmntfy.exe）
+    desc: 通常ビルド（out/redntfy.exe）
     deps: [kill]
     cmds:
       - mkdir -p {{.OUT_DIR}}

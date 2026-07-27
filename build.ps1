@@ -1,5 +1,5 @@
 # vi: ts=4 sw=4 ff=unix fenc=utf-8
-# rdmntfy ビルドスクリプト
+# redntfy ビルドスクリプト
 # DevShell モジュール経由で VC++ ビルド環境を初期化し、rc/cl でビルドする。
 param([string]$Version = "0.0.0", [switch]$Release)
 $ErrorActionPreference = 'Stop'
@@ -50,7 +50,7 @@ $clExtra   = if ($Release) { @('/DNDEBUG', '/GL', '/Gy') } else { @() }
 $linkExtra = if ($Release) { @('/LTCG', '/OPT:REF', '/OPT:ICF') } else { @() }
 
 cl /nologo /utf-8 /std:c++20 /EHsc /O2 @clExtra /I out\ /I "$vcpkgInclude" `
-    /Foout\ /Feout\rdmntfy.exe `
+    /Foout\ /Feout\redntfy.exe `
     src\main.cpp out\resource.res `
     /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup @linkExtra `
     windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib gdi32.lib `
