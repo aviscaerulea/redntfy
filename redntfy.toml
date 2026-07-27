@@ -33,13 +33,15 @@ schedule = [0, 0, 0, 0, 0, 0, 0, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 1, 0, 0, 0,
 
 # Redmine 接続設定（必須）
 # 3 キーとも redntfy.local.toml に記載する。いずれかが欠けると起動しない。
-# url      ：Redmine の URL（http:// または https:// で始まる、末尾スラッシュなし）
-# api_key  ：Redmine の「個人設定」→「API アクセスキー」で取得した値
-# query_id ：プロジェクトを指定せずに保存したグローバル保存クエリの id
+# url       ：Redmine の URL（http:// または https:// で始まる、末尾スラッシュなし）
+# api_key   ：Redmine の「個人設定」→「API アクセスキー」で取得した値
+# query_ids ：プロジェクトを指定せずに保存したグローバル保存クエリの id を配列で指定する。
+#             複数指定時は全クエリの和集合を追跡する。先頭の id は複数件通知・一覧フッタから
+#             開くクエリ画面に使う。
 # [redmine]
-# url      = "https://redmine.example.com"
-# api_key  = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-# query_id = 12
+# url       = "https://redmine.example.com"
+# api_key   = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+# query_ids = [12, 34]
 
 # ガードトーン設定
 [guard]

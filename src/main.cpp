@@ -3,17 +3,18 @@
  * redntfy - Redmine の更新チケットを Windows Toast 通知で知らせる常駐アプリ
  *
  * exe 同フォルダの redntfy.toml（redntfy.local.toml がキー単位で上書き）から設定を読み込み、
- * [redmine] で指定したグローバル保存クエリ（query_id）を schedule に従ってポーリングする。
+ * [redmine] で指定した複数のグローバル保存クエリ（query_ids）を schedule に従ってポーリングし、
+ * チケット id で重複排除した和集合を追跡する。
  * schedule は 0 時〜23 時の 24 要素配列。（回/時、0 でその時間帯は休止）
- * 追跡集合への新規流入と既知チケットの updated_on 進行を Toast 通知と音声で知らせる。
+ * 追跡集合への新規流入と既知チケットの updated_on 進行・新クエリ流入を Toast 通知と音声で知らせる。
  * 自分が起票したチケットの流入（author.id）と自分の操作による更新（最終 journal の user.id）は通知しない。
- * 検知済み状態は「チケット id → updated_on」を state.json に永続化して重複通知を防ぐ。
+ * 検知済み状態は「チケット id → updated_on ＋所属クエリ集合」を state.json（v2）に永続化して重複通知を防ぐ。
  * トレイ左クリックで未処理チケットの一覧を表示し、行の右クリックで最大 5 件をピン留めできる。
  * ピンは pins.json に永続化し、保存クエリの集合から外れたチケットも一覧に表示し続ける。
  *
  * 終了コード：
  *   0  - 正常終了（トレイメニューの「終了」による）
- *   1  - 設定エラー（[redmine] url / api_key / query_id の未設定）
+ *   1  - 設定エラー（[redmine] url / api_key / query_ids の未設定）
  *   2  - 予期しない初期化エラー
  *
  * 依存ライブラリ：WinHTTP, WinRT (Windows.UI.Notifications, Windows.Data.Json), Propsys
@@ -78,6 +79,7 @@
 #include <thread>
 #include <cstdio>
 #include <cmath>
+#include <climits>
 
 #pragma comment(lib, "windowsapp.lib")
 #pragma comment(lib, "winhttp.lib")
@@ -203,6 +205,9 @@ struct Issue {
                                    // Redmine はユーザとグループが同一 id 空間のため、自分の id と
                                    // 一致するかを見るだけでグループ担当を弾ける。型の判別は不要。
     bool        closed    = false; // closed_on が非 null（一覧で打ち消し線表示）
+    std::string dueDate;           // due_date（"YYYY-MM-DD"、期限なしは空。一覧の日付表示に使う）
+    std::vector<int> queryIds;     // このチケットが現れた保存クエリ id（昇順）。クエリ流入の検知に使う
+    bool assignedToGroup = false;  // 担当がグループ（一覧の 👥 マーカー。取得後にグループ id 集合と突合して設定）
 };
 
 // ピン留め 1 件分
@@ -212,6 +217,8 @@ struct PinEntry {
     std::string subject;
     std::string updatedOn;
     bool        closed = false;
+    std::string dueDate;           // due_date（"YYYY-MM-DD"、期限なしは空。一覧の日付表示に使う）
+    bool assignedToGroup = false;  // 担当がグループ（👥 マーカー。集合外ピンも表示できるよう永続化）
 };
 
 // loadConfig の戻り値
@@ -219,7 +226,9 @@ struct Config {
     // [redmine] 接続設定（必須。いずれか欠けると起動を中止する）
     std::wstring redmineUrl;       // Redmine の URL（末尾スラッシュを除去して保持する）
     std::wstring apiKey;           // 個人 API アクセスキー
-    int          queryId = 0;      // グローバル保存クエリの id
+    // 追跡対象のグローバル保存クエリ id（1 個以上必須。設定の記述順を保持し std::set にしない）
+    // 先頭要素は「代表クエリ」で、複数件 Toast と一覧フッタから開く URL に使う。
+    std::vector<int> queryIds;
 
     std::vector<int>          schedule;         // 24 要素（0 時〜23 時の 1 時間あたりポーリング回数、0 で休止）
     int                       listLimit;        // 一覧の非ピン表示件数（デフォルト 20）
@@ -342,6 +351,34 @@ static constexpr long long JST_OFFSET_HNS = 9LL * 60 * 60 * 10000000LL;
 
 // UTC SYSTEMTIME を JST SYSTEMTIME に変換する
 static SYSTEMTIME utcToJst(SYSTEMTIME st) { return shiftSystemTime(st, +JST_OFFSET_HNS); }
+
+// JST の今日を YYYYMMDD の整数で返す（期限日との比較用）
+// 日付だけの比較なので、時刻を持たない due_date と粒度が揃う。JST 固定は utcToJst と同じ方針。
+static int todayJstYmd() {
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    st = utcToJst(st);
+    return st.wYear * 10000 + st.wMonth * 100 + st.wDay;
+}
+
+// 期限日の表示情報
+struct DueDateView {
+    std::wstring md;              // "7/28"（ゼロパディングなし。期限なし・解釈不能なら空）
+    bool         overdue = false; // 期限 ≦ 今日（JST）＝日付部分を赤で描く
+};
+
+// Redmine の due_date（"YYYY-MM-DD"、期限なしは空）を表示情報へ変換する
+// todayYmd は todayJstYmd() の値。呼び出し側で 1 回だけ求めて全行に使い、
+// 一覧の途中で日付が変わって行ごとに判定が揺れることを防ぐ。
+static DueDateView makeDueDateView(const std::string& due, int todayYmd) {
+    DueDateView v;
+    int y = 0, m = 0, d = 0;
+    if (sscanf_s(due.c_str(), "%d-%d-%d", &y, &m, &d) != 3) return v;
+    if (y < 1900 || m < 1 || m > 12 || d < 1 || d > 31) return v;
+    v.md      = std::to_wstring(m) + L"/" + std::to_wstring(d);
+    v.overdue = (y * 10000 + m * 100 + d) <= todayYmd;
+    return v;
+}
 
 // Toast XML の特殊文字をエスケープする
 static std::wstring escapeXml(const std::wstring& s) {
@@ -645,52 +682,96 @@ static std::optional<std::string> readJsonFile(const std::wstring& path, const c
     return buf;
 }
 
+// state.json の issues 要素 1 件分（前回ポーリング時点の検知済み状態）
+struct StateEntry {
+    std::string      updatedOn;
+    std::vector<int> queryIds;           // 前回の所属クエリ id（昇順）
+    bool             hasQueries = false; // queries キーがあったか（旧形式 v1 の判別）
+};
+
+// state.json の読み込み結果
+struct PollState {
+    bool                                baseline = false; // ベースライン確立済みか
+    std::unordered_map<int, StateEntry> issues;
+    std::vector<int>                    knownQueries;     // 前回追跡していたクエリ id（昇順）
+};
+
 // 検知済み状態の読み込み
-// state.json の issues 配列を outMap（id → updated_on）へ展開する。
-// 戻り値はベースライン確立済みか。ファイル不在・パースエラーは未確立（false）として扱い、
+// 戻り値の baseline はベースライン確立済みか。ファイル不在・パースエラーは未確立として扱い、
 // 次回ポーリングで通知なしのベースライン再確立が走る。（誤通知より通知欠落側に倒す）
-static bool loadState(const std::wstring& dir, std::unordered_map<int, std::string>& outMap) {
+//
+// v1（queries なし）互換：エントリの queries 欠落は hasQueries=false とし、そのエントリの
+// クエリ流入検知を見送り、現所属を通知なしで採用する。ルートの queries 欠落は knownQueries を
+// 空にし、全クエリを「今回追加されたクエリ」として流入検知の対象外にする。
+// どちらも、バージョンアップや設定追加の直後に既存全チケットが「更新」通知になる嵐を防ぐため。
+static PollState loadState(const std::wstring& dir) {
     using namespace winrt::Windows::Data::Json;
-    outMap.clear();
+    PollState st;
     // state.json は追跡集合の件数に比例して育つため、書き込み側と非対称にならないよう
-    // 上限を 16MB（1 件約 55 バイトで約 30 万件相当）まで広げる
+    // 上限を 16MB（v2 は 1 件約 75 バイトで約 20 万件相当）まで広げる
     auto buf = readJsonFile(dir + L"\\" + STATE_FILENAME, "state", 16u * 1024 * 1024);
-    if (!buf) return false;
+    if (!buf) return st;
     try {
         auto obj = JsonObject::Parse(winrt::to_hstring(*buf));
-        bool baseline = obj.GetNamedBoolean(L"baseline", false);
+        st.baseline = obj.GetNamedBoolean(L"baseline", false);
+        if (obj.HasKey(L"queries")) {
+            for (auto q : obj.GetNamedArray(L"queries")) {
+                int qid = static_cast<int>(q.GetNumber());
+                if (qid > 0) st.knownQueries.push_back(qid);
+            }
+            std::sort(st.knownQueries.begin(), st.knownQueries.end());
+        }
         if (obj.HasKey(L"issues")) {
             for (auto item : obj.GetNamedArray(L"issues")) {
-                auto o = item.GetObject();
+                auto o  = item.GetObject();
                 int  id = static_cast<int>(o.GetNamedNumber(L"id", 0));
                 auto up = winrt::to_string(o.GetNamedString(L"updated_on", L""));
-                if (id > 0 && !up.empty()) outMap[id] = up;
+                if (id <= 0 || up.empty()) continue;
+                StateEntry e;
+                e.updatedOn = std::move(up);
+                if (o.HasKey(L"queries")) {
+                    e.hasQueries = true;
+                    for (auto q : o.GetNamedArray(L"queries")) {
+                        int qid = static_cast<int>(q.GetNumber());
+                        if (qid > 0) e.queryIds.push_back(qid);
+                    }
+                    std::sort(e.queryIds.begin(), e.queryIds.end());
+                }
+                st.issues.emplace(id, std::move(e));
             }
         }
-        return baseline;
+        return st;
     }
     catch (...) {
         writeLog("state: parse failed, re-establishing baseline");
-        outMap.clear();
-        return false;
+        return PollState{};  // 破損時はベースライン未確立として通知せず作り直す
     }
 }
 
 // 検知済み状態の保存
 // ポーリング成功のたびに追跡集合全体で上書きする。（集合から消えた id は自然に落ちる）
 // baseline フラグを明示するのは、保存クエリが正常に 0 件を返した状態と初回起動を区別するため。
+// version と queries（今回追跡したクエリ id）を持つのは、次回に旧形式からの移行と
+// query_ids へのクエリ追加を検出して通知の嵐を防ぐため。
 // 戻り値は保存成否。書き込み不能環境ではログも残せない可能性があるため、呼び出し側が
 // 失敗を Toast でユーザに知らせる。
-static bool saveState(const std::wstring& dir, const std::vector<Issue>& issues) {
+static bool saveState(const std::wstring& dir, const Config& cfg, const std::vector<Issue>& issues) {
     using namespace winrt::Windows::Data::Json;
     try {
         JsonObject root;
+        root.Insert(L"version",  JsonValue::CreateNumberValue(2));
         root.Insert(L"baseline", JsonValue::CreateBooleanValue(true));
+        JsonArray qarr;
+        for (int q : cfg.queryIds) qarr.Append(JsonValue::CreateNumberValue(q));
+        root.Insert(L"queries", qarr);
         JsonArray arr;
         for (const auto& is : issues) {
             JsonObject o;
             o.Insert(L"id",         JsonValue::CreateNumberValue(is.id));
             o.Insert(L"updated_on", JsonValue::CreateStringValue(winrt::to_hstring(is.updatedOn)));
+            JsonArray iq;
+            for (int q : is.queryIds) iq.Append(JsonValue::CreateNumberValue(q));
+            o.Insert(L"queries", iq);
             arr.Append(o);
         }
         root.Insert(L"issues", arr);
@@ -716,6 +797,8 @@ static void savePins(const std::wstring& dir) {
                 o.Insert(L"subject",    JsonValue::CreateStringValue(winrt::to_hstring(p.subject)));
                 o.Insert(L"updated_on", JsonValue::CreateStringValue(winrt::to_hstring(p.updatedOn)));
                 o.Insert(L"closed",     JsonValue::CreateBooleanValue(p.closed));
+                o.Insert(L"due_date",   JsonValue::CreateStringValue(winrt::to_hstring(p.dueDate)));
+                o.Insert(L"assigned_to_group", JsonValue::CreateBooleanValue(p.assignedToGroup));
                 arr.Append(o);
             }
         }
@@ -756,6 +839,9 @@ static void loadPins(const std::wstring& dir) {
             p.subject   = normalizeSubject(winrt::to_string(o.GetNamedString(L"subject", L"")));
             p.updatedOn = winrt::to_string(o.GetNamedString(L"updated_on", L""));
             p.closed    = o.GetNamedBoolean(L"closed", false);
+            // 旧形式（キーなし）は既定値で開始し、次のポーリングの refreshPins で実値になる
+            p.dueDate   = winrt::to_string(o.GetNamedString(L"due_date", L""));
+            p.assignedToGroup = o.GetNamedBoolean(L"assigned_to_group", false);
             if (p.id > 0) g_pins.push_back(std::move(p));
         }
         writeLog("pins: loaded " + std::to_string(g_pins.size()) + " entries");
@@ -857,10 +943,22 @@ static Config loadConfig(const std::wstring& exeDir) {
         if (base && (*base)["redmine"][key].is_string())   return toWide(**(*base)["redmine"][key].as_string());
         return {};
     };
-    auto readRedmineInt = [&](const char* key) -> int {
-        if (local && (*local)["redmine"][key].is_integer()) return static_cast<int>(**(*local)["redmine"][key].as_integer());
-        if (base && (*base)["redmine"][key].is_integer())   return static_cast<int>(**(*base)["redmine"][key].as_integer());
-        return 0;
+    // [redmine] の整数配列（query_ids）
+    // 配列は「local にキーが存在するか」で採否を決める。（duck_targets / schedule と同じ方針）
+    // 0 以下・非整数の要素と重複 id は除外する。（同じ HTTP を 2 回叩かない）
+    auto readRedmineIntArray = [&](const std::optional<toml::table>& tbl, const char* key)
+            -> std::optional<std::vector<int>> {
+        if (!tbl) return std::nullopt;
+        const auto* arr = (*tbl)["redmine"][key].as_array();
+        if (!arr) return std::nullopt;
+        std::vector<int> ids;
+        for (const auto& el : *arr) {
+            auto v = el.value<int64_t>();
+            if (!v || *v <= 0 || *v > INT_MAX) continue;
+            int id = static_cast<int>(*v);
+            if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+        }
+        return ids;
     };
 
     // [redmine] 接続設定（必須。欠落チェックは wmain で行い、欠けていれば起動を中止する）
@@ -868,7 +966,14 @@ static Config loadConfig(const std::wstring& exeDir) {
     while (!cfg.redmineUrl.empty() && cfg.redmineUrl.back() == L'/')
         cfg.redmineUrl.pop_back();  // 末尾スラッシュを除去して URL 連結を単純化する
     cfg.apiKey  = readRedmineString("api_key");
-    cfg.queryId = readRedmineInt("query_id");
+    if (auto q = readRedmineIntArray(local, "query_ids"))     cfg.queryIds = std::move(*q);
+    else if (auto q = readRedmineIntArray(base, "query_ids")) cfg.queryIds = std::move(*q);
+
+    // 旧キー query_id は廃止。設定エラー Toast だけでは移行漏れの原因が分からないためログで補う
+    if ((local && (*local)["redmine"]["query_id"].is_integer())
+        || (base && (*base)["redmine"]["query_id"].is_integer())) {
+        writeLog("config: [redmine] query_id is obsolete; use query_ids = [12, 34]");
+    }
 
     // 一覧の表示件数と件名の省略文字数
     cfg.listLimit       = readTopInt("list_limit", 20, 1, 25);
@@ -895,9 +1000,12 @@ static std::wstring issueUrl(const Config& cfg, int id) {
     return cfg.redmineUrl + L"/issues/" + std::to_wstring(id);
 }
 
-// 保存クエリ画面の URL（{url}/issues?query_id={qid}）
+// 代表クエリ（query_ids の先頭）の画面 URL（{url}/issues?query_id={qid}）
+// 複数件 Toast と一覧フッタの遷移先。和集合を表す URL は Redmine に無いため先頭で代表する。
 static std::wstring queryUrl(const Config& cfg) {
-    return cfg.redmineUrl + L"/issues?query_id=" + std::to_wstring(cfg.queryId);
+    // wmain の検証で非空が保証されるが、空でも 0 に落として未定義動作を作らない
+    int qid = cfg.queryIds.empty() ? 0 : cfg.queryIds.front();
+    return cfg.redmineUrl + L"/issues?query_id=" + std::to_wstring(qid);
 }
 
 // issue JSON オブジェクトを Issue に変換する
@@ -922,14 +1030,22 @@ static Issue parseIssueObject(const winrt::Windows::Data::Json::JsonObject& obj)
         is.closed = v && v.ValueType() == JsonValueType::String
                     && !winrt::to_string(v.GetString()).empty();
     }
+    // due_date はキー不在と null（期限なし）の両方を空として扱う。
+    // GetNamedString は値が null のとき例外になるため、closed_on と同じ判定形にする。
+    if (obj.HasKey(L"due_date")) {
+        auto v = obj.GetNamedValue(L"due_date", nullptr);
+        if (v && v.ValueType() == JsonValueType::String) is.dueDate = winrt::to_string(v.GetString());
+    }
     return is;
 }
 
-// /users/current.json から自分の user id を取得する（起動時 1 回）
+// /users/current.json から自分の user id と所属グループ id を取得する（起動時 1 回）
 // 失敗時は 0 を返す。0 のときは自分の操作の除外判定を行わない。（通知欠落より過剰通知側に倒す）
-static int fetchMyUserId(const Config& cfg) {
+// outOwnGroups は成功時のみ上書きする。グループ担当判定（/groups.json）が権限不足で
+// 使えない場合のフォールバック用。
+static int fetchMyUserId(const Config& cfg, std::vector<int>& outOwnGroups) {
     DWORD status = 0;
-    auto body = redmineGet(cfg.redmineUrl + L"/users/current.json", cfg.apiKey, &status);
+    auto body = redmineGet(cfg.redmineUrl + L"/users/current.json?include=groups", cfg.apiKey, &status);
     if (status != 200 || body.empty()) {
         writeLog("fetchMyUserId: request failed, status=" + std::to_string(status));
         return 0;
@@ -938,6 +1054,13 @@ static int fetchMyUserId(const Config& cfg) {
         auto obj  = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
         auto user = obj.GetNamedObject(L"user", nullptr);
         if (!user) return 0;
+        if (user.HasKey(L"groups")) {
+            outOwnGroups.clear();
+            for (auto g : user.GetNamedArray(L"groups")) {
+                int gid = static_cast<int>(g.GetObject().GetNamedNumber(L"id", 0));
+                if (gid > 0) outOwnGroups.push_back(gid);
+            }
+        }
         return static_cast<int>(user.GetNamedNumber(L"id", 0));
     }
     catch (...) {
@@ -946,29 +1069,67 @@ static int fetchMyUserId(const Config& cfg) {
     }
 }
 
-// 保存クエリの結果を total_count に達するまでページングして取得する
-// 成功時 true。outIssues は updated_on 降順にソート済みで返す。
+// /groups.json から全グループの id を取得する（グループ担当マーカーの判定用、起動時 1 回）
+// この API は admin 権限が必要。403（権限なし）は確定的な失敗として outStatus で呼び出し側に
+// 伝え、所属グループへのフォールバックを促す。接続エラー等は nullopt で再試行対象とする。
+static std::optional<std::vector<int>> fetchAllGroupIds(const Config& cfg, DWORD* outStatus) {
+    DWORD status = 0;
+    auto body = redmineGet(cfg.redmineUrl + L"/groups.json", cfg.apiKey, &status);
+    if (outStatus) *outStatus = status;
+    if (status != 200 || body.empty()) {
+        writeLog("fetchAllGroupIds: request failed, status=" + std::to_string(status));
+        return std::nullopt;
+    }
+    try {
+        auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
+        std::vector<int> ids;
+        if (obj.HasKey(L"groups")) {
+            for (auto g : obj.GetNamedArray(L"groups")) {
+                int gid = static_cast<int>(g.GetObject().GetNamedNumber(L"id", 0));
+                if (gid > 0) ids.push_back(gid);
+            }
+        }
+        return ids;
+    }
+    catch (...) {
+        writeLog("fetchAllGroupIds: JSON parse failed");
+        return std::nullopt;
+    }
+}
+
+// 担当者 id がグループかどうかを判定する（一覧の 👥 マーカー用）
+// groupIds は起動時に確定した判定集合。（全グループ、または権限不足時は自分の所属グループ）
+static bool isGroupAssignee(const std::vector<int>& groupIds, int assignedToId) {
+    return assignedToId != 0
+        && std::find(groupIds.begin(), groupIds.end(), assignedToId) != groupIds.end();
+}
+
+// 保存クエリ 1 件の結果を total_count に達するまでページングして取得する
+// 成功時 true。ソートは行わない。（呼び出し側が和集合を作ってからまとめてソートする）
 // API の sort には依存しない。（query_id 側のソート設定に左右されないため取得後にローカルでソートする）
-static bool fetchIssues(const Config& cfg, std::vector<Issue>& outIssues) {
+// 失敗ログにクエリ id を含めるのは、複数クエリ運用でどのクエリが壊れているかを
+// ログだけで切り分けられるようにするため。
+static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>& outIssues) {
     using namespace winrt::Windows::Data::Json;
     outIssues.clear();
 
+    const std::string logTag = "fetchQueryIssues(" + std::to_string(queryId) + ")";
     int offset = 0;
     int total  = 0;
     do {
-        std::wstring url = cfg.redmineUrl + L"/issues.json?query_id=" + std::to_wstring(cfg.queryId)
+        std::wstring url = cfg.redmineUrl + L"/issues.json?query_id=" + std::to_wstring(queryId)
             + L"&limit=100&offset=" + std::to_wstring(offset);
         DWORD status = 0;
         auto body = redmineGet(url, cfg.apiKey, &status);
         if (status != 200 || body.empty()) {
-            writeLog("fetchIssues: request failed, status=" + std::to_string(status)
+            writeLog(logTag + ": request failed, status=" + std::to_string(status)
                 + " offset=" + std::to_string(offset));
             return false;
         }
         try {
             auto obj = JsonObject::Parse(winrt::to_hstring(body));
             if (obj.HasKey(L"errors")) {
-                writeLog("fetchIssues: API error response");
+                writeLog(logTag + ": API error response");
                 return false;
             }
             total = static_cast<int>(obj.GetNamedNumber(L"total_count", 0));
@@ -981,7 +1142,7 @@ static bool fetchIssues(const Config& cfg, std::vector<Issue>& outIssues) {
             offset += static_cast<int>(arr.Size());
         }
         catch (...) {
-            writeLog("fetchIssues: JSON parse failed");
+            writeLog(logTag + ": JSON parse failed");
             return false;
         }
     } while (offset < total && !g_shutdownRequested);
@@ -989,11 +1150,41 @@ static bool fetchIssues(const Config& cfg, std::vector<Issue>& outIssues) {
     // シャットダウンによる中断や total_count 不整合で全件に達しなかった場合は失敗扱いとする。
     // 部分集合のまま成功を返すと state.json が欠落込みで上書きされ、次回に「新規」誤通知が出る
     if (offset < total) {
-        writeLog("fetchIssues: incomplete (" + std::to_string(offset) + "/"
+        writeLog(logTag + ": incomplete (" + std::to_string(offset) + "/"
             + std::to_string(total) + "), discarded");
         return false;
     }
+    return true;
+}
 
+// query_ids の全クエリを取得し、チケット id で重複排除した和集合を返す
+// 成功時 true。outIssues は updated_on 降順ソート済みで、各要素の queryIds に
+// 「そのチケットが現れたクエリ id」を昇順で保持する。
+// 1 クエリでも失敗したら全体を false として部分結果を破棄する。欠落込みの集合で
+// state.json を上書きすると次回に「新規」誤通知が出るため。（単一クエリ時代の方針を維持）
+static bool fetchIssues(const Config& cfg, std::vector<Issue>& outIssues) {
+    outIssues.clear();
+    std::unordered_map<int, size_t> indexById;  // チケット id → outIssues の位置
+    for (int qid : cfg.queryIds) {
+        std::vector<Issue> part;
+        if (!fetchQueryIssues(cfg, qid, part)) return false;
+        for (auto& is : part) {
+            auto [it, inserted] = indexById.try_emplace(is.id, outIssues.size());
+            if (inserted) {
+                is.queryIds = {qid};
+                outIssues.push_back(std::move(is));
+                continue;
+            }
+            // 重複チケットの表示フィールドは最初に現れたクエリの値を採用する。
+            // 同一時刻に同一 API から取るため内容は一致し、差はポーリング中の更新時だけ。
+            auto& dst = outIssues[it->second];
+            if (std::find(dst.queryIds.begin(), dst.queryIds.end(), qid) == dst.queryIds.end())
+                dst.queryIds.push_back(qid);
+        }
+        if (g_shutdownRequested) return false;  // 途中終了は部分集合なので失敗扱い
+    }
+    // 所属クエリは state.json 上で前回値と比較するため、query_ids の記述順に依存しない昇順へ正規化
+    for (auto& is : outIssues) std::sort(is.queryIds.begin(), is.queryIds.end());
     std::sort(outIssues.begin(), outIssues.end(), [](const Issue& a, const Issue& b) {
         return a.updatedOn > b.updatedOn;
     });
@@ -2164,6 +2355,11 @@ struct IssueItem {
     int          id     = 0;
     std::wstring url;            // {redmine.url}/issues/{id}
     std::wstring label;          // 描画テキスト（WM_DRAWITEM / WM_MEASUREITEM で使用）
+    // 日付部分だけ赤で描くための位置情報。セグメント文字列を別々に持つとラベル全体との
+    // 不整合が起き得るため、label を単一の真実として位置だけを保持する。
+    size_t       dateOffset = 0;
+    size_t       dateLen    = 0;     // 0 = 期限なし（分割描画しない）
+    bool         overdue    = false; // 期限 ≦ 今日（JST）＝日付部分を赤で描く
     bool         pinned = false; // ピン留め中（マーカー列の描画条件。右クリックトグル時にもその場で更新する）
     bool         closed = false; // クローズ済（打ち消し線の描画条件）
 };
@@ -2321,11 +2517,37 @@ static std::wstring truncateSubject(const std::wstring& s, size_t maxChars) {
     return s.substr(0, cut) + L"…";
 }
 
-// 一覧行のラベルを組み立てる（"#12345  件名" 形式）
+// 一覧行のラベル（描画テキストと、その中の日付部分の位置）
+// 日付だけ色を変えて描くため位置と長さも返す。幅計測（measureIssueMenuItem）と打ち消し線は
+// text 全体で行うため、text を単一の真実として保つ。
+struct IssueLabel {
+    std::wstring text;
+    size_t       dateOffset = 0;  // text 内の日付開始位置（dateLen == 0 のとき無意味）
+    size_t       dateLen    = 0;  // 日付部分の文字数（0 = 期限なし）
+};
+
+// グループ担当マーカー（👥 + 半角スペース）
+// ラベルに埋め込み GDI で描く。フォントリンク経由の単色描画で足りるため、
+// 📌 のような D2D カラー描画はしない。（単色でも輪郭が明瞭で意味が通る）
+static constexpr wchar_t GROUP_MARK[] = L"👥 ";
+
+// 一覧行のラベルを組み立てる
+//   期限あり："#12345  7/28 件名"（番号の後は空白 2、日付の後は空白 1）
+//   期限なし："#12345  件名"（従来どおり）
+//   グループ担当：件名の直前に 👥 を付ける（例："#12345  7/28 👥 件名"）
 // ピン記号はラベルに含めない。WM_DRAWITEM が IssueItem::pinned を見てマーカー列に描く。
-static std::wstring buildIssueLabel(int id, const std::string& subject) {
-    return L"#" + std::to_wstring(id) + L"  "
-        + truncateSubject(toWide(subject), static_cast<size_t>(g_currentConfig.subjectMaxChars));
+static IssueLabel buildIssueLabel(int id, const std::string& subject, const std::wstring& dateMd,
+                                  bool assignedToGroup) {
+    IssueLabel r;
+    r.text = L"#" + std::to_wstring(id) + L"  ";
+    if (!dateMd.empty()) {
+        r.dateOffset = r.text.size();
+        r.dateLen    = dateMd.size();
+        r.text += dateMd + L" ";
+    }
+    if (assignedToGroup) r.text += GROUP_MARK;
+    r.text += truncateSubject(toWide(subject), static_cast<size_t>(g_currentConfig.subjectMaxChars));
+    return r;
 }
 
 // 左クリック時のチケット一覧ポップアップ表示
@@ -2346,6 +2568,25 @@ static void showIssuePopup(HWND hWnd) {
         pins   = g_pins;
     }
     const Config& cfg = g_currentConfig;
+
+    // 「今日」は 1 回だけ求めて全行に使う。行ごとに求めると日付境界をまたいだ瞬間に
+    // 同じ一覧内で赤判定が揺れる
+    const int todayYmd = todayJstYmd();
+    auto makeItem = [&](int id, const std::string& subject, const std::string& dueDate,
+                        bool assignedToGroup, bool pinned, bool closed) {
+        IssueItem it;
+        it.id  = id;
+        it.url = issueUrl(cfg, id);
+        auto due = makeDueDateView(dueDate, todayYmd);
+        auto lbl = buildIssueLabel(id, subject, due.md, assignedToGroup);
+        it.label      = std::move(lbl.text);
+        it.dateOffset = lbl.dateOffset;
+        it.dateLen    = lbl.dateLen;
+        it.overdue    = due.overdue;
+        it.pinned     = pinned;
+        it.closed     = closed;
+        return it;
+    };
 
     auto isPinned = [&pins](int id) {
         for (const auto& p : pins) {
@@ -2370,13 +2611,13 @@ static void showIssuePopup(HWND hWnd) {
         }
         if (rows.size() >= static_cast<size_t>(cfg.listLimit)) continue;
         rows.push_back({is.updatedOn,
-            {is.id, issueUrl(cfg, is.id), buildIssueLabel(is.id, is.subject), pinned, is.closed}});
+            makeItem(is.id, is.subject, is.dueDate, is.assignedToGroup, pinned, is.closed)});
         shown.insert(is.id);
     }
     for (const auto& p : pins) {
         if (shown.count(p.id)) continue;
         rows.push_back({p.updatedOn,
-            {p.id, issueUrl(cfg, p.id), buildIssueLabel(p.id, p.subject), true, p.closed}});
+            makeItem(p.id, p.subject, p.dueDate, p.assignedToGroup, true, p.closed)});
     }
     std::sort(rows.begin(), rows.end(),
         [](const auto& a, const auto& b) { return a.first > b.first; });
@@ -2744,15 +2985,19 @@ static BOOL measureIssueMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
     GetTextExtentPoint32W(hdc, PIN_MARK, static_cast<int>(wcslen(PIN_MARK)), &markSz);
     SelectObject(hdc, old);
     ReleaseDC(hWnd, hdc);
-    // 左右パディングとして 16 px ずつ確保する
-    mis->itemWidth  = static_cast<UINT>(sz.cx + markSz.cx) + 32;
+    // パディングは左 8 px + 右 16 px。（左はピンマーカー列が続くため控えめにする）
+    mis->itemWidth  = static_cast<UINT>(sz.cx + markSz.cx) + 24;
     mis->itemHeight = static_cast<UINT>(sz.cy) + 6;
     return TRUE;
 }
 
+// 期限切れ日付の文字色（更新通知メニューの新バージョン表示と同じ赤に揃える）
+static constexpr COLORREF OVERDUE_DATE_COLOR = RGB(220, 0, 0);
+
 // 左クリックポップアップの owner-draw 項目描画
 // ODS_SELECTED に応じた背景色・テキスト色を切り替え、closed フラグが立つ項目には
 // DrawTextW 後に 2 px の取消線を手動で重ね描画する。
+// 期限切れ（overdue）の行は日付部分だけ OVERDUE_DATE_COLOR で描く。
 static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
     if (dis->CtlType != ODT_MENU) return FALSE;
     UINT eidx = static_cast<UINT>(dis->itemData);
@@ -2765,7 +3010,7 @@ static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
             static_cast<INT_PTR>(selected ? COLOR_HIGHLIGHT + 1 : COLOR_MENU + 1)));
 
     RECT textRect  = dis->rcItem;
-    textRect.left += 16;
+    textRect.left += 8;  // 左パディング（measureIssueMenuItem の確保幅と揃える）
     SetBkMode(dis->hDC, TRANSPARENT);
     COLORREF textColor = GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT);
     SetTextColor(dis->hDC, textColor);
@@ -2788,8 +3033,36 @@ static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
     textRect.left += markSz.cx;
     // DT_NOPREFIX がないと件名中の & がニーモニック指定として食われ、次の文字に下線が付く
     // （幅は & を 1 文字として計測するため、描画幅とのずれで取消線も伸び過ぎる）
-    DrawTextW(dis->hDC, item.label.c_str(), -1, &textRect,
-        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+    constexpr UINT DT_ROW = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX;
+    if (item.overdue && item.dateLen > 0 && !selected) {
+        // 期限切れの日付部分だけ赤にするため「前・日付・後」の 3 セグメントに分けて描く。
+        // 選択行は drawVersionMenuItem と同じく赤をやめて textColor 一色（単発描画）。
+        // 送り幅は「ラベル先頭からの累積」で測る。セグメント単位に測って足すと丸め差が
+        // 積み上がり、ラベル全体で計測している行幅・打ち消し線とずれる
+        const wchar_t* base = item.label.c_str();
+        size_t preLen  = item.dateOffset;
+        size_t dateEnd = item.dateOffset + item.dateLen;
+        SIZE szPre = {}, szThroughDate = {};
+        GetTextExtentPoint32W(dis->hDC, base, static_cast<int>(preLen), &szPre);
+        GetTextExtentPoint32W(dis->hDC, base, static_cast<int>(dateEnd), &szThroughDate);
+
+        RECT seg = textRect;
+        DrawTextW(dis->hDC, base, static_cast<int>(preLen), &seg, DT_ROW);
+
+        seg = textRect;
+        seg.left += szPre.cx;
+        SetTextColor(dis->hDC, OVERDUE_DATE_COLOR);
+        DrawTextW(dis->hDC, base + preLen, static_cast<int>(item.dateLen), &seg, DT_ROW);
+
+        seg = textRect;
+        seg.left += szThroughDate.cx;
+        SetTextColor(dis->hDC, textColor);  // 件名は通常色へ戻す（打ち消し線も textColor を使う）
+        DrawTextW(dis->hDC, base + dateEnd,
+            static_cast<int>(item.label.size() - dateEnd), &seg, DT_ROW);
+    }
+    else {
+        DrawTextW(dis->hDC, item.label.c_str(), -1, &textRect, DT_ROW);
+    }
     if (item.closed) {
         SIZE sz = {};
         GetTextExtentPoint32W(dis->hDC, item.label.c_str(),
@@ -2847,15 +3120,17 @@ static void togglePin(UINT itemIdx, HMENU hm) {
                 catch (...) {}
                 return;
             }
-            // 件名・更新日時は g_issues から引く（一覧行のラベルは省略済みで復元できないため）
+            // 件名・更新日時・期限日は g_issues から引く（一覧行のラベルは省略済みで復元できないため）
             PinEntry p;
             p.id     = item.id;
             p.closed = item.closed;
             for (const auto& is : g_issues) {
                 if (is.id == item.id) {
-                    p.subject   = is.subject;
-                    p.updatedOn = is.updatedOn;
-                    p.closed    = is.closed;
+                    p.subject         = is.subject;
+                    p.updatedOn       = is.updatedOn;
+                    p.closed          = is.closed;
+                    p.dueDate         = is.dueDate;
+                    p.assignedToGroup = is.assignedToGroup;
                     break;
                 }
             }
@@ -2872,7 +3147,10 @@ static void togglePin(UINT itemIdx, HMENU hm) {
         wchar_t className[16] = {};
         if (GetClassNameW(hwnd, className, ARRAYSIZE(className))
             && wcscmp(className, L"#32768") == 0) {
-            InvalidateRect(hwnd, nullptr, TRUE);
+            // erase は FALSE にして背景消去を抑止する。メニューの WM_PAINT が全項目
+            // （owner-draw 行・セパレータ・フッタ）を描き直すため消去は不要。
+            // TRUE だと全面消去→再描画の白フラッシュ（チラつき）が見える
+            InvalidateRect(hwnd, nullptr, FALSE);
             UpdateWindow(hwnd);
         }
         return TRUE;
@@ -2967,7 +3245,8 @@ static VOID WINAPI onNetworkChange(PVOID, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION
 // 個別取得で最新化する（最大 PIN_LIMIT 回/ポーリング）。個別取得の失敗時（削除済み・
 // 接続エラー）は前回キャッシュの内容のまま表示を継続する。
 static void refreshPins(const std::wstring& exeDir, const Config& cfg,
-                        const std::vector<Issue>& issues)
+                        const std::vector<Issue>& issues, const std::vector<int>& groupIds,
+                        bool groupIdsResolved)
 {
     std::vector<PinEntry> pinsSnapshot;
     {
@@ -2982,13 +3261,26 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
         Issue fetched;
         const Issue* src = nullptr;
         auto it = byId.find(p.id);
-        if (it != byId.end())                    src = it->second;
-        else if (fetchIssue(cfg, p.id, fetched)) src = &fetched;
+        if (it != byId.end()) {
+            src = it->second;
+        }
+        else if (fetchIssue(cfg, p.id, fetched)) {
+            // 個別取得分にもグループ担当を付与する（取得集合と同じ判定を通す）
+            fetched.assignedToGroup = isGroupAssignee(groupIds, fetched.assignedToId);
+            src = &fetched;
+        }
+        // 判定集合が未解決の間はグループフラグを比較・更新しない。空集合との突合結果（全 false）で
+        // 保存済みの true を書き戻してしまうため。（解決後のポーリングで追いつく）
+        bool groupChanged = src && groupIdsResolved
+            && p.assignedToGroup != src->assignedToGroup;
         if (src && (p.subject != src->subject || p.updatedOn != src->updatedOn
-                    || p.closed != src->closed)) {
+                    || p.closed != src->closed || p.dueDate != src->dueDate
+                    || groupChanged)) {
             p.subject   = src->subject;
             p.updatedOn = src->updatedOn;
             p.closed    = src->closed;
+            p.dueDate   = src->dueDate;
+            if (groupIdsResolved) p.assignedToGroup = src->assignedToGroup;
             changed = true;
         }
     }
@@ -3001,9 +3293,11 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
         for (auto& gp : g_pins) {
             for (const auto& sp : pinsSnapshot) {
                 if (gp.id == sp.id) {
-                    gp.subject   = sp.subject;
-                    gp.updatedOn = sp.updatedOn;
-                    gp.closed    = sp.closed;
+                    gp.subject         = sp.subject;
+                    gp.updatedOn       = sp.updatedOn;
+                    gp.closed          = sp.closed;
+                    gp.dueDate         = sp.dueDate;
+                    gp.assignedToGroup = sp.assignedToGroup;
                     break;
                 }
             }
@@ -3012,9 +3306,35 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
     savePins(exeDir);
 }
 
+// 通知理由（1 件時の Toast 文言切替とログ内訳に使う）
+enum class NotifyKind { New, Updated, QueryEntered };
+
+// 通知対象 1 件（prev の再検索を省くため理由を持たせる）
+struct NotifyTarget {
+    const Issue* issue = nullptr;
+    NotifyKind   kind  = NotifyKind::Updated;
+};
+
+// now に有り prev に無いクエリ id があるか（＝新たなクエリへの流入があるか）
+// known（前回追跡していたクエリ id）に無いクエリは流入と見なさない。query_ids に追加した
+// 直後、そのクエリの全件が「更新」通知になるのを防ぐため。（v1 移行と同じ「黙って採用」方針）
+static bool hasNewQueryEntry(const std::vector<int>& now, const std::vector<int>& prev,
+                             const std::vector<int>& known)
+{
+    for (int q : now) {
+        if (std::find(prev.begin(), prev.end(), q) != prev.end()) continue;
+        if (std::find(known.begin(), known.end(), q) == known.end()) continue;
+        return true;
+    }
+    return false;
+}
+
 // ポーリング結果の処理（通知判定 → Toast → 状態保存）
 //
-// 前回状態（state.json）と突合して「新規流入」と「updated_on の進行」を検知する。
+// 前回状態（state.json）と突合して「新規流入」「updated_on の進行」「既知チケットの
+// 新クエリ流入」を検知する。クエリ流入は「更新」として通知する。ただし前回追跡して
+// いなかったクエリについては、そのクエリへの流入も、そのクエリだけに属するチケットの
+// 新規流入も検知しない。（設定追加直後の通知の嵐を防ぐ）
 // 自分が起票したチケットの流入は author.id で、自分の操作による更新は最終 journal の
 // 更新者 id で除外する。（g_myUserId == 0 のときはどちらの除外も行わず通知側に倒す）
 // 担当者フィルタ ON なら、自分が担当でないチケットもあわせて除外する。
@@ -3028,20 +3348,33 @@ static void deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         g_issues = issues;
     }
 
-    std::unordered_map<int, std::string> prev;
-    bool baseline = loadState(exeDir, prev);
-    if (!baseline) {
+    PollState prev = loadState(exeDir);
+    if (!prev.baseline) {
         // 保存失敗を放置すると baseline が永久に確立せず無言で通知ゼロになるため、Toast で知らせる
         // （書き込み不可のディレクトリに展開した場合など、ログ自体が残せない環境を想定）
-        if (!saveState(exeDir, issues))
+        if (!saveState(exeDir, cfg, issues))
             showErrorToast(L"状態保存エラー", L"state.json を書き込めません。展開先の書き込み権限を確認してください");
         if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
         writeLog("baseline established (" + std::to_string(issues.size()) + " issues)");
         return;
     }
 
+    // 旧形式からの移行と query_ids への追加分をログに残す。
+    // どちらも「流入検知を見送った回」で、通知が出ないことの説明になる
+    if (prev.knownQueries.empty()) {
+        writeLog("state: v1 format (no query membership), adopting membership silently");
+    }
+    else {
+        for (int q : cfg.queryIds) {
+            if (std::find(prev.knownQueries.begin(), prev.knownQueries.end(), q)
+                    == prev.knownQueries.end())
+                writeLog("state: query " + std::to_string(q)
+                    + " newly tracked, adopting membership silently");
+        }
+    }
+
     // 通知対象の抽出
-    std::vector<const Issue*> targets;
+    std::vector<NotifyTarget> targets;
     for (const auto& is : issues) {
         // 更新判定は 1 件ごとに journals の同期 HTTP を伴い件数上限もないため、中断可能にする。
         // ここで抜けると state.json は前回のまま残り、次回ポーリングで再検知される（通知は失われない）
@@ -3049,31 +3382,50 @@ static void deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         // 担当者フィルタで外れたチケットは通知しない
         // prev の照合より前に置くことで、除外分の journals 取得（同期 HTTP）も省ける
         if (!passesAssigneeFilter(is)) continue;
-        auto it = prev.find(is.id);
-        if (it == prev.end()) {
+        auto it = prev.issues.find(is.id);
+        if (it == prev.issues.end()) {
             // 新規流入（自分の起票は通知しない）
             if (g_myUserId != 0 && is.authorId == g_myUserId) continue;
-            targets.push_back(&is);
+            // 前回追跡していたクエリのいずれにも属さないチケットは、query_ids へ追加した
+            // 直後のクエリ固有の既存チケットなので黙って採用する。（既知チケットの流入抑止と
+            // 同じ方針。通知するとサマリ Toast・通知音・未読バッジが件数分跳ね上がる）
+            // v1 移行時は knownQueries が空で判定できないため、従来どおり通知側に倒す。
+            bool inKnown = prev.knownQueries.empty();
+            for (int q : is.queryIds) {
+                if (std::find(prev.knownQueries.begin(), prev.knownQueries.end(), q)
+                        != prev.knownQueries.end()) {
+                    inKnown = true;
+                    break;
+                }
+            }
+            if (!inKnown) continue;
+            targets.push_back({&is, NotifyKind::New});
+            continue;
         }
-        else if (is.updatedOn > it->second) {
-            // 更新（自分の操作は通知しない）
-            if (isLastUpdateByMe(cfg, is.id)) continue;
-            targets.push_back(&is);
-        }
+        const StateEntry& pv = it->second;
+        bool updated = is.updatedOn > pv.updatedOn;
+        // 既知チケットの新クエリ流入（期限が近づいて期限クエリに入った等）。「更新」扱いで通知する
+        bool entered = pv.hasQueries
+            && hasNewQueryEntry(is.queryIds, pv.queryIds, prev.knownQueries);
+        if (!updated && !entered) continue;
+        // 自分の操作による更新は通知しない。updated_on が進んでいない純粋な流入では
+        // journals を引かない：時間経過による流入が典型で「自分の操作」ではないため。
+        if (updated && isLastUpdateByMe(cfg, is.id)) continue;
+        targets.push_back({&is, updated ? NotifyKind::Updated : NotifyKind::QueryEntered});
     }
 
     if (!targets.empty()) {
         try {
             if (targets.size() == 1) {
                 // 1 件：チケット番号＋件名を出し、クリックでそのチケットを開く
-                const Issue* t = targets[0];
-                bool isNew = prev.find(t->id) == prev.end();
+                const Issue* t = targets[0].issue;
+                bool isNew = targets[0].kind == NotifyKind::New;
                 showToast(L"#" + std::to_wstring(t->id) + L" " + toWide(t->subject),
                           isNew ? L"新規" : L"更新",
                           issueUrl(cfg, t->id));
             }
             else {
-                // 複数件：合計件数のみのサマリ 1 通とし、クリックでクエリ画面を開く
+                // 複数件：合計件数のみのサマリ 1 通とし、クリックで代表クエリ画面（query_ids の先頭）を開く
                 showToast(L"チケットが " + std::to_wstring(targets.size()) + L" 件更新されました",
                           L"",
                           queryUrl(cfg));
@@ -3089,11 +3441,20 @@ static void deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         if (g_soundEnabled.load() && !(g_muteInMeeting.load() && isMeetingActive()))
             launchSound(cfg);
         g_unreadCount.fetch_add(static_cast<int>(targets.size()));
-        writeLog("notify: " + std::to_string(targets.size()) + " issue(s)");
+        int nNew = 0, nUpd = 0, nEnt = 0;
+        for (const auto& t : targets) {
+            if (t.kind == NotifyKind::New)          ++nNew;
+            else if (t.kind == NotifyKind::Updated) ++nUpd;
+            else                                    ++nEnt;
+        }
+        // 内訳を残すのは、クエリ流入だけで通知が出た回を後から切り分けるため
+        writeLog("notify: " + std::to_string(targets.size()) + " issue(s) (new="
+            + std::to_string(nNew) + " updated=" + std::to_string(nUpd)
+            + " entered=" + std::to_string(nEnt) + ")");
     }
 
     // 保存に失敗すると次回も同じ更新を再検知して通知が重複するため、Toast で知らせる
-    if (!saveState(exeDir, issues))
+    if (!saveState(exeDir, cfg, issues))
         showErrorToast(L"状態保存エラー", L"state.json を書き込めません。通知が重複する可能性があります");
     if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
 }
@@ -3111,6 +3472,11 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     winrt::init_apartment();
 
     bool startupPoll = true;  // 起動直後の 1 回だけ schedule・クールダウンに関わらずポーリングする
+
+    // グループ担当判定用の id 集合（起動後に 1 回確定する。本スレッド専用でロック不要）
+    std::vector<int> ownGroups;        // 自分の所属グループ（fetchMyUserId が設定）
+    std::vector<int> groupIds;         // 判定に使う集合（全グループ、権限不足時は所属グループ）
+    bool groupIdsResolved = false;
 
     while (!g_shutdownRequested) {
         try {
@@ -3137,8 +3503,25 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             // 自動起動直後などネットワーク未接続で失敗した場合に備え、取得できるまで毎回試みる。
             // 休止時間帯の判定より後に置き、休止中はネットワークに一切触れない
             if (g_myUserId == 0) {
-                g_myUserId = fetchMyUserId(cfg);
+                g_myUserId = fetchMyUserId(cfg, ownGroups);
                 if (g_myUserId != 0) writeLog("my user id: " + std::to_string(g_myUserId.load()));
+            }
+
+            // グループ担当マーカーの判定集合を確定する（user id 取得後に 1 回）
+            // /groups.json は admin 権限が必要なため、403 なら自分の所属グループへ縮退する。
+            // （他グループ宛の判定は漏れるが誤判定はしない）接続エラーは次回ポーリングで再試行。
+            if (!groupIdsResolved && g_myUserId != 0) {
+                DWORD status = 0;
+                if (auto all = fetchAllGroupIds(cfg, &status)) {
+                    groupIds = std::move(*all);
+                    groupIdsResolved = true;
+                    writeLog("group ids: " + std::to_string(groupIds.size()) + " (all groups)");
+                }
+                else if (status == 403) {
+                    groupIds = ownGroups;
+                    groupIdsResolved = true;
+                    writeLog("group ids: " + std::to_string(groupIds.size()) + " (own groups fallback)");
+                }
             }
 
             // 即時ポーリング判定。（forcePoll フラグ or 1 時間以上未ポーリング）
@@ -3183,8 +3566,12 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             writeLog("poll: " + std::to_string(issues.size()) + " issues ("
                 + std::to_string(elapsed) + "ms), next: " + nextPollTimeStr(pollsPerHour));
 
+            // 担当がグループかを付与する（一覧の 👥 マーカー用。表示専用の属性のため取得後に一括で付ける）
+            for (auto& is : issues)
+                is.assignedToGroup = isGroupAssignee(groupIds, is.assignedToId);
+
             deliverPollResults(exeDir, cfg, issues);
-            refreshPins(exeDir, cfg, issues);
+            refreshPins(exeDir, cfg, issues, groupIds, groupIdsResolved);
 
             g_lastPollTick.store(GetTickCount64());
             waitInterruptible(calcSleepUntilNextPoll(pollsPerHour));
@@ -3274,11 +3661,11 @@ int wmain() {
         // url のスキームもここで検証し、以降の全経路（API・ブラウザ起動・Toast ボタン）で
         // http(s) 以外が ShellExecuteW に渡らないことを保証する
         if (cfg.redmineUrl.empty() || !isHttpUrl(cfg.redmineUrl)
-            || cfg.apiKey.empty() || cfg.queryId <= 0) {
-            writeLog("config error: [redmine] url (must start with http:// or https://) / api_key / query_id must be set in redntfy.local.toml");
+            || cfg.apiKey.empty() || cfg.queryIds.empty()) {
+            writeLog("config error: [redmine] url (must start with http:// or https://) / api_key / query_ids must be set in redntfy.local.toml");
             try {
                 showToast(L"設定エラー",
-                          L"redntfy.local.toml の [redmine] url / api_key / query_id を設定してください",
+                          L"redntfy.local.toml の [redmine] url / api_key / query_ids を設定してください",
                           L"", false);
             }
             catch (...) {}
@@ -3299,6 +3686,12 @@ int wmain() {
 
         writeLog("started");
         logSchedule(cfg.schedule);
+        // どのクエリを追跡しているかは state.json の記録と通知挙動に直結するため起動時に残す
+        {
+            std::string s;
+            for (int q : cfg.queryIds) s += (s.empty() ? "" : ",") + std::to_string(q);
+            writeLog("query_ids: [" + s + "]");
+        }
 
         // 更新チェックスレッド起動（起動時に 1 回のみ実行、detach で分離）
         if (cfg.updateCheckEnabled) {
