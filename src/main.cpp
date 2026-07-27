@@ -111,6 +111,8 @@ static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリ
 static constexpr UINT IDM_OPEN_QUERY          = 40009; // Redmine の保存クエリ画面を開く
 static constexpr UINT IDM_STARTUP             = 40010; // Windows スタートアップ登録トグル
 static constexpr UINT IDM_ASSIGNED_TO_ME      = 40011; // 担当がグループのチケットを一覧・tooltip・通知から除外するトグル
+static constexpr UINT IDM_UPDATE_NOW          = 40012; // 休止時間帯・クールダウンを無視した即時ポーリング
+static constexpr UINT IDM_SORT_BY_DUE         = 40013; // 一覧を期日昇順に並べるトグル
 
 static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/redntfy";
 static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/redntfy/releases";
@@ -172,6 +174,9 @@ static std::atomic<bool> g_muteInMeeting{true};
 // 対価として、ON 中に抑止した更新は state.json に記録済みのため OFF に戻しても再通知されない。
 static std::atomic<bool> g_assignedToMeOnly{false};
 
+// 一覧を期日昇順に並べるトグル（レジストリ永続化。OFF は更新日時降順）
+static std::atomic<bool> g_sortByDue{false};
+
 // トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングループと通知スレッドが参照）
 static HWND g_hWnd = nullptr;
 
@@ -180,6 +185,10 @@ static std::atomic<bool> g_popupShowing{false};
 
 // スリープ復帰・ロック解除時の即時ポーリングフラグ
 static std::atomic<bool> g_forcePoll{false};
+
+// トレイメニュー「今すぐ更新」の即時ポーリングフラグ
+// 明示のユーザ操作のため、g_forcePoll と違い休止時間帯・クールダウンの抑止を受けない
+static std::atomic<bool> g_manualPoll{false};
 
 // 前回ポーリング実行時刻（GetTickCount64、連続ポーリング抑制・stale 判定用）
 static std::atomic<ULONGLONG> g_lastPollTick{0};
@@ -267,6 +276,11 @@ static Config                  g_currentConfig;
 // 未読件数（前回一覧を開いてから検知した通知対象の累計。一覧を開くと 0 に戻す。永続化しない）
 static std::atomic<int>        g_unreadCount{0};
 
+// 未読チケットの id 集合（g_mtx で保護。一覧の太字表示に使い、一覧を開いた時点でクリアする）
+// 通知対象になったチケットの id 集合。g_unreadCount は重複を含む累計のため件数は一致しない。
+// 永続化しない。
+static std::unordered_set<int> g_unreadIds;
+
 // 自分の Redmine user id（起動時に /users/current.json で確定。0 = 取得失敗＝自分除外判定なし）
 // ポーリングスレッドが書き込み、担当者フィルタのため WndProc スレッドも読むので atomic とする。
 static std::atomic<int>        g_myUserId{0};
@@ -303,7 +317,8 @@ static HANDLE g_soundThread = nullptr;
 static std::wstring g_exeDir;
 
 // 左クリックポップアップのチケット項目描画用フォント（initMenuFonts で初期化）
-static HFONT g_hMenuFont = nullptr;
+static HFONT g_hMenuFont     = nullptr;
+static HFONT g_hMenuFontBold = nullptr;  // 未読行用の太字（フェイス・サイズは g_hMenuFont と同一）
 
 // 通知音再生スレッドへの受け渡し用コンテキスト
 // ダッキング操作（duck/unduck）はすべて soundThread 内で実行する。
@@ -1354,6 +1369,7 @@ static constexpr const wchar_t* REG_KEY_PATH        = L"SOFTWARE\\redntfy";
 static constexpr const wchar_t* REG_SOUND_ENABLED     = L"SoundEnabled";
 static constexpr const wchar_t* REG_MUTE_IN_MEETING   = L"MuteInMeeting";
 static constexpr const wchar_t* REG_ASSIGNED_TO_ME    = L"AssignedToMeOnly";
+static constexpr const wchar_t* REG_SORT_BY_DUE       = L"SortByDue";
 static constexpr const wchar_t* REG_NOTIFIED_VERSION  = L"NotifiedUpdateVersion";
 
 // Windows スタートアップ登録用レジストリ（HKCU Run キー）
@@ -2137,11 +2153,11 @@ static void showErrorToast(const std::wstring& title, const std::wstring& body)
 // バックグラウンドスレッド用の中断可能 Sleep
 //
 // メッセージは処理しない。（呼び出し元がメインスレッドではないため）
-// g_shutdownRequested または g_forcePoll が true になった時点で即座にリターンする。
+// g_shutdownRequested・g_forcePoll・g_manualPoll のいずれかが true になった時点で即座にリターンする。
 // 100 ms 単位で各フラグをポーリングするため、最大 100 ms の中断遅延が発生する。
 static void waitInterruptible(DWORD ms) {
     ULONGLONG end = GetTickCount64() + ms;
-    while (!g_shutdownRequested && !g_forcePoll.load()) {
+    while (!g_shutdownRequested && !g_forcePoll.load() && !g_manualPoll.load()) {
         ULONGLONG now = GetTickCount64();
         if (end <= now) break;
         ULONGLONG remain = end - now;
@@ -2348,6 +2364,10 @@ static void initMenuFonts() {
     NONCLIENTMETRICSW ncm = { sizeof(ncm) };
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
     g_hMenuFont = CreateFontIndirectW(&ncm.lfMenuFont);
+    // 未読行の太字はメニューフォントのウェイトだけ変えて作る（フェイス・サイズは揃える）
+    LOGFONTW lfBold = ncm.lfMenuFont;
+    lfBold.lfWeight = FW_BOLD;
+    g_hMenuFontBold = CreateFontIndirectW(&lfBold);
 }
 
 // 左クリックポップアップのチケット項目（IDM_ISSUE_BASE + index に対応、WndProc スレッドのみ使用）
@@ -2360,6 +2380,7 @@ struct IssueItem {
     size_t       dateOffset = 0;
     size_t       dateLen    = 0;     // 0 = 期限なし（分割描画しない）
     bool         overdue    = false; // 期限 ≦ 今日（JST）＝日付部分を赤で描く
+    bool         unread     = false; // 未読（前回一覧表示以降に検知）＝太字で描く
     bool         pinned = false; // ピン留め中（マーカー列の描画条件。右クリックトグル時にもその場で更新する）
     bool         closed = false; // クローズ済（打ち消し線の描画条件）
 };
@@ -2553,19 +2574,25 @@ static IssueLabel buildIssueLabel(int id, const std::string& subject, const std:
 // 左クリック時のチケット一覧ポップアップ表示
 //
 // 表示リストの組み立て：
-//   1. g_issues（updated_on 降順）から担当者フィルタを通った先頭 list_limit 件を採る
+//   1. g_issues から担当者フィルタを通った行をすべて採る
 //      （フィルタで外れてもピン留め済みなら残す。ピンはフィルタより優先する）
 //   2. 1 に含まれないピンを追加する（保存クエリの集合外ピンはキャッシュ内容で表示）
-//   3. 全体を updated_on 降順で再ソートする（ピンも本来の位置に置く）
+//   3. 全体を並べ替える（既定は updated_on 降順。「期日順に並べる」ON なら期日昇順で
+//      期日なしは末尾。ピンも同じ規則で本来の位置に置く）
+//   4. 先頭 list_limit 件へ絞る（ピン留めは上限適用外で常に残す）
 // 行の左クリックでチケットを開き、右クリックでピン留めをトグルする。
 // フッタの「未処理 N 件」はフィルタを通った件数で、フィルタで外れたピンは数えない。
 static void showIssuePopup(HWND hWnd) {
     std::vector<Issue>    issues;
     std::vector<PinEntry> pins;
+    std::unordered_set<int> unread;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         issues = g_issues;
         pins   = g_pins;
+        // 一覧を開いた時点で既読化する。swap でスナップショットとクリアを同時に行い、
+        // この表示に限り太字で見せる。（g_unreadCount と同じ「開いたら既読」の意味論）
+        unread.swap(g_unreadIds);
     }
     const Config& cfg = g_currentConfig;
 
@@ -2583,6 +2610,7 @@ static void showIssuePopup(HWND hWnd) {
         it.dateOffset = lbl.dateOffset;
         it.dateLen    = lbl.dateLen;
         it.overdue    = due.overdue;
+        it.unread     = unread.count(id) != 0;
         it.pinned     = pinned;
         it.closed     = closed;
         return it;
@@ -2595,8 +2623,13 @@ static void showIssuePopup(HWND hWnd) {
         return false;
     };
 
-    // first = updated_on（ソートキー）、second = 表示行
-    std::vector<std::pair<std::string, IssueItem>> rows;
+    // 表示行とソートキー（既定は updatedOn、「期日順に並べる」ON なら dueDate を主キーにする）
+    struct RowEntry {
+        std::string updatedOn;
+        std::string dueDate;   // "YYYY-MM-DD"（期日なしは空）
+        IssueItem   item;
+    };
+    std::vector<RowEntry> rows;
     std::unordered_set<int> shown;
     int visible = 0;
     for (const auto& is : issues) {
@@ -2609,18 +2642,42 @@ static void showIssuePopup(HWND hWnd) {
         else {
             ++visible;
         }
-        if (rows.size() >= static_cast<size_t>(cfg.listLimit)) continue;
-        rows.push_back({is.updatedOn,
+        rows.push_back({is.updatedOn, is.dueDate,
             makeItem(is.id, is.subject, is.dueDate, is.assignedToGroup, pinned, is.closed)});
         shown.insert(is.id);
     }
     for (const auto& p : pins) {
         if (shown.count(p.id)) continue;
-        rows.push_back({p.updatedOn,
+        rows.push_back({p.updatedOn, p.dueDate,
             makeItem(p.id, p.subject, p.dueDate, p.assignedToGroup, true, p.closed)});
     }
-    std::sort(rows.begin(), rows.end(),
-        [](const auto& a, const auto& b) { return a.first > b.first; });
+    if (g_sortByDue.load()) {
+        // 期日は ISO 形式のため文字列辞書順で昇順に比較できる。期日なしは末尾へ回し、
+        // 同順位は更新日時降順で安定させる
+        std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+            bool aNone = a.dueDate.empty(), bNone = b.dueDate.empty();
+            if (aNone != bNone) return bNone;
+            if (a.dueDate != b.dueDate) return a.dueDate < b.dueDate;
+            return a.updatedOn > b.updatedOn;
+        });
+    }
+    else {
+        std::sort(rows.begin(), rows.end(),
+            [](const auto& a, const auto& b) { return a.updatedOn > b.updatedOn; });
+    }
+
+    // 並べ替えの後に list_limit 件へ絞る。（ピン留めは上限適用外で常に残す）
+    // 絞り込みを並べ替えの前に行うと、期日順 ON のとき「更新は古いが期日が近い」チケットが
+    // 更新日時降順の窓から落ちて一覧に出ない。
+    if (rows.size() > static_cast<size_t>(cfg.listLimit)) {
+        std::vector<RowEntry> kept;
+        kept.reserve(rows.size());
+        for (auto& r : rows) {
+            if (kept.size() < static_cast<size_t>(cfg.listLimit) || r.item.pinned)
+                kept.push_back(std::move(r));
+        }
+        rows = std::move(kept);
+    }
 
     g_issueItems.clear();
     HMENU hMenu = CreatePopupMenu();
@@ -2643,7 +2700,7 @@ static void showIssuePopup(HWND hWnd) {
             mii.wID        = IDM_ISSUE_BASE + idx;
             mii.dwItemData = static_cast<ULONG_PTR>(idx);
             InsertMenuItemW(hMenu, idx, TRUE, &mii);
-            g_issueItems.push_back(row.second);
+            g_issueItems.push_back(row.item);
             ++idx;
         }
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
@@ -2652,7 +2709,8 @@ static void showIssuePopup(HWND hWnd) {
         AppendMenuW(hMenu, MF_STRING, IDM_OPEN_QUERY, footer.c_str());
     }
 
-    // 一覧を開いた時点で未読を既読化する（バッジと tooltip はポップアップ終了後に更新される）
+    // 一覧を開いた時点で未読件数を既読化する（バッジと tooltip はポップアップ終了後に更新される。
+    // 未読 id 集合は冒頭のスナップショット取得時に swap でクリア済み）
     g_unreadCount.store(0);
     if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
 
@@ -2838,9 +2896,17 @@ static void showTrayContextMenu(HWND hWnd) {
     }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
+    // 即時ポーリング（明示操作のため休止時間帯・クールダウンを無視する。g_manualPoll 経由）
+    AppendMenuW(hMenu, MF_STRING, IDM_UPDATE_NOW, L"今すぐ更新");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+
     // 担当者フィルタ（レジストリ永続化。一覧・tooltip・通知のすべてに効く）
     AppendMenuW(hMenu, MF_STRING | (g_assignedToMeOnly ? MF_CHECKED : MF_UNCHECKED),
         IDM_ASSIGNED_TO_ME, L"担当がグループのチケットを除外");
+
+    // 一覧の並び順トグル（レジストリ永続化。ON で期日昇順、期日なしは末尾）
+    AppendMenuW(hMenu, MF_STRING | (g_sortByDue ? MF_CHECKED : MF_UNCHECKED),
+        IDM_SORT_BY_DUE, L"期日順に並べる");
 
     // 音声通知（親：レジストリ永続化）
     AppendMenuW(hMenu, MF_STRING | (g_soundEnabled ? MF_CHECKED : MF_UNCHECKED),
@@ -2896,6 +2962,16 @@ static std::wstring getCurrentLogTarget() {
 // WM_COMMAND ディスパッチ
 // メニュー選択（IDM_*）と一覧クリック（IDM_ISSUE_BASE 以降）を処理する。
 static void handleTrayCommand(UINT id) {
+    if (id == IDM_UPDATE_NOW) {
+        // 明示のユーザ操作のため、休止時間帯・クールダウンを無視して直ちに再取得する
+        g_manualPoll.store(true);
+        return;
+    }
+    if (id == IDM_SORT_BY_DUE) {
+        g_sortByDue.store(!g_sortByDue.load());
+        writeRegDword(REG_SORT_BY_DUE, g_sortByDue.load() ? 1u : 0u);
+        return;
+    }
     if (id == IDM_EXIT) {
         g_shutdownRequested = true;
         PostQuitMessage(0);
@@ -2907,6 +2983,11 @@ static void handleTrayCommand(UINT id) {
         // 未読を仕切り直す。未読は通知時点のフィルタで数えた累計のため、切り替え後は
         // 一覧に出ないチケットの分が残り「未処理 10 件（未読 3 件）」のような矛盾表示になる。
         g_unreadCount.store(0);
+        {
+            // 未読 id 集合も同時に仕切り直す。（残すとバッジ 0 なのに一覧が太字のままになる）
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_unreadIds.clear();
+        }
         // 一覧は次に開いた時点で g_issues から組み直されるが、tooltip とバッジは即時に更新する。
         // 取得済みの全件を保持しているため再ポーリングは不要。
         if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
@@ -2973,10 +3054,13 @@ static BOOL measureIssueMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
     if (eidx >= g_issueItems.size()) return FALSE;
     const auto& item = g_issueItems[eidx];
     HDC   hdc = GetDC(hWnd);
-    HFONT old = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
+    // 未読行はラベルを太字で測る（描画側と同じフォントでないと行幅・取消線が食い違う）
+    HFONT old = static_cast<HFONT>(SelectObject(hdc, item.unread ? g_hMenuFontBold : g_hMenuFont));
     SIZE  sz  = {};
     GetTextExtentPoint32W(hdc, item.label.c_str(),
         static_cast<int>(item.label.size()), &sz);
+    // ピンマーカー列は全行で同幅を保つため、常に通常フォントで測る
+    SelectObject(hdc, g_hMenuFont);
     // ピンマーカー列の幅（ピン有無で行幅が変わらないよう全行に確保する）
     // 実描画は D2D だが幅計測は GDI に一本化する。フォールバック先の Segoe UI Emoji と em
     // サイズが GDI・DirectWrite で同一のため送り幅は一致し、末尾スペース分が丸め差を吸収する。
@@ -2985,8 +3069,8 @@ static BOOL measureIssueMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
     GetTextExtentPoint32W(hdc, PIN_MARK, static_cast<int>(wcslen(PIN_MARK)), &markSz);
     SelectObject(hdc, old);
     ReleaseDC(hWnd, hdc);
-    // パディングは左 8 px + 右 16 px。（左はピンマーカー列が続くため控えめにする）
-    mis->itemWidth  = static_cast<UINT>(sz.cx + markSz.cx) + 24;
+    // パディングは左 4 px + 右 16 px。（左はピンマーカー列が続くため控えめにする）
+    mis->itemWidth  = static_cast<UINT>(sz.cx + markSz.cx) + 20;
     mis->itemHeight = static_cast<UINT>(sz.cy) + 6;
     return TRUE;
 }
@@ -3010,7 +3094,7 @@ static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
             static_cast<INT_PTR>(selected ? COLOR_HIGHLIGHT + 1 : COLOR_MENU + 1)));
 
     RECT textRect  = dis->rcItem;
-    textRect.left += 8;  // 左パディング（measureIssueMenuItem の確保幅と揃える）
+    textRect.left += 4;  // 左パディング（measureIssueMenuItem の確保幅と揃える）
     SetBkMode(dis->hDC, TRANSPARENT);
     COLORREF textColor = GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT);
     SetTextColor(dis->hDC, textColor);
@@ -3031,6 +3115,9 @@ static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
         }
     }
     textRect.left += markSz.cx;
+    // 未読行はラベルだけ太字で描く（ピンマーカー列の幅は通常フォント基準を保つ。
+    // 以降の幅計測（日付セグメント・取消線）も太字で行われ、描画幅と一致する）
+    if (item.unread) SelectObject(dis->hDC, g_hMenuFontBold);
     // DT_NOPREFIX がないと件名中の & がニーモニック指定として食われ、次の文字に下線が付く
     // （幅は & を 1 文字として計測するため、描画幅とのずれで取消線も伸び過ぎる）
     constexpr UINT DT_ROW = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX;
@@ -3440,6 +3527,11 @@ static void deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         // 通知音（ミーティング中ミュートの判定は発火時点の状態で行う）
         if (g_soundEnabled.load() && !(g_muteInMeeting.load() && isMeetingActive()))
             launchSound(cfg);
+        {
+            // 未読 id を記録する（一覧の太字表示用。一覧を開いた時点でクリアされる）
+            std::lock_guard<std::mutex> lk(g_mtx);
+            for (const auto& t : targets) g_unreadIds.insert(t.issue->id);
+        }
         g_unreadCount.fetch_add(static_cast<int>(targets.size()));
         int nNew = 0, nUpd = 0, nEnt = 0;
         for (const auto& t : targets) {
@@ -3489,12 +3581,16 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             // ことで、休止中はどのトリガーでもポーリングしない。（schedule の 0 を最優先とする）
             // 起動直後の 1 回だけは例外として実行し、一覧を出せる状態にする。
             // calcSleepUntilNextPoll(0) は内部ガードで 1 回/時扱いになり「次の正時まで」を返す。
-            if (pollsPerHour == 0 && !startupPoll) {
+            // 「今すぐ更新」は明示のユーザ操作のため、休止時間帯・クールダウンの抑止を受けない
+            bool manualTriggered = g_manualPoll.exchange(false);
+
+            if (pollsPerHour == 0 && !startupPoll && !manualTriggered) {
                 g_forcePoll.store(false);  // 休止中に積まれたトリガーは破棄する（次の稼働正時に自然に取得される）
                 // waitInterruptible は forcePoll で即復帰するため使わない（NIC 変化の連発で
-                // 周回してしまい「休止中は何もしない」が破れる）。shutdown のみ監視して待つ
+                // 周回してしまい「休止中は何もしない」が破れる）。shutdown と手動更新のみ監視して待つ
                 DWORD sleepMs = calcSleepUntilNextPoll(0);
-                for (DWORD waited = 0; waited < sleepMs && !g_shutdownRequested; waited += 100)
+                for (DWORD waited = 0; waited < sleepMs && !g_shutdownRequested
+                        && !g_manualPoll.load(); waited += 100)
                     Sleep(100);
                 continue;
             }
@@ -3532,16 +3628,19 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             ULONGLONG lastTick  = g_lastPollTick.load();
             bool stale = (lastTick > 0) && (tickNow - lastTick >= STALE_POLL_THRESHOLD_MS);
 
-            if ((forceTriggered || stale) && !startupPoll && lastTick > 0
+            if (!manualTriggered && (forceTriggered || stale) && !startupPoll && lastTick > 0
                 && (tickNow - lastTick < FORCE_POLL_COOLDOWN_MS)) {
                 writeLog("force poll deferred (cooldown)");
                 // クールダウンの残り時間は forcePoll を無視して待つ。waitInterruptible は
-                // forcePoll で即復帰するため、連発トリガー時に busy loop になり使えない
+                // forcePoll で即復帰するため、連発トリガー時に busy loop になり使えない。
+                // 手動更新はクールダウンの対象外なので監視して即座に抜ける
                 ULONGLONG remain = FORCE_POLL_COOLDOWN_MS - (tickNow - lastTick);
-                for (ULONGLONG waited = 0; waited < remain && !g_shutdownRequested; waited += 100)
+                for (ULONGLONG waited = 0; waited < remain && !g_shutdownRequested
+                        && !g_manualPoll.load(); waited += 100)
                     Sleep(100);
                 continue;
             }
+            if (manualTriggered) writeLog("manual poll triggered");
             if (forceTriggered && !startupPoll) writeLog("force poll triggered");
             if (stale && !startupPoll)
                 writeLog("stale poll triggered (" + std::to_string((tickNow - lastTick) / 1000) + "s since last poll)");
@@ -3683,6 +3782,7 @@ int wmain() {
         g_soundEnabled  = readRegDword(REG_SOUND_ENABLED, 1u) != 0;
         g_muteInMeeting = readRegDword(REG_MUTE_IN_MEETING, 1u) != 0;
         g_assignedToMeOnly = readRegDword(REG_ASSIGNED_TO_ME, 0u) != 0;
+        g_sortByDue        = readRegDword(REG_SORT_BY_DUE, 0u) != 0;
 
         writeLog("started");
         logSchedule(cfg.schedule);

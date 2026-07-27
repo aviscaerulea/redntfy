@@ -36,7 +36,7 @@ build.ps1 は `Microsoft.VisualStudio.DevShell.dll` + `Enter-VsDevShell` で VC+
 
 - スレッド構成：メイン（メッセージループ・トレイ UI）／`pollThreadFunc`（HTTP・Toast・音・状態保存）／`soundThread`（WASAPI 再生）／`checkForUpdates`（起動時 1 回、detach）
 
-- 共有状態は `g_mtx`（`g_issues`・`g_pins`・`g_latestVersion`）と atomic（`g_unreadCount`・`g_myUserId`・`g_assignedToMeOnly` など）で保護する  
+- 共有状態は `g_mtx`（`g_issues`・`g_pins`・`g_unreadIds`・`g_latestVersion`）と atomic（`g_unreadCount`・`g_myUserId`・`g_assignedToMeOnly` など）で保護する  
   `g_currentConfig` は起動時に 1 回設定した後は不変で、ロック無しで読み取る。
 
 - 永続化は `state.json`（検知済み）と `pins.json`（ピン留め）で、書き出しは `atomicWriteJson`（tmp 経由の置換）  
@@ -51,6 +51,7 @@ build.ps1 は `Microsoft.VisualStudio.DevShell.dll` + `Enter-VsDevShell` で VC+
 
 - schedule の 0（休止時間帯）は force poll・stale 判定より優先される  
   この順序を崩すと深夜に通知が鳴る。起動直後の 1 回だけは休止時間帯でも実行する。
+  トレイメニューの「今すぐ更新」（`g_manualPoll`）だけは明示操作として休止時間帯・クールダウンを無視する。
 
 - Toast には AUMID 付きスタートメニューショートカットが必須（`ensureShortcut` が自動作成）
 
