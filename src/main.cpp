@@ -385,7 +385,7 @@ static int todayJstYmd() {
 
 // 期限日の表示情報
 struct DueDateView {
-    std::wstring md;              // "7/28"（ゼロパディングなし。期限なし・解釈不能なら空）
+    std::wstring text;            // 今年は "7/28"、他年は "2025/6/30"（期限なし・解釈不能なら空）
     bool         overdue = false; // 期限 ≦ 今日（JST）＝日付部分を赤で描く
 };
 
@@ -397,7 +397,11 @@ static DueDateView makeDueDateView(const std::string& due, int todayYmd) {
     int y = 0, m = 0, d = 0;
     if (sscanf_s(due.c_str(), "%d-%d-%d", &y, &m, &d) != 3) return v;
     if (y < 1900 || m < 1 || m > 12 || d < 1 || d > 31) return v;
-    v.md      = std::to_wstring(m) + L"/" + std::to_wstring(d);
+    // 今年以外は年を添える。月日だけでは期日順に並べた一覧が順不同に見える。
+    // （例：2025-12-22 の次に 2026-04-09 が来ると「12/22 → 4/9」と読める）
+    // 年込みも月日と同じ書式に揃える。（区切りは "/"、ゼロパディングなし）
+    v.text = std::to_wstring(m) + L"/" + std::to_wstring(d);
+    if (y != todayYmd / 10000) v.text = std::to_wstring(y) + L"/" + v.text;
     v.overdue = (y * 10000 + m * 100 + d) <= todayYmd;
     return v;
 }
@@ -2668,17 +2672,18 @@ static constexpr wchar_t GROUP_MARK[] = L"👥 ";
 // 一覧行のラベルを組み立てる
 //   並びは「番号、最終更新者の姓、期日、グループ担当マーカー、件名」
 //   （例："#12345  山田  7/28 👥 件名"。番号と姓の後は空白 2、日付の後は空白 1）
+//   期日は今年以外だと "2025/6/30" のように年が付き、文字数が変わる。
 //   更新者不明・期限なしなどの要素は詰めて省く。
 // ピン記号はラベルに含めない。WM_DRAWITEM が IssueItem::pinned を見てマーカー列に描く。
 static IssueLabel buildIssueLabel(int id, const std::string& subject, const std::string& updater,
-                                  const std::wstring& dateMd, bool assignedToGroup) {
+                                  const std::wstring& dateText, bool assignedToGroup) {
     IssueLabel r;
     r.text = L"#" + std::to_wstring(id) + L"  ";
     if (!updater.empty()) r.text += toWide(updater) + L"  ";
-    if (!dateMd.empty()) {
+    if (!dateText.empty()) {
         r.dateOffset = r.text.size();
-        r.dateLen    = dateMd.size();
-        r.text += dateMd + L" ";
+        r.dateLen    = dateText.size();
+        r.text += dateText + L" ";
     }
     if (assignedToGroup) r.text += GROUP_MARK;
     r.text += truncateSubject(toWide(subject), static_cast<size_t>(g_currentConfig.subjectMaxChars));
@@ -2720,7 +2725,7 @@ static void showIssuePopup(HWND hWnd) {
         it.id  = id;
         it.url = issueUrl(cfg, id);
         auto due = makeDueDateView(dueDate, todayYmd);
-        auto lbl = buildIssueLabel(id, subject, updater, due.md, assignedToGroup);
+        auto lbl = buildIssueLabel(id, subject, updater, due.text, assignedToGroup);
         it.label      = std::move(lbl.text);
         it.dateOffset = lbl.dateOffset;
         it.dateLen    = lbl.dateLen;
