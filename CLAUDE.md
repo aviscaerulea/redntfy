@@ -36,7 +36,7 @@ build.ps1 は `Microsoft.VisualStudio.DevShell.dll` + `Enter-VsDevShell` で VC+
 
 - スレッド構成：メイン（メッセージループ・トレイ UI）／`pollThreadFunc`（HTTP・Toast・音・状態保存）／`soundThread`（WASAPI 再生）／`checkForUpdates`（起動時 1 回、detach）
 
-- 共有状態は `g_mtx`（`g_issues`・`g_pins`・`g_unreadIds`・`g_latestVersion`）と atomic（`g_unreadCount`・`g_myUserId`・`g_assignedToMeOnly` など）で保護する  
+- 共有状態は `g_mtx`（`g_issues`・`g_pins`・`g_unreadIds`・`g_latestVersion`）と atomic（`g_myUserId`・`g_assignedToMeOnly` など）で保護する  
   `g_currentConfig` は起動時に 1 回設定した後は不変で、ロック無しで読み取る。
 
 - 永続化は `state.json`（検知済み）と `pins.json`（ピン留め）で、書き出しは `atomicWriteJson`（tmp 経由の置換）  
@@ -58,6 +58,14 @@ build.ps1 は `Microsoft.VisualStudio.DevShell.dll` + `Enter-VsDevShell` で VC+
   更新を検知した回は通知 Toast が完了の合図になるため重ねない。
   取得失敗時は `showErrorToast` の force でクールダウンを無視して接続エラーを出す。
   （force でもクールダウンの起点は更新する。据え置くと 60 秒後の自動リトライで同じ Toast が 2 通出る）
+
+- 未読（一覧の太字）の既読化は一覧の行クリックのみ  
+  一覧を開いただけでは既読にしない。（開いた≠読んだ。読み落としを防ぐのが未読表示の目的）
+  tooltip の未読件数とバッジは `buildListRows` の結果、すなわち一覧に出る行から数える。
+  一覧の選定を `showIssuePopup` と共有することで、件数と画面上の太字行数を一致させる。
+  `list_limit` の窓外に落ちた未読は数にもバッジにも出ない。
+  （クリックできない行でバッジが消せなくなるのを防ぐため、表示範囲を件数の基準に揃えた）
+  Toast の「チケットを開く」は OS がブラウザを直接起動するため既読化されない。
 
 - Toast には AUMID 付きスタートメニューショートカットが必須（`ensureShortcut` が自動作成）
 

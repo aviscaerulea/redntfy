@@ -280,11 +280,14 @@ static std::vector<PinEntry>   g_pins;     // ピン留め（g_mtx で保護、�
 // ホットリロードしないため、スレッド起動後は全スレッドからロック無しで読み取ってよい）
 static Config                  g_currentConfig;
 
-// 未読件数（前回一覧を開いてから検知した通知対象の累計。一覧を開くと 0 に戻す。永続化しない）
-static std::atomic<int>        g_unreadCount{0};
-
-// 未読チケットの id 集合（g_mtx で保護。一覧の太字表示に使い、一覧を開いた時点でクリアする）
-// 通知対象になったチケットの id 集合。g_unreadCount は重複を含む累計のため件数は一致しない。
+// 未読チケットの id 集合（g_mtx で保護。一覧の太字表示と tooltip の未読件数の唯一の根拠）
+// 通知対象になった id を入れ、一覧の行クリックでそのチケットを開いた時だけ取り除く。
+// 一覧を開いただけでは既読にしない。（開いたことは読んだことではない）
+// 件数とバッジは buildListRows が返す行、すなわち一覧に出る行だけから数える。
+// そのため list_limit の窓外に落ちた id は数にも太字にも出ない。
+// （表示できない行でバッジが消せなくなるのを防ぐため、表示範囲を件数の基準に揃えた）
+// 追跡集合から外れた id も同様に出ないが、ピン留め行は一覧に残るため数に入る。
+// 刈り取りはしないので、再び一覧に出た時点で未読として現れる。
 // 永続化しない。
 static std::unordered_set<int> g_unreadIds;
 
@@ -2444,28 +2447,118 @@ static void clearTrayTooltip(HWND hWnd) {
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
-// tooltip と「今すぐ更新」の完了 Toast に出す未処理件数
-// 担当者フィルタ ON なら自分担当のみを数える。ピン留めは対象外。
+// 一覧に出す 1 行の素材（表示文字列の組み立て前）
+struct ListRow {
+    int         id = 0;
+    std::string subject;
+    std::string updater;
+    std::string dueDate;              // "YYYY-MM-DD"（期日なしは空）
+    std::string updatedOn;
+    bool        assignedToGroup = false;
+    bool        pinned          = false;
+    bool        closed          = false;
+    bool        unread          = false;
+};
+
+// 一覧に出す行を選定し、並べ替えて list_limit 件へ絞る
+//
+//   1. g_issues から担当者フィルタを通った行をすべて採る
+//      （フィルタで外れてもピン留め済みなら残す。ピンはフィルタより優先する）
+//   2. 1 に含まれないピンを追加する（保存クエリの集合外ピンはキャッシュ内容で表示）
+//   3. 全体を並べ替える（既定は updated_on 降順。「期日順に並べる」ON なら期日昇順で
+//      期日なしは末尾。ピンも同じ規則で本来の位置に置く）
+//   4. 先頭 list_limit 件へ絞る（ピン留めは上限適用外で常に残す）
+// visible には担当者フィルタを通った未処理件数（絞り込み前）を返す。ピン留めは数えない。
 // （明示の意思表示であって未処理件数ではないため、フィルタで外れたピンを件数に足し戻さない）
-static int visibleIssueCount() {
-    std::lock_guard<std::mutex> lk(g_mtx);
-    int n = 0;
-    for (const auto& is : g_issues) {
-        if (passesAssigneeFilter(is)) ++n;
+// tooltip の未読件数も本関数の結果から数える。表示と同じ選定を通すことで「未読 N 件」と
+// 画面上の太字行数を一致させる。（一覧に出ない未読は数に出さず、バッジも点けない）
+static std::vector<ListRow> buildListRows(int& visible) {
+    std::vector<Issue>      issues;
+    std::vector<PinEntry>   pins;
+    std::unordered_set<int> unread;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        issues = g_issues;
+        pins   = g_pins;
+        unread = g_unreadIds;
     }
-    return n;
+
+    auto isPinned = [&pins](int id) {
+        for (const auto& p : pins) {
+            if (p.id == id) return true;
+        }
+        return false;
+    };
+
+    std::vector<ListRow>    rows;
+    std::unordered_set<int> shown;
+    visible = 0;
+    for (const auto& is : issues) {
+        // 担当者フィルタで外れた行は出さない。ただしピン留め済みは明示の意思表示として常に残す
+        // （クローズ済・集合外でも表示する既存のピン仕様と揃える）
+        bool pinned = isPinned(is.id);
+        if (!passesAssigneeFilter(is)) {
+            if (!pinned) continue;
+        }
+        else {
+            ++visible;
+        }
+        rows.push_back({is.id, is.subject, is.updaterDisplay, is.dueDate, is.updatedOn,
+                        is.assignedToGroup, pinned, is.closed, unread.count(is.id) != 0});
+        shown.insert(is.id);
+    }
+    for (const auto& p : pins) {
+        if (shown.count(p.id)) continue;
+        rows.push_back({p.id, p.subject, p.updaterDisplay, p.dueDate, p.updatedOn,
+                        p.assignedToGroup, true, p.closed, unread.count(p.id) != 0});
+    }
+
+    if (g_sortByDue.load()) {
+        // 期日は ISO 形式のため文字列辞書順で昇順に比較できる。期日なしは末尾へ回し、
+        // 同順位は更新日時降順で安定させる
+        std::sort(rows.begin(), rows.end(), [](const ListRow& a, const ListRow& b) {
+            bool aNone = a.dueDate.empty(), bNone = b.dueDate.empty();
+            if (aNone != bNone) return bNone;
+            if (a.dueDate != b.dueDate) return a.dueDate < b.dueDate;
+            return a.updatedOn > b.updatedOn;
+        });
+    }
+    else {
+        std::sort(rows.begin(), rows.end(),
+            [](const ListRow& a, const ListRow& b) { return a.updatedOn > b.updatedOn; });
+    }
+
+    // 並べ替えの後に list_limit 件へ絞る。（ピン留めは上限適用外で常に残す）
+    // 絞り込みを並べ替えの前に行うと、期日順 ON のとき「更新は古いが期日が近い」チケットが
+    // 更新日時降順の窓から落ちて一覧に出ない。
+    size_t limit = static_cast<size_t>(g_currentConfig.listLimit);
+    if (rows.size() > limit) {
+        std::vector<ListRow> kept;
+        kept.reserve(rows.size());
+        for (auto& r : rows) {
+            if (kept.size() < limit || r.pinned) kept.push_back(std::move(r));
+        }
+        rows = std::move(kept);
+    }
+    return rows;
 }
 
 // トレイアイコンのツールチップを更新する
 // 「未処理 N 件」に未読があれば「（未読 M 件）」を続けて表示し、赤バッジは未読ありを表す。
+// 未読件数は一覧に出る行から数えるため、画面上の太字行数と一致する。
 // ポップアップメニュー表示中は更新しない
 static void updateTrayTooltip(HWND hWnd) {
     if (g_popupShowing.load()) return;
     if (g_tooltipUpdating) return;
     g_tooltipUpdating = true;
 
-    int unread = g_unreadCount.load();
-    std::wstring tip = L"未処理 " + std::to_wstring(visibleIssueCount()) + L" 件";
+    int visible = 0;
+    auto rows = buildListRows(visible);
+    int unread = 0;
+    for (const auto& r : rows) {
+        if (r.unread) ++unread;
+    }
+    std::wstring tip = L"未処理 " + std::to_wstring(visible) + L" 件";
     if (unread > 0) tip += L"（未読 " + std::to_wstring(unread) + L" 件）";
 
     auto nid = makeTrayNid(hWnd);
@@ -2505,7 +2598,7 @@ struct IssueItem {
     size_t       dateOffset = 0;
     size_t       dateLen    = 0;     // 0 = 期限なし（分割描画しない）
     bool         overdue    = false; // 期限 ≦ 今日（JST）＝日付部分を赤で描く
-    bool         unread     = false; // 未読（前回一覧表示以降に検知）＝太字で描く
+    bool         unread     = false; // 未読（まだ一覧から開いていない）＝太字で描く
     bool         pinned = false; // ピン留め中（マーカー列の描画条件。右クリックトグル時にもその場で更新する）
     bool         closed = false; // クローズ済（打ち消し線の描画条件）
 };
@@ -2700,114 +2793,34 @@ static IssueLabel buildIssueLabel(int id, const std::string& subject, const std:
 
 // 左クリック時のチケット一覧ポップアップ表示
 //
-// 表示リストの組み立て：
-//   1. g_issues から担当者フィルタを通った行をすべて採る
-//      （フィルタで外れてもピン留め済みなら残す。ピンはフィルタより優先する）
-//   2. 1 に含まれないピンを追加する（保存クエリの集合外ピンはキャッシュ内容で表示）
-//   3. 全体を並べ替える（既定は updated_on 降順。「期日順に並べる」ON なら期日昇順で
-//      期日なしは末尾。ピンも同じ規則で本来の位置に置く）
-//   4. 先頭 list_limit 件へ絞る（ピン留めは上限適用外で常に残す）
-// 行の左クリックでチケットを開き、右クリックでピン留めをトグルする。
+// 表示行の選定・並べ替え・絞り込みは buildListRows に委ねる。（tooltip の未読件数と同じ根拠）
+// 行の左クリックでチケットを開いてその 1 件だけ既読にする。
+// 右クリックはピン留めのトグルで、既読にはしない。
 // フッタの「未処理 N 件」はフィルタを通った件数で、フィルタで外れたピンは数えない。
 static void showIssuePopup(HWND hWnd) {
-    std::vector<Issue>    issues;
-    std::vector<PinEntry> pins;
-    std::unordered_set<int> unread;
-    {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        issues = g_issues;
-        pins   = g_pins;
-        // 一覧を開いた時点で既読化する。swap でスナップショットとクリアを同時に行い、
-        // この表示に限り太字で見せる。（g_unreadCount と同じ「開いたら既読」の意味論）
-        unread.swap(g_unreadIds);
-    }
     const Config& cfg = g_currentConfig;
+    int visible = 0;
+    auto rows = buildListRows(visible);
 
     // 「今日」は 1 回だけ求めて全行に使う。行ごとに求めると日付境界をまたいだ瞬間に
     // 同じ一覧内で赤判定が揺れる
     const int todayYmd = todayJstYmd();
-    auto makeItem = [&](int id, const std::string& subject, const std::string& updater,
-                        const std::string& dueDate, bool assignedToGroup,
-                        bool pinned, bool closed) {
+    auto makeItem = [&](const ListRow& row) {
         IssueItem it;
-        it.id  = id;
-        it.url = issueUrl(cfg, id);
-        auto due = makeDueDateView(dueDate, todayYmd);
-        auto lbl = buildIssueLabel(id, subject, updater, due.text, assignedToGroup);
+        it.id  = row.id;
+        it.url = issueUrl(cfg, row.id);
+        auto due = makeDueDateView(row.dueDate, todayYmd);
+        auto lbl = buildIssueLabel(row.id, row.subject, row.updater, due.text,
+                                   row.assignedToGroup);
         it.label      = std::move(lbl.text);
         it.dateOffset = lbl.dateOffset;
         it.dateLen    = lbl.dateLen;
         it.overdue    = due.overdue;
-        it.unread     = unread.count(id) != 0;
-        it.pinned     = pinned;
-        it.closed     = closed;
+        it.unread     = row.unread;
+        it.pinned     = row.pinned;
+        it.closed     = row.closed;
         return it;
     };
-
-    auto isPinned = [&pins](int id) {
-        for (const auto& p : pins) {
-            if (p.id == id) return true;
-        }
-        return false;
-    };
-
-    // 表示行とソートキー（既定は updatedOn、「期日順に並べる」ON なら dueDate を主キーにする）
-    struct RowEntry {
-        std::string updatedOn;
-        std::string dueDate;   // "YYYY-MM-DD"（期日なしは空）
-        IssueItem   item;
-    };
-    std::vector<RowEntry> rows;
-    std::unordered_set<int> shown;
-    int visible = 0;
-    for (const auto& is : issues) {
-        // 担当者フィルタで外れた行は出さない。ただしピン留め済みは明示の意思表示として常に残す
-        // （クローズ済・集合外でも表示する既存のピン仕様と揃える）
-        bool pinned = isPinned(is.id);
-        if (!passesAssigneeFilter(is)) {
-            if (!pinned) continue;
-        }
-        else {
-            ++visible;
-        }
-        rows.push_back({is.updatedOn, is.dueDate,
-            makeItem(is.id, is.subject, is.updaterDisplay, is.dueDate,
-                     is.assignedToGroup, pinned, is.closed)});
-        shown.insert(is.id);
-    }
-    for (const auto& p : pins) {
-        if (shown.count(p.id)) continue;
-        rows.push_back({p.updatedOn, p.dueDate,
-            makeItem(p.id, p.subject, p.updaterDisplay, p.dueDate,
-                     p.assignedToGroup, true, p.closed)});
-    }
-    if (g_sortByDue.load()) {
-        // 期日は ISO 形式のため文字列辞書順で昇順に比較できる。期日なしは末尾へ回し、
-        // 同順位は更新日時降順で安定させる
-        std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
-            bool aNone = a.dueDate.empty(), bNone = b.dueDate.empty();
-            if (aNone != bNone) return bNone;
-            if (a.dueDate != b.dueDate) return a.dueDate < b.dueDate;
-            return a.updatedOn > b.updatedOn;
-        });
-    }
-    else {
-        std::sort(rows.begin(), rows.end(),
-            [](const auto& a, const auto& b) { return a.updatedOn > b.updatedOn; });
-    }
-
-    // 並べ替えの後に list_limit 件へ絞る。（ピン留めは上限適用外で常に残す）
-    // 絞り込みを並べ替えの前に行うと、期日順 ON のとき「更新は古いが期日が近い」チケットが
-    // 更新日時降順の窓から落ちて一覧に出ない。
-    if (rows.size() > static_cast<size_t>(cfg.listLimit)) {
-        std::vector<RowEntry> kept;
-        kept.reserve(rows.size());
-        for (auto& r : rows) {
-            if (kept.size() < static_cast<size_t>(cfg.listLimit) || r.item.pinned)
-                kept.push_back(std::move(r));
-        }
-        rows = std::move(kept);
-    }
 
     g_issueItems.clear();
     HMENU hMenu = CreatePopupMenu();
@@ -2830,7 +2843,7 @@ static void showIssuePopup(HWND hWnd) {
             mii.wID        = IDM_ISSUE_BASE + idx;
             mii.dwItemData = static_cast<ULONG_PTR>(idx);
             InsertMenuItemW(hMenu, idx, TRUE, &mii);
-            g_issueItems.push_back(row.item);
+            g_issueItems.push_back(makeItem(row));
             ++idx;
         }
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
@@ -2838,11 +2851,6 @@ static void showIssuePopup(HWND hWnd) {
             + L" 件（クリックでウェブ表示 ／ 右クリックでピン留め）";
         AppendMenuW(hMenu, MF_STRING, IDM_OPEN_QUERY, footer.c_str());
     }
-
-    // 一覧を開いた時点で未読件数を既読化する（バッジと tooltip はポップアップ終了後に更新される。
-    // 未読 id 集合は冒頭のスナップショット取得時に swap でクリア済み）
-    g_unreadCount.store(0);
-    if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
 
     POINT pt;
     GetCursorPos(&pt);
@@ -3089,8 +3097,21 @@ static std::wstring getCurrentLogTarget() {
     return logExists ? logPath : g_logDir;
 }
 
+// 開いたチケット 1 件を既読にする
+// TrackPopupMenu の WM_COMMAND がポップアップ終了前に届く環境がある。
+// その場合は g_popupShowing 中の直接呼びが捨てられるため、PostMessage でキューに積む。
+// 積んでおけば、WM_COMMAND がどちらの順序で届いてもポップアップ終了後に必ず反映される。
+static void markIssueRead(int issueId) {
+    bool wasUnread;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        wasUnread = g_unreadIds.erase(issueId) != 0;
+    }
+    if (wasUnread && g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
+}
+
 // WM_COMMAND ディスパッチ
-// メニュー選択（IDM_*）と一覧クリック（IDM_ISSUE_BASE 以降）を処理する。
+// メニュー選択（IDM_*）と一覧クリック（IDM_ISSUE_BASE 以降。開いた 1 件を既読にする）を処理する。
 static void handleTrayCommand(UINT id) {
     if (id == IDM_UPDATE_NOW) {
         // 明示のユーザ操作のため、休止時間帯・クールダウンを無視して直ちに再取得する
@@ -3110,14 +3131,8 @@ static void handleTrayCommand(UINT id) {
     if (id == IDM_ASSIGNED_TO_ME) {
         g_assignedToMeOnly.store(!g_assignedToMeOnly.load());
         writeRegDword(REG_ASSIGNED_TO_ME, g_assignedToMeOnly.load() ? 1u : 0u);
-        // 未読を仕切り直す。未読は通知時点のフィルタで数えた累計のため、切り替え後は
-        // 一覧に出ないチケットの分が残り「未処理 10 件（未読 3 件）」のような矛盾表示になる。
-        g_unreadCount.store(0);
-        {
-            // 未読 id 集合も同時に仕切り直す。（残すとバッジ 0 なのに一覧が太字のままになる）
-            std::lock_guard<std::mutex> lk(g_mtx);
-            g_unreadIds.clear();
-        }
+        // 未読は消さない。未読件数は一覧に出る行から数えるため、切り替えても件数と
+        // 一覧の太字は食い違わない。（表示条件を変えただけで読んだことにはならない）
         // 一覧は次に開いた時点で g_issues から組み直されるが、tooltip とバッジは即時に更新する。
         // 取得済みの全件を保持しているため再ポーリングは不要。
         if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
@@ -3172,6 +3187,10 @@ static void handleTrayCommand(UINT id) {
         if (idx < g_issueItems.size() && isHttpUrl(g_issueItems[idx].url)) {
             ShellExecuteW(nullptr, L"open", g_issueItems[idx].url.c_str(),
                           nullptr, nullptr, SW_SHOWNORMAL);
+            // URL の検証を通った行だけ既読にする。（不正な URL の行は開かないため未読のまま残す）
+            // ShellExecuteW の戻り値は見ない。関連付け不備でブラウザが起動しない場合まで
+            // 未読を守るより、経路を単純に保つ方を採る。
+            markIssueRead(g_issueItems[idx].id);
         }
     }
 }
@@ -3683,11 +3702,10 @@ static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         if (g_soundEnabled.load() && !(g_muteInMeeting.load() && isMeetingActive()))
             launchSound(cfg);
         {
-            // 未読 id を記録する（一覧の太字表示用。一覧を開いた時点でクリアされる）
+            // 未読 id を記録する。（一覧の太字と tooltip の未読件数。行クリックで開いた分だけ取り除く）
             std::lock_guard<std::mutex> lk(g_mtx);
             for (const auto& t : targets) g_unreadIds.insert(t.issue->id);
         }
-        g_unreadCount.fetch_add(static_cast<int>(targets.size()));
         int nNew = 0, nUpd = 0, nEnt = 0;
         for (const auto& t : targets) {
             if (t.kind == NotifyKind::New)          ++nNew;
@@ -3715,9 +3733,12 @@ static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
 // 通知音は鳴らさない。（チケットの更新通知と違い、ユーザが待っている場面での応答のため）
 static void showPollDoneToast()
 {
+    // 件数は tooltip と同じ根拠にするため buildListRows から得る。（行そのものは使わない）
+    int visible = 0;
+    buildListRows(visible);
     try {
         showToast3(L"更新が完了しました", L"新しい更新はありません",
-                   L"未処理 " + std::to_wstring(visibleIssueCount()) + L" 件",
+                   L"未処理 " + std::to_wstring(visible) + L" 件",
                    L"", true);
     }
     catch (winrt::hresult_error const& e) {
