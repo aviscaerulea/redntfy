@@ -74,3 +74,8 @@ task release    # リリースビルドと zip 作成
 - WASAPI（通知音再生）
 - libebur128（ラウドネス測定、vcpkg：`libebur128:x64-windows-static`）
 - toml++（設定ファイル）
+
+## ライセンス
+
+アプリケーションアイコンには Redmine 公式ロゴを使用している。
+ロゴは Martin Herr 氏の著作物で、[CC BY-SA 2.5](https://creativecommons.org/licenses/by-sa/2.5/) でライセンスされている。
