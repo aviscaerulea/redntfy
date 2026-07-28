@@ -53,6 +53,12 @@ build.ps1 は `Microsoft.VisualStudio.DevShell.dll` + `Enter-VsDevShell` で VC+
   この順序を崩すと深夜に通知が鳴る。起動直後の 1 回だけは休止時間帯でも実行する。
   トレイメニューの「今すぐ更新」（`g_manualPoll`）だけは明示操作として休止時間帯・クールダウンを無視する。
 
+- 「今すぐ更新」は完了時に必ず応答を返す  
+  成功時は `deliverPollResults` の戻り値（通知件数）が 0 のときだけ完了 Toast（`showPollDoneToast`）を出す。
+  更新を検知した回は通知 Toast が完了の合図になるため重ねない。
+  取得失敗時は `showErrorToast` の force でクールダウンを無視して接続エラーを出す。
+  （force でもクールダウンの起点は更新する。据え置くと 60 秒後の自動リトライで同じ Toast が 2 通出る）
+
 - Toast には AUMID 付きスタートメニューショートカットが必須（`ensureShortcut` が自動作成）
 
 ## References

@@ -2226,11 +2226,13 @@ static void showToast(const std::wstring& line1, const std::wstring& line2,
     dispatchToastXml(std::move(xml), permalink);
 }
 
-// 3 行 Toast 通知を表示する（更新チェックの新版通知用）
+// 3 行 Toast 通知を表示する（更新チェックの新版通知、「今すぐ更新」の完了通知用）
 //
-// line1 を title スタイル（太字大）で表示し、OS 標準通知音を鳴らす。
+// line1 を title スタイル（太字大）で表示する。
+// silent=true（デフォルト false）で OS 通知音を無効化する。
 static void showToast3(const std::wstring& line1, const std::wstring& line2,
-                       const std::wstring& line3, const std::wstring& permalink)
+                       const std::wstring& line3, const std::wstring& permalink,
+                       bool silent = false)
 {
     std::wstring xml =
         L"<toast>"
@@ -2239,7 +2241,8 @@ static void showToast3(const std::wstring& line1, const std::wstring& line2,
         L"<text hint-style=\"title\">" + escapeXml(line1) + L"</text>"
         L"<text>" + escapeXml(line2) + L"</text>"
         L"<text>" + escapeXml(line3) + L"</text>"
-        L"</binding></visual>";
+        L"</binding></visual>"
+        + (silent ? L"<audio silent=\"true\"/>" : L"");
 
     dispatchToastXml(std::move(xml), permalink);
 }
@@ -2248,11 +2251,16 @@ static void showToast3(const std::wstring& line1, const std::wstring& line2,
 //
 // 前回通知から ERROR_TOAST_COOLDOWN_MS 以内は抑制する。
 // showToast の 1 行目にエラー種別、2 行目に本文を表示する。
-static void showErrorToast(const std::wstring& title, const std::wstring& body)
+// force=true でクールダウンを無視する。「今すぐ更新」など明示操作への応答は、
+// 無音で失敗すると操作が届いたか判断できないため抑制しない。
+// force で出した場合もクールダウンの起点は更新する。取得失敗の 60 秒後には自動リトライが
+// 走るため、起点を据え置くと同じ内容の Toast が続けて 2 通出る。
+static void showErrorToast(const std::wstring& title, const std::wstring& body,
+                           bool force = false)
 {
     ULONGLONG now  = GetTickCount64();
     ULONGLONG last = g_lastErrorToastTime.load();
-    if (last != 0 && now - last < ERROR_TOAST_COOLDOWN_MS) return;
+    if (!force && last != 0 && now - last < ERROR_TOAST_COOLDOWN_MS) return;
     g_lastErrorToastTime.store(now);
     try {
         showToast(title, body, L"");
@@ -2436,7 +2444,7 @@ static void clearTrayTooltip(HWND hWnd) {
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
-// tooltip に出す未処理件数
+// tooltip と「今すぐ更新」の完了 Toast に出す未処理件数
 // 担当者フィルタ ON なら自分担当のみを数える。ピン留めは対象外。
 // （明示の意思表示であって未処理件数ではないため、フィルタで外れたピンを件数に足し戻さない）
 static int visibleIssueCount() {
@@ -3559,8 +3567,9 @@ static bool hasNewQueryEntry(const std::vector<int>& now, const std::vector<int>
 // ベースライン未確立（初回起動・state.json 破損）の場合は通知せず状態保存のみ行う。
 // prev は呼び出し側が loadState で読んだ前回状態。（resolveUpdaters のキャッシュと共有するため外で読む）
 // issues の最終更新者は resolveUpdaters が確定済みであることを前提とする。
-static void deliverPollResults(const std::wstring& exeDir, const Config& cfg,
-                               const std::vector<Issue>& issues, const PollState& prev)
+// 戻り値：通知対象と判定した件数。（0 は通知なし。「今すぐ更新」の完了通知の出し分けに使う）
+static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
+                              const std::vector<Issue>& issues, const PollState& prev)
 {
     // 一覧・tooltip 用の共有状態を更新する
     {
@@ -3575,7 +3584,7 @@ static void deliverPollResults(const std::wstring& exeDir, const Config& cfg,
             showErrorToast(L"状態保存エラー", L"state.json を書き込めません。展開先の書き込み権限を確認してください");
         if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
         writeLog("baseline established (" + std::to_string(issues.size()) + " issues)");
-        return;
+        return 0;
     }
 
     // 旧形式からの移行と query_ids への追加分をログに残す。
@@ -3597,7 +3606,7 @@ static void deliverPollResults(const std::wstring& exeDir, const Config& cfg,
     for (const auto& is : issues) {
         // 終了要求時は state.json を書かずに抜ける。前回のまま残るため、未通知分は
         // 次回ポーリングで再検知される。（通知は失われない）
-        if (g_shutdownRequested) return;
+        if (g_shutdownRequested) return 0;
         // 担当者フィルタで外れたチケットは通知しない
         if (!passesAssigneeFilter(is)) continue;
         auto it = prev.issues.find(is.id);
@@ -3695,6 +3704,28 @@ static void deliverPollResults(const std::wstring& exeDir, const Config& cfg,
     if (!saveState(exeDir, cfg, issues))
         showErrorToast(L"状態保存エラー", L"state.json を書き込めません。通知が重複する可能性があります");
     if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
+
+    return static_cast<int>(targets.size());
+}
+
+// 「今すぐ更新」の完了 Toast
+//
+// 明示のユーザ操作に対し、再取得が終わった時点を知らせる。（完了が分からない問題への対処）
+// 更新を検知した回は通知 Toast 自体が完了の合図になるため、呼び出し側で出し分ける。
+// 通知音は鳴らさない。（チケットの更新通知と違い、ユーザが待っている場面での応答のため）
+static void showPollDoneToast()
+{
+    try {
+        showToast3(L"更新が完了しました", L"新しい更新はありません",
+                   L"未処理 " + std::to_wstring(visibleIssueCount()) + L" 件",
+                   L"", true);
+    }
+    catch (winrt::hresult_error const& e) {
+        writeLog("poll done toast failed: " + winrt::to_string(e.message()));
+    }
+    catch (...) {
+        writeLog("poll done toast failed: unknown exception");
+    }
 }
 
 // ポーリングスレッド本体
@@ -3806,7 +3837,9 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             if (!ok) {
                 if (g_shutdownRequested) break;  // 終了による取得中断は接続エラーではない
                 writeLog("HTTP request failed");
-                showErrorToast(L"接続エラー", L"Redmine API に接続できません");
+                // 手動更新の失敗はクールダウンを無視して必ず知らせる。無音のままだと
+                // 操作が届いたのか失敗したのか区別できず、完了通知の目的を果たせない
+                showErrorToast(L"接続エラー", L"Redmine API に接続できません", manualTriggered);
                 waitInterruptible(RETRY_WAIT_MS);
                 continue;
             }
@@ -3831,8 +3864,12 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             resolveUpdaters(cfg, issues, prevState, userLastNames);
             if (g_shutdownRequested) break;  // resolveUpdaters は HTTP を伴うため中断を確認する
 
-            deliverPollResults(exeDir, cfg, issues, prevState);
+            int notified = deliverPollResults(exeDir, cfg, issues, prevState);
             refreshPins(exeDir, cfg, issues, groupIds, groupIdsResolved);
+
+            // 「今すぐ更新」の完了通知。更新を検知した回は通知 Toast が出ているため重ねない
+            if (manualTriggered && notified == 0 && !g_shutdownRequested)
+                showPollDoneToast();
 
             g_lastPollTick.store(GetTickCount64());
             waitInterruptible(calcSleepUntilNextPoll(pollsPerHour));
