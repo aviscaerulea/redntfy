@@ -40,7 +40,7 @@ build.ps1 は `Microsoft.VisualStudio.DevShell.dll` + `Enter-VsDevShell` で VC+
   `g_currentConfig` は起動時に 1 回設定した後は不変で、ロック無しで読み取る。
 
 - 永続化は `state.json`（検知済み）と `pins.json`（ピン留め）で、書き出しは `atomicWriteJson`（tmp 経由の置換）  
-  `state.json` は v2（チケット id → updated_on ＋所属クエリ、ルートに追跡クエリ id）。  
+  `state.json` は v2（チケット id → updated_on ＋所属クエリ＋最終更新者、ルートに追跡クエリ id と前回ポーリング時刻）。  
   旧形式と `query_ids` への追加分は流入検知を見送り、現在の所属を黙って採用する。（通知の嵐の防止）
 
 - `fetchIssues` は 1 クエリでも失敗すると全体を失敗にして部分結果を破棄する（誤「新規」通知の防止）

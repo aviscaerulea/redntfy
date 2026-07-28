@@ -7,7 +7,8 @@
  * チケット id で重複排除した和集合を追跡する。
  * schedule は 0 時〜23 時の 24 要素配列。（回/時、0 でその時間帯は休止）
  * 追跡集合への新規流入と既知チケットの updated_on 進行・新クエリ流入を Toast 通知と音声で知らせる。
- * 自分が起票したチケットの流入（author.id）と自分の操作による更新（最終 journal の user.id）は通知しない。
+ * 自分が起票したチケットの流入（author.id で判定）は通知しない。
+ * 自分の操作による更新と、前回ポーリング以降の自分の更新が原因の流入（最終 journal の user.id で判定）も通知しない。
  * 検知済み状態は「チケット id → updated_on ＋所属クエリ集合」を state.json（v2）に永続化して重複通知を防ぐ。
  * トレイ左クリックで未処理チケットの一覧を表示し、行の右クリックで最大 5 件をピン留めできる。
  * ピンは pins.json に永続化し、保存クエリの集合から外れたチケットも一覧に表示し続ける。
@@ -210,6 +211,7 @@ struct Issue {
     std::string subject;
     std::string updatedOn;
     int         authorId  = 0;     // 自分の起票を通知対象から外すために保持する
+    std::string authorName;        // 起票者名（新規流入 Toast の表示用。更新者名が取れない場合のフォールバック）
     int         assignedToId = 0;  // 担当者 id（0 = 未割当）
                                    // Redmine はユーザとグループが同一 id 空間のため、自分の id と
                                    // 一致するかを見るだけでグループ担当を弾ける。型の判別は不要。
@@ -217,6 +219,10 @@ struct Issue {
     std::string dueDate;           // due_date（"YYYY-MM-DD"、期限なしは空。一覧の日付表示に使う）
     std::vector<int> queryIds;     // このチケットが現れた保存クエリ id（昇順）。クエリ流入の検知に使う
     bool assignedToGroup = false;  // 担当がグループ（一覧の 👥 マーカー。取得後にグループ id 集合と突合して設定）
+    // 最終更新者（resolveUpdaters が journals から確定する。journal なしは起票者で代替）
+    int         updaterId = 0;     // 自分の操作による通知の抑止判定に使う（0 = 未確定）
+    std::string updaterName;       // フルネーム（Toast の「更新：○○」表示用）
+    std::string updaterDisplay;    // 一覧の表示名（姓。取得できない場合はフルネーム）
 };
 
 // ピン留め 1 件分
@@ -228,6 +234,7 @@ struct PinEntry {
     bool        closed = false;
     std::string dueDate;           // due_date（"YYYY-MM-DD"、期限なしは空。一覧の日付表示に使う）
     bool assignedToGroup = false;  // 担当がグループ（👥 マーカー。集合外ピンも表示できるよう永続化）
+    std::string updaterDisplay;    // 最終更新者の表示名（姓。集合外ピンも表示できるよう永続化）
 };
 
 // loadConfig の戻り値
@@ -393,6 +400,18 @@ static DueDateView makeDueDateView(const std::string& due, int todayYmd) {
     v.md      = std::to_wstring(m) + L"/" + std::to_wstring(d);
     v.overdue = (y * 10000 + m * 100 + d) <= todayYmd;
     return v;
+}
+
+// 現在時刻を Redmine の updated_on と同形式の UTC ISO 8601 文字列で返す
+// state.json の polled_on に記録し、次回ポーリングで「前回以降の更新か」を辞書順比較で判定する。
+// ローカル時計とサーバ時計のずれはそのまま判定窓のずれになるが、秒〜分単位であり実害は無視できる。
+static std::string nowUtcIso() {
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    char buf[32];
+    sprintf_s(buf, "%04u-%02u-%02uT%02u:%02u:%02uZ",
+              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return buf;
 }
 
 // Toast XML の特殊文字をエスケープする
@@ -702,6 +721,9 @@ struct StateEntry {
     std::string      updatedOn;
     std::vector<int> queryIds;           // 前回の所属クエリ id（昇順）
     bool             hasQueries = false; // queries キーがあったか（旧形式 v1 の判別）
+    // 最終更新者のキャッシュ（updated_on が変わっていなければ journals を引き直さないため）
+    int              updaterId = 0;
+    std::string      updaterDisplay;
 };
 
 // state.json の読み込み結果
@@ -709,6 +731,7 @@ struct PollState {
     bool                                baseline = false; // ベースライン確立済みか
     std::unordered_map<int, StateEntry> issues;
     std::vector<int>                    knownQueries;     // 前回追跡していたクエリ id（昇順）
+    std::string                         polledOn;         // 前回ポーリング時刻（UTC ISO 8601。旧形式は空）
 };
 
 // 検知済み状態の読み込み
@@ -723,12 +746,13 @@ static PollState loadState(const std::wstring& dir) {
     using namespace winrt::Windows::Data::Json;
     PollState st;
     // state.json は追跡集合の件数に比例して育つため、書き込み側と非対称にならないよう
-    // 上限を 16MB（v2 は 1 件約 75 バイトで約 20 万件相当）まで広げる
+    // 上限を 16MB（v2 は 1 件約 110 バイトで約 14 万件相当）まで広げる
     auto buf = readJsonFile(dir + L"\\" + STATE_FILENAME, "state", 16u * 1024 * 1024);
     if (!buf) return st;
     try {
         auto obj = JsonObject::Parse(winrt::to_hstring(*buf));
         st.baseline = obj.GetNamedBoolean(L"baseline", false);
+        st.polledOn = winrt::to_string(obj.GetNamedString(L"polled_on", L""));
         if (obj.HasKey(L"queries")) {
             for (auto q : obj.GetNamedArray(L"queries")) {
                 int qid = static_cast<int>(q.GetNumber());
@@ -743,7 +767,9 @@ static PollState loadState(const std::wstring& dir) {
                 auto up = winrt::to_string(o.GetNamedString(L"updated_on", L""));
                 if (id <= 0 || up.empty()) continue;
                 StateEntry e;
-                e.updatedOn = std::move(up);
+                e.updatedOn      = std::move(up);
+                e.updaterId      = static_cast<int>(o.GetNamedNumber(L"updater_id", 0));
+                e.updaterDisplay = winrt::to_string(o.GetNamedString(L"updater", L""));
                 if (o.HasKey(L"queries")) {
                     e.hasQueries = true;
                     for (auto q : o.GetNamedArray(L"queries")) {
@@ -776,6 +802,7 @@ static bool saveState(const std::wstring& dir, const Config& cfg, const std::vec
         JsonObject root;
         root.Insert(L"version",  JsonValue::CreateNumberValue(2));
         root.Insert(L"baseline", JsonValue::CreateBooleanValue(true));
+        root.Insert(L"polled_on", JsonValue::CreateStringValue(winrt::to_hstring(nowUtcIso())));
         JsonArray qarr;
         for (int q : cfg.queryIds) qarr.Append(JsonValue::CreateNumberValue(q));
         root.Insert(L"queries", qarr);
@@ -784,6 +811,8 @@ static bool saveState(const std::wstring& dir, const Config& cfg, const std::vec
             JsonObject o;
             o.Insert(L"id",         JsonValue::CreateNumberValue(is.id));
             o.Insert(L"updated_on", JsonValue::CreateStringValue(winrt::to_hstring(is.updatedOn)));
+            o.Insert(L"updater_id", JsonValue::CreateNumberValue(is.updaterId));
+            o.Insert(L"updater",    JsonValue::CreateStringValue(winrt::to_hstring(is.updaterDisplay)));
             JsonArray iq;
             for (int q : is.queryIds) iq.Append(JsonValue::CreateNumberValue(q));
             o.Insert(L"queries", iq);
@@ -814,6 +843,7 @@ static void savePins(const std::wstring& dir) {
                 o.Insert(L"closed",     JsonValue::CreateBooleanValue(p.closed));
                 o.Insert(L"due_date",   JsonValue::CreateStringValue(winrt::to_hstring(p.dueDate)));
                 o.Insert(L"assigned_to_group", JsonValue::CreateBooleanValue(p.assignedToGroup));
+                o.Insert(L"updater",    JsonValue::CreateStringValue(winrt::to_hstring(p.updaterDisplay)));
                 arr.Append(o);
             }
         }
@@ -857,6 +887,9 @@ static void loadPins(const std::wstring& dir) {
             // 旧形式（キーなし）は既定値で開始し、次のポーリングの refreshPins で実値になる
             p.dueDate   = winrt::to_string(o.GetNamedString(L"due_date", L""));
             p.assignedToGroup = o.GetNamedBoolean(L"assigned_to_group", false);
+            // updater は集合内ピンのみ refreshPins で実値になる。（集合外ピンの個別取得は
+            // journals を含まないため、保存値のまま維持される）
+            p.updaterDisplay  = winrt::to_string(o.GetNamedString(L"updater", L""));
             if (p.id > 0) g_pins.push_back(std::move(p));
         }
         writeLog("pins: loaded " + std::to_string(g_pins.size()) + " entries");
@@ -1033,7 +1066,10 @@ static Issue parseIssueObject(const winrt::Windows::Data::Json::JsonObject& obj)
     is.updatedOn = winrt::to_string(obj.GetNamedString(L"updated_on", L""));
     if (obj.HasKey(L"author")) {
         auto author = obj.GetNamedObject(L"author", nullptr);
-        if (author) is.authorId = static_cast<int>(author.GetNamedNumber(L"id", 0));
+        if (author) {
+            is.authorId   = static_cast<int>(author.GetNamedNumber(L"id", 0));
+            is.authorName = winrt::to_string(author.GetNamedString(L"name", L""));
+        }
     }
     // assigned_to はキー自体が無ければ未割当。ユーザとグループで形は同じ。（id と name のみ）
     if (obj.HasKey(L"assigned_to")) {
@@ -1225,28 +1261,105 @@ static bool fetchIssue(const Config& cfg, int id, Issue& out) {
     }
 }
 
-// 指定チケットの最終 journal の更新者が自分かどうかを判定する
+// 最終更新者（直近 journal の更新者）
+// ok は journals の取得・解析に成功したか。（journals が空でも成功。通信失敗と区別する）
+// userId 0 は journals 空（journal の無い新規チケット等）または取得失敗を表す。
+struct LastUpdater {
+    bool        ok     = false;
+    int         userId = 0;
+    std::string userName;
+};
+
+// 指定チケットの最終 journal の更新者を取得する
 // journals は作成順（昇順）で返るため末尾要素が最新の更新。
-// 取得失敗・journals 空（説明文編集等で journal が付かないケース）は false を返す
-// 。（判定できないものは通知する側に倒す）
-static bool isLastUpdateByMe(const Config& cfg, int id) {
-    if (g_myUserId == 0) return false;
+// 自分の操作の抑止判定（userId 比較）と Toast の更新者表示（userName）で 1 回の取得を共用する。
+// 取得失敗時は userId 0 のまま返し、呼び出し側の抑止判定は通知する側に倒れる。
+static LastUpdater fetchLastUpdater(const Config& cfg, int id) {
+    LastUpdater lu;
     DWORD status = 0;
     auto body = redmineGet(issueUrl(cfg, id) + L".json?include=journals", cfg.apiKey, &status);
-    if (status != 200 || body.empty()) return false;
+    if (status != 200 || body.empty()) return lu;
     try {
         auto obj   = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
         auto issue = obj.GetNamedObject(L"issue", nullptr);
-        if (!issue || !issue.HasKey(L"journals")) return false;
+        if (!issue || !issue.HasKey(L"journals")) return lu;
         auto journals = issue.GetNamedArray(L"journals");
-        if (journals.Size() == 0) return false;
+        lu.ok = true;  // journals を取得できた（空でも成功。呼び出し側が失敗時の再解決を判断する）
+        if (journals.Size() == 0) return lu;
         auto last = journals.GetObjectAt(journals.Size() - 1);
         auto user = last.GetNamedObject(L"user", nullptr);
-        if (!user) return false;
-        return static_cast<int>(user.GetNamedNumber(L"id", 0)) == g_myUserId;
+        if (!user) return lu;
+        lu.userId   = static_cast<int>(user.GetNamedNumber(L"id", 0));
+        lu.userName = winrt::to_string(user.GetNamedString(L"name", L""));
+        return lu;
     }
     catch (...) {
-        return false;
+        return lu;
+    }
+}
+
+// ユーザ id から姓を取得する（セッション内キャッシュ）
+// Redmine のユーザ名文字列は姓名が無区切りで分割できない。一覧の最終更新者列に姓だけを
+// 出すため /users/{id}.json の lastname を引く。取得失敗は空をキャッシュして毎回の再試行を
+// 抑える。（呼び出し側がフルネームへフォールバックし、再起動で再試行される）
+static std::string resolveLastName(const Config& cfg, int userId,
+                                   std::unordered_map<int, std::string>& cache)
+{
+    if (userId <= 0) return {};
+    auto it = cache.find(userId);
+    if (it != cache.end()) return it->second;
+    std::string lastName;
+    DWORD status = 0;
+    auto body = redmineGet(cfg.redmineUrl + L"/users/" + std::to_wstring(userId) + L".json",
+                           cfg.apiKey, &status);
+    if (status == 200 && !body.empty()) {
+        try {
+            auto obj  = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
+            auto user = obj.GetNamedObject(L"user", nullptr);
+            if (user) lastName = winrt::to_string(user.GetNamedString(L"lastname", L""));
+        }
+        catch (...) {
+            writeLog("resolveLastName: JSON parse failed (user=" + std::to_string(userId) + ")");
+        }
+    }
+    else {
+        writeLog("resolveLastName: request failed, status=" + std::to_string(status)
+            + " (user=" + std::to_string(userId) + ")");
+    }
+    cache[userId] = lastName;
+    return lastName;
+}
+
+// 一覧・Toast 用に各チケットの最終更新者を確定する
+// updated_on が前回ポーリングから変わっていないチケットは state.json のキャッシュを使う。
+// 変わったチケットと新規のチケットだけ journals を取得する。（定常時の追加 HTTP は変化分のみ）
+// journal の無いチケットは起票者を最終更新者として扱い、取得失敗は表示名を空のまま残して
+// 次回ポーリングで再解決する。通知抑止（deliverPollResults）もここで確定した updaterId を
+// 使うため、journals の取得は本関数だけで行う。
+static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
+                            const PollState& prev,
+                            std::unordered_map<int, std::string>& lastNameCache)
+{
+    for (auto& is : issues) {
+        if (g_shutdownRequested) return;
+        auto it = prev.issues.find(is.id);
+        if (it != prev.issues.end() && it->second.updatedOn == is.updatedOn
+            && !it->second.updaterDisplay.empty()) {
+            is.updaterId      = it->second.updaterId;
+            is.updaterDisplay = it->second.updaterDisplay;
+            continue;
+        }
+        LastUpdater lu = fetchLastUpdater(cfg, is.id);
+        is.updaterId   = lu.userId;
+        is.updaterName = lu.userName;
+        // 取得失敗は表示名を空のまま残し、次回ポーリングのキャッシュミスで再解決する。
+        // （誤った名前を state.json に焼き付けない。抑止判定は userId 0 で通知側に倒れる）
+        if (!lu.ok) continue;
+        // journal の無いチケットは起票者を最終更新者として扱う
+        int         dispId   = lu.userId != 0 ? lu.userId : is.authorId;
+        std::string dispName = lu.userId != 0 ? lu.userName : is.authorName;
+        is.updaterDisplay = resolveLastName(cfg, dispId, lastNameCache);
+        if (is.updaterDisplay.empty()) is.updaterDisplay = dispName;
     }
 }
 
@@ -2553,14 +2666,15 @@ struct IssueLabel {
 static constexpr wchar_t GROUP_MARK[] = L"👥 ";
 
 // 一覧行のラベルを組み立てる
-//   期限あり："#12345  7/28 件名"（番号の後は空白 2、日付の後は空白 1）
-//   期限なし："#12345  件名"（従来どおり）
-//   グループ担当：件名の直前に 👥 を付ける（例："#12345  7/28 👥 件名"）
+//   並びは「番号、最終更新者の姓、期日、グループ担当マーカー、件名」
+//   （例："#12345  山田  7/28 👥 件名"。番号と姓の後は空白 2、日付の後は空白 1）
+//   更新者不明・期限なしなどの要素は詰めて省く。
 // ピン記号はラベルに含めない。WM_DRAWITEM が IssueItem::pinned を見てマーカー列に描く。
-static IssueLabel buildIssueLabel(int id, const std::string& subject, const std::wstring& dateMd,
-                                  bool assignedToGroup) {
+static IssueLabel buildIssueLabel(int id, const std::string& subject, const std::string& updater,
+                                  const std::wstring& dateMd, bool assignedToGroup) {
     IssueLabel r;
     r.text = L"#" + std::to_wstring(id) + L"  ";
+    if (!updater.empty()) r.text += toWide(updater) + L"  ";
     if (!dateMd.empty()) {
         r.dateOffset = r.text.size();
         r.dateLen    = dateMd.size();
@@ -2599,13 +2713,14 @@ static void showIssuePopup(HWND hWnd) {
     // 「今日」は 1 回だけ求めて全行に使う。行ごとに求めると日付境界をまたいだ瞬間に
     // 同じ一覧内で赤判定が揺れる
     const int todayYmd = todayJstYmd();
-    auto makeItem = [&](int id, const std::string& subject, const std::string& dueDate,
-                        bool assignedToGroup, bool pinned, bool closed) {
+    auto makeItem = [&](int id, const std::string& subject, const std::string& updater,
+                        const std::string& dueDate, bool assignedToGroup,
+                        bool pinned, bool closed) {
         IssueItem it;
         it.id  = id;
         it.url = issueUrl(cfg, id);
         auto due = makeDueDateView(dueDate, todayYmd);
-        auto lbl = buildIssueLabel(id, subject, due.md, assignedToGroup);
+        auto lbl = buildIssueLabel(id, subject, updater, due.md, assignedToGroup);
         it.label      = std::move(lbl.text);
         it.dateOffset = lbl.dateOffset;
         it.dateLen    = lbl.dateLen;
@@ -2643,13 +2758,15 @@ static void showIssuePopup(HWND hWnd) {
             ++visible;
         }
         rows.push_back({is.updatedOn, is.dueDate,
-            makeItem(is.id, is.subject, is.dueDate, is.assignedToGroup, pinned, is.closed)});
+            makeItem(is.id, is.subject, is.updaterDisplay, is.dueDate,
+                     is.assignedToGroup, pinned, is.closed)});
         shown.insert(is.id);
     }
     for (const auto& p : pins) {
         if (shown.count(p.id)) continue;
         rows.push_back({p.updatedOn, p.dueDate,
-            makeItem(p.id, p.subject, p.dueDate, p.assignedToGroup, true, p.closed)});
+            makeItem(p.id, p.subject, p.updaterDisplay, p.dueDate,
+                     p.assignedToGroup, true, p.closed)});
     }
     if (g_sortByDue.load()) {
         // 期日は ISO 形式のため文字列辞書順で昇順に比較できる。期日なしは末尾へ回し、
@@ -3218,6 +3335,7 @@ static void togglePin(UINT itemIdx, HMENU hm) {
                     p.closed          = is.closed;
                     p.dueDate         = is.dueDate;
                     p.assignedToGroup = is.assignedToGroup;
+                    p.updaterDisplay  = is.updaterDisplay;
                     break;
                 }
             }
@@ -3360,14 +3478,19 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
         // 保存済みの true を書き戻してしまうため。（解決後のポーリングで追いつく）
         bool groupChanged = src && groupIdsResolved
             && p.assignedToGroup != src->assignedToGroup;
+        // 最終更新者は src 側で確定している場合だけ比較・更新する。集合外ピンの個別取得
+        // （fetchIssue）は journals を含まず updaterDisplay が空のため、保存済みの値を保つ
+        bool updaterChanged = src && !src->updaterDisplay.empty()
+            && p.updaterDisplay != src->updaterDisplay;
         if (src && (p.subject != src->subject || p.updatedOn != src->updatedOn
                     || p.closed != src->closed || p.dueDate != src->dueDate
-                    || groupChanged)) {
+                    || groupChanged || updaterChanged)) {
             p.subject   = src->subject;
             p.updatedOn = src->updatedOn;
             p.closed    = src->closed;
             p.dueDate   = src->dueDate;
             if (groupIdsResolved) p.assignedToGroup = src->assignedToGroup;
+            if (!src->updaterDisplay.empty()) p.updaterDisplay = src->updaterDisplay;
             changed = true;
         }
     }
@@ -3385,6 +3508,7 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
                     gp.closed          = sp.closed;
                     gp.dueDate         = sp.dueDate;
                     gp.assignedToGroup = sp.assignedToGroup;
+                    gp.updaterDisplay  = sp.updaterDisplay;
                     break;
                 }
             }
@@ -3400,6 +3524,8 @@ enum class NotifyKind { New, Updated, QueryEntered };
 struct NotifyTarget {
     const Issue* issue = nullptr;
     NotifyKind   kind  = NotifyKind::Updated;
+    std::string  updaterName;  // Toast に添える表示名。新規は前回ポーリング以降の更新者
+                               //（居なければ起票者）、更新は最終更新者。クエリ流入は空。
 };
 
 // now に有り prev に無いクエリ id があるか（＝新たなクエリへの流入があるか）
@@ -3422,12 +3548,14 @@ static bool hasNewQueryEntry(const std::vector<int>& now, const std::vector<int>
 // 新クエリ流入」を検知する。クエリ流入は「更新」として通知する。ただし前回追跡して
 // いなかったクエリについては、そのクエリへの流入も、そのクエリだけに属するチケットの
 // 新規流入も検知しない。（設定追加直後の通知の嵐を防ぐ）
-// 自分が起票したチケットの流入は author.id で、自分の操作による更新は最終 journal の
-// 更新者 id で除外する。（g_myUserId == 0 のときはどちらの除外も行わず通知側に倒す）
+// 自分が起票したチケットの流入は author.id で、自分の操作による更新と自分の更新が原因の
+// 流入は最終 journal の更新者 id で除外する。（g_myUserId == 0 のときは除外せず通知側に倒す）
 // 担当者フィルタ ON なら、自分が担当でないチケットもあわせて除外する。
 // ベースライン未確立（初回起動・state.json 破損）の場合は通知せず状態保存のみ行う。
+// prev は呼び出し側が loadState で読んだ前回状態。（resolveUpdaters のキャッシュと共有するため外で読む）
+// issues の最終更新者は resolveUpdaters が確定済みであることを前提とする。
 static void deliverPollResults(const std::wstring& exeDir, const Config& cfg,
-                               const std::vector<Issue>& issues)
+                               const std::vector<Issue>& issues, const PollState& prev)
 {
     // 一覧・tooltip 用の共有状態を更新する
     {
@@ -3435,7 +3563,6 @@ static void deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         g_issues = issues;
     }
 
-    PollState prev = loadState(exeDir);
     if (!prev.baseline) {
         // 保存失敗を放置すると baseline が永久に確立せず無言で通知ゼロになるため、Toast で知らせる
         // （書き込み不可のディレクトリに展開した場合など、ログ自体が残せない環境を想定）
@@ -3463,11 +3590,10 @@ static void deliverPollResults(const std::wstring& exeDir, const Config& cfg,
     // 通知対象の抽出
     std::vector<NotifyTarget> targets;
     for (const auto& is : issues) {
-        // 更新判定は 1 件ごとに journals の同期 HTTP を伴い件数上限もないため、中断可能にする。
-        // ここで抜けると state.json は前回のまま残り、次回ポーリングで再検知される（通知は失われない）
+        // 終了要求時は state.json を書かずに抜ける。前回のまま残るため、未通知分は
+        // 次回ポーリングで再検知される。（通知は失われない）
         if (g_shutdownRequested) return;
         // 担当者フィルタで外れたチケットは通知しない
-        // prev の照合より前に置くことで、除外分の journals 取得（同期 HTTP）も省ける
         if (!passesAssigneeFilter(is)) continue;
         auto it = prev.issues.find(is.id);
         if (it == prev.issues.end()) {
@@ -3486,7 +3612,18 @@ static void deliverPollResults(const std::wstring& exeDir, const Config& cfg,
                 }
             }
             if (!inKnown) continue;
-            targets.push_back({&is, NotifyKind::New});
+            // 自分の更新が原因の流入は通知しない。既存チケットは自分の操作（期日削除等）で
+            // 保存クエリの条件に入り直すことがある。起票者チェックだけでは弾けないため、
+            // 前回ポーリング以降に更新されたチケットは最終更新者でも判定する。
+            // それより古い更新の流入は時間経過（期日接近等）によるもので、最終更新者が
+            // 自分でも通知する。（既知チケットのクエリ流入の扱いと揃える）
+            // polled_on の無い旧形式 state.json では判定せず通知側に倒す。
+            bool recentUpdate = !prev.polledOn.empty() && is.updatedOn > prev.polledOn;
+            if (recentUpdate && g_myUserId != 0 && is.updaterId == g_myUserId) continue;
+            // 表示名も同じ基準で選ぶ。直近の更新が原因の流入はその更新者、時間経過の流入は
+            // 起票者を出す。（古い最終更新者を「新規：○○」と出すと起票者と誤読される）
+            targets.push_back({&is, NotifyKind::New,
+                recentUpdate && !is.updaterName.empty() ? is.updaterName : is.authorName});
             continue;
         }
         const StateEntry& pv = it->second;
@@ -3495,21 +3632,25 @@ static void deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         bool entered = pv.hasQueries
             && hasNewQueryEntry(is.queryIds, pv.queryIds, prev.knownQueries);
         if (!updated && !entered) continue;
-        // 自分の操作による更新は通知しない。updated_on が進んでいない純粋な流入では
-        // journals を引かない：時間経過による流入が典型で「自分の操作」ではないため。
-        if (updated && isLastUpdateByMe(cfg, is.id)) continue;
-        targets.push_back({&is, updated ? NotifyKind::Updated : NotifyKind::QueryEntered});
+        // 自分の操作による更新は通知しない。（最終更新者は resolveUpdaters が確定済み）
+        // updated_on が進んでいない純粋な流入では判定しない：時間経過による流入が典型で
+        // 「自分の操作」ではないため。（クエリ流入の Toast は更新者名も出さない）
+        if (updated && g_myUserId != 0 && is.updaterId == g_myUserId) continue;
+        targets.push_back({&is, updated ? NotifyKind::Updated : NotifyKind::QueryEntered,
+                           updated ? is.updaterName : std::string()});
     }
 
     if (!targets.empty()) {
         try {
             if (targets.size() == 1) {
-                // 1 件：チケット番号＋件名を出し、クリックでそのチケットを開く
-                const Issue* t = targets[0].issue;
-                bool isNew = targets[0].kind == NotifyKind::New;
+                // 1 件：チケット番号＋件名を出し、クリックでそのチケットを開く。
+                // 種別に更新者名を添える。（例「更新：山田太郎」。名前が取れない場合は種別のみ）
+                const NotifyTarget& nt = targets[0];
+                const Issue* t = nt.issue;
+                std::wstring kind = nt.kind == NotifyKind::New ? L"新規" : L"更新";
+                if (!nt.updaterName.empty()) kind += L"：" + toWide(nt.updaterName);
                 showToast(L"#" + std::to_wstring(t->id) + L" " + toWide(t->subject),
-                          isNew ? L"新規" : L"更新",
-                          issueUrl(cfg, t->id));
+                          kind, issueUrl(cfg, t->id));
             }
             else {
                 // 複数件：合計件数のみのサマリ 1 通とし、クリックで代表クエリ画面（query_ids の先頭）を開く
@@ -3569,6 +3710,9 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     std::vector<int> ownGroups;        // 自分の所属グループ（fetchMyUserId が設定）
     std::vector<int> groupIds;         // 判定に使う集合（全グループ、権限不足時は所属グループ）
     bool groupIdsResolved = false;
+
+    // ユーザ id → 姓のセッション内キャッシュ（一覧の最終更新者列。resolveLastName が使う）
+    std::unordered_map<int, std::string> userLastNames;
 
     while (!g_shutdownRequested) {
         try {
@@ -3669,7 +3813,20 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             for (auto& is : issues)
                 is.assignedToGroup = isGroupAssignee(groupIds, is.assignedToId);
 
-            deliverPollResults(exeDir, cfg, issues);
+            // 一覧・tooltip は最終更新者の解決を待たずに先行公開する。初回起動や移行直後は
+            // resolveUpdaters が全件分の HTTP を打つため、完了を待つと一覧が空のまま待たされる。
+            // （姓の列は解決後、deliverPollResults の再公開で入る）
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                g_issues = issues;
+            }
+
+            // 前回状態はここで 1 回だけ読み、最終更新者の解決と通知判定で共有する
+            PollState prevState = loadState(exeDir);
+            resolveUpdaters(cfg, issues, prevState, userLastNames);
+            if (g_shutdownRequested) break;  // resolveUpdaters は HTTP を伴うため中断を確認する
+
+            deliverPollResults(exeDir, cfg, issues, prevState);
             refreshPins(exeDir, cfg, issues, groupIds, groupIdsResolved);
 
             g_lastPollTick.store(GetTickCount64());
