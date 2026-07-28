@@ -2930,7 +2930,7 @@ static void checkForUpdates() {
 
 // 更新通知メニュー項目のサイズを計算する
 static BOOL measureVersionMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
-    std::wstring prefix = std::wstring(L"Redntfy v") + APP_VERSION + L" → ";
+    std::wstring prefix = std::wstring(L"redntfy v") + APP_VERSION + L" → ";
     std::wstring latest;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
@@ -2956,7 +2956,7 @@ static BOOL measureVersionMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
 // 更新通知メニュー項目を描画する
 // プレフィックス部分を通常色、新バージョン部分を赤色で描く
 static BOOL drawVersionMenuItem(DRAWITEMSTRUCT* dis) {
-    std::wstring prefix = std::wstring(L"Redntfy v") + APP_VERSION + L" → ";
+    std::wstring prefix = std::wstring(L"redntfy v") + APP_VERSION + L" → ";
     std::wstring latest;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
@@ -3006,7 +3006,7 @@ static void showTrayContextMenu(HWND hWnd) {
         return;
     }
     if (g_updateAvailable.load()) {
-        // 新版あり：オーナードローで "Redntfy vX.Y.Z → vNew" を赤文字で表示する
+        // 新版あり：オーナードローで "redntfy vX.Y.Z → vNew" を赤文字で表示する
         MENUITEMINFOW mii = { sizeof(mii) };
         mii.fMask = MIIM_FTYPE | MIIM_ID;
         mii.fType = MFT_OWNERDRAW;
@@ -3014,7 +3014,7 @@ static void showTrayContextMenu(HWND hWnd) {
         InsertMenuItemW(hMenu, 0, TRUE, &mii);
     }
     else {
-        AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"Redntfy v" APP_VERSION);
+        AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GITHUB, L"redntfy v" APP_VERSION);
     }
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
