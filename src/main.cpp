@@ -114,6 +114,7 @@ static constexpr UINT IDM_STARTUP             = 40010; // Windows スタート�
 static constexpr UINT IDM_ASSIGNED_TO_ME      = 40011; // 担当がグループのチケットを一覧・tooltip・通知から除外するトグル
 static constexpr UINT IDM_UPDATE_NOW          = 40012; // 休止時間帯・クールダウンを無視した即時ポーリング
 static constexpr UINT IDM_SORT_BY_DUE         = 40013; // 一覧を期日昇順に並べるトグル
+static constexpr UINT IDM_EXCLUDE_NO_VERSION  = 40014; // バージョン未指定を一覧・tooltip・通知から除外するトグル（期日ありは例外的に残す）
 
 static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/redntfy";
 static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/redntfy/releases";
@@ -178,6 +179,13 @@ static std::atomic<bool> g_assignedToMeOnly{false};
 // 一覧を期日昇順に並べるトグル（レジストリ永続化。OFF は更新日時降順）
 static std::atomic<bool> g_sortByDue{false};
 
+// バージョン未指定のチケットを一覧・tooltip・通知から除外するトグル（レジストリ永続化）
+// 期日が設定されているチケットは「時限のある未来課題」として、バージョン未指定でも残す。
+// 取得と state.json は常に全件のまま扱い、表示と通知の直前だけで絞る。
+// 追跡集合そのものを絞ると、OFF に戻したとき state.json に無い id が「新規」と誤検知される。
+// 対価として、ON 中に抑止した更新は state.json に記録済みのため OFF に戻しても再通知されない。
+static std::atomic<bool> g_excludeNoVersion{false};
+
 // トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングループと通知スレッドが参照）
 static HWND g_hWnd = nullptr;
 
@@ -221,6 +229,7 @@ struct Issue {
     std::vector<int> queryIds;     // このチケットが現れた保存クエリ id（昇順）。クエリ流入の検知に使う
     bool assignedToGroup = false;  // 担当がグループ（一覧の 👥 マーカー。取得後にグループ id 集合と突合して設定）
     bool isBugTracker    = false;  // トラッカーが bug_trackers に一致（一覧の 💥 マーカー。パース時に判定）
+    bool hasFixedVersion = false;  // fixed_version が JSON に含まれ非 null。バージョンフィルタで見る
     // 最終更新者（resolveUpdaters が journals から確定する。journal なしは起票者で代替）
     int         updaterId = 0;     // 自分の操作による通知の抑止判定に使う（0 = 未確定）
     std::string updaterName;       // フルネーム（Toast の「更新：○○」表示用）
@@ -310,6 +319,14 @@ static bool passesAssigneeFilter(const Issue& is) {
     int me = g_myUserId.load();
     if (!g_assignedToMeOnly.load() || me == 0) return true;
     return is.assignedToId == me;
+}
+
+// 一覧・tooltip・通知に出す対象かを判定する（トレイメニューの「バージョン未指定のチケットを除外」）
+// バージョン未指定でも期日が設定されていれば「時限のある未来課題」として通す。
+// 「将来の課題として起票しておいた」チケットを日常の一覧から外すのが本フィルタの意図。
+static bool passesVersionFilter(const Issue& is) {
+    if (!g_excludeNoVersion.load()) return true;
+    return is.hasFixedVersion || !is.dueDate.empty();
 }
 
 // トレイアイコンのバッジ状態
@@ -1154,6 +1171,12 @@ static Issue parseIssueObject(const Config& cfg,
         auto assignee = obj.GetNamedObject(L"assigned_to", nullptr);
         if (assignee) is.assignedToId = static_cast<int>(assignee.GetNamedNumber(L"id", 0));
     }
+    // fixed_version は include 指定なしでも常に返り、未設定ならキー自体が現れない。
+    // 除外判定にしか使わないため name は保持せず、有無だけを持つ。
+    if (obj.HasKey(L"fixed_version")) {
+        auto ver = obj.GetNamedObject(L"fixed_version", nullptr);
+        if (ver) is.hasFixedVersion = true;
+    }
     if (obj.HasKey(L"closed_on")) {
         auto v = obj.GetNamedValue(L"closed_on", nullptr);
         is.closed = v && v.ValueType() == JsonValueType::String
@@ -1561,6 +1584,7 @@ static constexpr const wchar_t* REG_SOUND_ENABLED     = L"SoundEnabled";
 static constexpr const wchar_t* REG_MUTE_IN_MEETING   = L"MuteInMeeting";
 static constexpr const wchar_t* REG_ASSIGNED_TO_ME    = L"AssignedToMeOnly";
 static constexpr const wchar_t* REG_SORT_BY_DUE       = L"SortByDue";
+static constexpr const wchar_t* REG_EXCLUDE_NO_VERSION = L"ExcludeNoVersion";
 static constexpr const wchar_t* REG_NOTIFIED_VERSION  = L"NotifiedUpdateVersion";
 
 // Windows スタートアップ登録用レジストリ（HKCU Run キー）
@@ -2537,13 +2561,13 @@ struct ListRow {
 
 // 一覧に出す行を選定し、並べ替えて list_limit 件へ絞る
 //
-//   1. g_issues から担当者フィルタを通った行をすべて採る
-//      （フィルタで外れてもピン留め済みなら残す。ピンはフィルタより優先する）
+//   1. g_issues から表示フィルタ（担当者フィルタ AND バージョンフィルタ）を通った行をすべて採る
+//      （フィルタで外れてもピン留め済みなら残す。ピンはすべてのフィルタより優先する）
 //   2. 1 に含まれないピンを追加する（保存クエリの集合外ピンはキャッシュ内容で表示）
 //   3. 全体を並べ替える（既定は updated_on 降順。「期日順に並べる」ON なら期日昇順で
 //      期日なしは末尾。ピンも同じ規則で本来の位置に置く）
 //   4. 先頭 list_limit 件へ絞る（ピン留めは上限適用外で常に残す）
-// visible には担当者フィルタを通った未処理件数（絞り込み前）を返す。ピン留めは数えない。
+// visible には表示フィルタを通った未処理件数（絞り込み前）を返す。ピン留めは数えない。
 // （明示の意思表示であって未処理件数ではないため、フィルタで外れたピンを件数に足し戻さない）
 // tooltip の未読件数も本関数の結果から数える。表示と同じ選定を通すことで「未読 N 件」と
 // 画面上の太字行数を一致させる。（一覧に出ない未読は数に出さず、バッジも点けない）
@@ -2569,10 +2593,11 @@ static std::vector<ListRow> buildListRows(int& visible) {
     std::unordered_set<int> shown;
     visible = 0;
     for (const auto& is : issues) {
-        // 担当者フィルタで外れた行は出さない。ただしピン留め済みは明示の意思表示として常に残す
+        // 表示フィルタで外れた行は出さない。ただしピン留め済みは明示の意思表示として常に残す
         // （クローズ済・集合外でも表示する既存のピン仕様と揃える）
         bool pinned = isPinned(is.id);
-        if (!passesAssigneeFilter(is)) {
+        bool excluded = !passesAssigneeFilter(is) || !passesVersionFilter(is);
+        if (excluded) {
             if (!pinned) continue;
         }
         else {
@@ -3186,6 +3211,10 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_STRING | (g_assignedToMeOnly ? MF_CHECKED : MF_UNCHECKED),
         IDM_ASSIGNED_TO_ME, L"担当がグループのチケットを除外");
 
+    // バージョンフィルタ（レジストリ永続化。期日ありは例外的に残す）
+    AppendMenuW(hMenu, MF_STRING | (g_excludeNoVersion ? MF_CHECKED : MF_UNCHECKED),
+        IDM_EXCLUDE_NO_VERSION, L"バージョン未指定のチケットを除外");
+
     // 一覧の並び順トグル（レジストリ永続化。ON で期日昇順、期日なしは末尾）
     AppendMenuW(hMenu, MF_STRING | (g_sortByDue ? MF_CHECKED : MF_UNCHECKED),
         IDM_SORT_BY_DUE, L"期日順に並べる");
@@ -3279,6 +3308,13 @@ static void handleTrayCommand(UINT id) {
         // 一覧の太字は食い違わない。（表示条件を変えただけで読んだことにはならない）
         // 一覧は次に開いた時点で g_issues から組み直されるが、tooltip とバッジは即時に更新する。
         // 取得済みの全件を保持しているため再ポーリングは不要。
+        if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
+        return;
+    }
+    if (id == IDM_EXCLUDE_NO_VERSION) {
+        g_excludeNoVersion.store(!g_excludeNoVersion.load());
+        writeRegDword(REG_EXCLUDE_NO_VERSION, g_excludeNoVersion.load() ? 1u : 0u);
+        // 担当者フィルタと同じ扱い。未読は消さず、tooltip・バッジは即時更新、再ポーリングは不要
         if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
         return;
     }
@@ -3756,6 +3792,7 @@ static bool hasNewQueryEntry(const std::vector<int>& now, const std::vector<int>
 // 自分が起票したチケットの流入は author.id で、自分の操作による更新と自分の更新が原因の
 // 流入は最終 journal の更新者 id で除外する。（g_myUserId == 0 のときは除外せず通知側に倒す）
 // 担当者フィルタ ON なら、自分が担当でないチケットもあわせて除外する。
+// バージョンフィルタ ON なら、fixed_version 未指定かつ期日なしのチケットもあわせて除外する。
 // ベースライン未確立（初回起動・state.json 破損）の場合は通知せず状態保存のみ行う。
 // prev は呼び出し側が loadState で読んだ前回状態。（resolveUpdaters のキャッシュと共有するため外で読む）
 // issues の最終更新者は resolveUpdaters が確定済みであることを前提とする。
@@ -3801,6 +3838,8 @@ static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         if (g_shutdownRequested) return 0;
         // 担当者フィルタで外れたチケットは通知しない
         if (!passesAssigneeFilter(is)) continue;
+        // バージョン未指定は「将来の課題」なので通知しない（期日ありは通す）
+        if (!passesVersionFilter(is)) continue;
         auto it = prev.issues.find(is.id);
         if (it == prev.issues.end()) {
             // 新規流入（自分の起票は通知しない）
@@ -4176,6 +4215,7 @@ int wmain() {
         g_muteInMeeting = readRegDword(REG_MUTE_IN_MEETING, 1u) != 0;
         g_assignedToMeOnly = readRegDword(REG_ASSIGNED_TO_ME, 0u) != 0;
         g_sortByDue        = readRegDword(REG_SORT_BY_DUE, 0u) != 0;
+        g_excludeNoVersion = readRegDword(REG_EXCLUDE_NO_VERSION, 0u) != 0;
 
         writeLog("started");
         logSchedule(cfg.schedule);
