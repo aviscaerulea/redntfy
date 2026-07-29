@@ -27,7 +27,7 @@ build.ps1 は `Microsoft.VisualStudio.DevShell.dll` + `Enter-VsDevShell` で VC+
 - `[redmine]` の url / api_key / query_ids がどちらの toml にも無い場合、原因別に Toast を出して終了コード 1 で終了する（接続情報なしでの起動確認に使える）
   - url 空・非 http(s)：「設定ファイルで Redmine の項目を確認してください」
   - api_key 空：`<url>/my/account` をブラウザで開いた上で「API キーを取得してください」
-  - query_ids 空：「redntfy.local.toml の [redmine] query_ids を設定してください」
+  - query_ids 空：`<url>/issues` をブラウザで開いた上で「カスタムクエリを作成し、query_ids に設定してください」
 - ポーリング中に HTTP 401 を検出したら、初回のみ `<url>/my/account` をブラウザで開き、「API キーを取得してください」の Toast を出す（既存の 30 分クールダウン適用）。以降の 401 は Toast のみ。一度成功すればフラグはリセットされ、再度 401 になれば再びブラウザを開く。api_key を直すには再起動が必要
 - ログは `out/logs/YYYY-MM-DD.log` に出力される
 

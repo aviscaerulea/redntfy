@@ -4271,10 +4271,14 @@ int wmain() {
             return 1;
         }
         if (cfg.queryIds.empty()) {
-            writeLog("config error: [redmine] query_ids is empty");
+            // url が確定しているため /issues を開いてカスタムクエリ作成画面へ誘導する。
+            // /my/account と同じ扱いで、Toast にリンクは持たせない（要求どおりボタンなし）。
+            writeLog("config error: [redmine] query_ids is empty; opening /issues");
+            std::wstring issuesUrl = cfg.redmineUrl + L"/issues";
+            ShellExecuteW(nullptr, L"open", issuesUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             try {
                 showToast(L"設定エラー",
-                          L"redntfy.local.toml の [redmine] query_ids を設定してください",
+                          L"カスタムクエリを作成し、query_ids に設定してください",
                           L"", false);
             }
             catch (...) {}
