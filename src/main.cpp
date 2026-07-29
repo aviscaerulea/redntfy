@@ -220,6 +220,7 @@ struct Issue {
     std::string dueDate;           // due_date（"YYYY-MM-DD"、期限なしは空。一覧の日付表示に使う）
     std::vector<int> queryIds;     // このチケットが現れた保存クエリ id（昇順）。クエリ流入の検知に使う
     bool assignedToGroup = false;  // 担当がグループ（一覧の 👥 マーカー。取得後にグループ id 集合と突合して設定）
+    bool isBugTracker    = false;  // トラッカーが bug_trackers に一致（一覧の 💥 マーカー。パース時に判定）
     // 最終更新者（resolveUpdaters が journals から確定する。journal なしは起票者で代替）
     int         updaterId = 0;     // 自分の操作による通知の抑止判定に使う（0 = 未確定）
     std::string updaterName;       // フルネーム（Toast の「更新：○○」表示用）
@@ -236,6 +237,7 @@ struct PinEntry {
     bool        closed = false;
     std::string dueDate;           // due_date（"YYYY-MM-DD"、期限なしは空。一覧の日付表示に使う）
     bool assignedToGroup = false;  // 担当がグループ（👥 マーカー。集合外ピンも表示できるよう永続化）
+    bool isBugTracker    = false;  // バグ・障害トラッカー（💥 マーカー。集合外ピンも表示できるよう永続化）
     std::string updaterDisplay;    // 最終更新者の表示名（姓。集合外ピンも表示できるよう永続化）
 };
 
@@ -252,6 +254,9 @@ struct Config {
     int                       listLimit;        // 一覧の非ピン表示件数（デフォルト 20）
     int                       subjectMaxChars;  // 件名の省略文字数（デフォルト 40）
     int                       projectMaxChars;  // プロジェクト名の省略文字数（0 で非表示、デフォルト 5）
+    // 💥 を付けるトラッカー名（* のワイルドカード可。既定は空＝どのチケットにも付けない）
+    // 比較対象の Redmine のトラッカー名が UTF-8 のため、wstring へ変換せず持つ
+    std::vector<std::string>  bugTrackers;
     std::vector<std::wstring> duckTargets;      // 通知音再生中にミュートするプロセス名
 
     // [guard] ガードトーン設定（BLE ヘッドホン対処）
@@ -332,6 +337,7 @@ static std::wstring g_exeDir;
 // 左クリックポップアップのチケット項目描画用フォント（initMenuFonts で初期化）
 static HFONT g_hMenuFont     = nullptr;
 static HFONT g_hMenuFontBold = nullptr;  // 未読行用の太字（フェイス・サイズは g_hMenuFont と同一）
+static HFONT g_hMenuFontSemiBold = nullptr;  // ラベル内の部分強調用（同上）
 
 // 通知音再生スレッドへの受け渡し用コンテキスト
 // ダッキング操作（duck/unduck）はすべて soundThread 内で実行する。
@@ -854,6 +860,7 @@ static void savePins(const std::wstring& dir) {
                 o.Insert(L"closed",     JsonValue::CreateBooleanValue(p.closed));
                 o.Insert(L"due_date",   JsonValue::CreateStringValue(winrt::to_hstring(p.dueDate)));
                 o.Insert(L"assigned_to_group", JsonValue::CreateBooleanValue(p.assignedToGroup));
+                o.Insert(L"bug_tracker", JsonValue::CreateBooleanValue(p.isBugTracker));
                 o.Insert(L"updater",    JsonValue::CreateStringValue(winrt::to_hstring(p.updaterDisplay)));
                 arr.Append(o);
             }
@@ -899,6 +906,7 @@ static void loadPins(const std::wstring& dir) {
             p.dueDate   = winrt::to_string(o.GetNamedString(L"due_date", L""));
             p.projectName     = normalizeSpaces(winrt::to_string(o.GetNamedString(L"project", L"")));
             p.assignedToGroup = o.GetNamedBoolean(L"assigned_to_group", false);
+            p.isBugTracker    = o.GetNamedBoolean(L"bug_tracker", false);
             // updater は集合内ピンのみ refreshPins で実値になる。（集合外ピンの個別取得は
             // journals を含まないため、保存値のまま維持される）
             p.updaterDisplay  = winrt::to_string(o.GetNamedString(L"updater", L""));
@@ -951,17 +959,23 @@ static Config loadConfig(const std::wstring& exeDir) {
     auto local = loadToml(exeDir + L"\\" + CONFIG_LOCAL_FILENAME);
     if (local) writeLog("Loaded redntfy.local.toml (override active)");
 
-    // duck_targets 配列の読み込み（キーが存在する側を採用。local 優先）
-    auto readDuckTargets = [&](const std::optional<toml::table>& tbl)
-            -> std::optional<std::vector<std::wstring>> {
+    // 文字列配列の読み込み（キー不在は nullopt を返し、空配列との区別に使う）
+    auto readStrArray = [](const std::optional<toml::table>& tbl, const char* key)
+            -> std::optional<std::vector<std::string>> {
         if (!tbl) return std::nullopt;
-        const auto* arr = (*tbl)["duck_targets"].as_array();
+        const auto* arr = (*tbl)[key].as_array();
         if (!arr) return std::nullopt;
-        std::vector<std::wstring> targets;
+        std::vector<std::string> out;
         for (const auto& el : *arr) {
-            if (auto s = el.value<std::string>()) targets.push_back(toWide(*s));
+            if (auto s = el.value<std::string>()) out.push_back(*s);
         }
-        return targets;
+        return out;
+    };
+    // キーが存在する側を採用する（local 優先。空配列でも local を採る）
+    auto pickStrArray = [&](const char* key) -> std::vector<std::string> {
+        if (auto v = readStrArray(local, key)) return *v;
+        if (auto v = readStrArray(base, key))  return *v;
+        return {};
     };
 
     Config cfg;
@@ -975,8 +989,9 @@ static Config loadConfig(const std::wstring& exeDir) {
         cfg.schedule.resize(24, 1);
     }
 
-    if (auto d = readDuckTargets(local))      cfg.duckTargets = std::move(*d);
-    else if (auto d = readDuckTargets(base))  cfg.duckTargets = std::move(*d);
+    cfg.bugTrackers = pickStrArray("bug_trackers");
+    // ダッキング対象はプロセス名の比較に wstring を使うため、ここで変換する
+    for (const auto& s : pickStrArray("duck_targets")) cfg.duckTargets.push_back(toWide(s));
 
     // スカラー読み込みヘルパー（local → base → デフォルトの優先順）
     auto readConfigBool = [&](const char* section, const char* key, bool def) -> bool {
@@ -1069,9 +1084,47 @@ static std::wstring queryUrl(const Config& cfg) {
     return cfg.redmineUrl + L"/issues?query_id=" + std::to_wstring(qid);
 }
 
+// ワイルドカード照合（`*` は 0 文字以上の任意列に一致する）
+// トラッカー名にリテラルの `*` は来ない前提のため、エスケープ機構は持たない。
+// UTF-8 のバイト単位で比較する。`*` はマルチバイト文字の継続バイトに現れないため、
+// バイト単位でも文字境界を跨いだ誤一致は起きない。
+// PathMatchSpecW を使わないのは、ファイル名向けの MS-DOS 由来の特例を持ち込まないため。
+static bool matchWildcard(const std::string& text, const std::string& pattern) {
+    size_t t = 0, p = 0, mark = 0;
+    size_t star = std::string::npos;  // 直近に読んだ `*` の位置（npos = まだ無い）
+    while (t < text.size()) {
+        if (p < pattern.size() && pattern[p] == text[t]) {
+            ++t;
+            ++p;
+        }
+        else if (p < pattern.size() && pattern[p] == '*') {
+            star = p++;
+            mark = t;
+        }
+        else if (star != std::string::npos) {
+            // 直近の `*` に 1 文字多く食わせてやり直す（後戻り）
+            p = star + 1;
+            t = ++mark;
+        }
+        else {
+            return false;
+        }
+    }
+    while (p < pattern.size() && pattern[p] == '*') ++p;
+    return p == pattern.size();
+}
+
+// トラッカー名が bug_trackers のいずれかに一致するか（一覧の 💥 マーカー用）
+// 判定材料を引数で受ける形は isGroupAssignee と揃える。
+static bool matchesBugTracker(const std::vector<std::string>& patterns, const std::string& name) {
+    return std::any_of(patterns.begin(), patterns.end(),
+                       [&](const std::string& pat) { return matchWildcard(name, pat); });
+}
+
 // issue JSON オブジェクトを Issue に変換する
 // closed_on はキー不在と null 値の両方を「未クローズ」として扱う。（Redmine の版による差異対策）
-static Issue parseIssueObject(const winrt::Windows::Data::Json::JsonObject& obj) {
+static Issue parseIssueObject(const Config& cfg,
+                              const winrt::Windows::Data::Json::JsonObject& obj) {
     using namespace winrt::Windows::Data::Json;
     Issue is;
     is.id        = static_cast<int>(obj.GetNamedNumber(L"id", 0));
@@ -1089,6 +1142,12 @@ static Issue parseIssueObject(const winrt::Windows::Data::Json::JsonObject& obj)
     if (obj.HasKey(L"project")) {
         auto proj = obj.GetNamedObject(L"project", nullptr);
         if (proj) is.projectName = normalizeSpaces(winrt::to_string(proj.GetNamedString(L"name", L"")));
+    }
+    // tracker も include 指定なしで常に含まれる。設定との照合結果だけを持ち、名前は残さない。
+    if (obj.HasKey(L"tracker")) {
+        auto tracker = obj.GetNamedObject(L"tracker", nullptr);
+        if (tracker) is.isBugTracker = matchesBugTracker(
+            cfg.bugTrackers, winrt::to_string(tracker.GetNamedString(L"name", L"")));
     }
     // assigned_to はキー自体が無ければ未割当。ユーザとグループで形は同じ。（id と name のみ）
     if (obj.HasKey(L"assigned_to")) {
@@ -1206,7 +1265,7 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
             auto arr = obj.GetNamedArray(L"issues");
             if (arr.Size() == 0) break;  // total_count 不整合による無限ループ防止
             for (auto item : arr) {
-                auto is = parseIssueObject(item.GetObject());
+                auto is = parseIssueObject(cfg, item.GetObject());
                 if (is.id > 0 && !is.updatedOn.empty()) outIssues.push_back(std::move(is));
             }
             offset += static_cast<int>(arr.Size());
@@ -1271,7 +1330,7 @@ static bool fetchIssue(const Config& cfg, int id, Issue& out) {
         auto obj   = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
         auto issue = obj.GetNamedObject(L"issue", nullptr);
         if (!issue) return false;
-        out = parseIssueObject(issue);
+        out = parseIssueObject(cfg, issue);
         return out.id > 0;
     }
     catch (...) {
@@ -2470,6 +2529,7 @@ struct ListRow {
     std::string dueDate;              // "YYYY-MM-DD"（期日なしは空）
     std::string updatedOn;
     bool        assignedToGroup = false;
+    bool        isBugTracker    = false;
     bool        pinned          = false;
     bool        closed          = false;
     bool        unread          = false;
@@ -2521,6 +2581,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
         rows.push_back({.id = is.id, .subject = is.subject, .projectName = is.projectName,
                         .updater = is.updaterDisplay, .dueDate = is.dueDate,
                         .updatedOn = is.updatedOn, .assignedToGroup = is.assignedToGroup,
+                        .isBugTracker = is.isBugTracker,
                         .pinned = pinned, .closed = is.closed,
                         .unread = unread.count(is.id) != 0});
         shown.insert(is.id);
@@ -2530,6 +2591,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
         rows.push_back({.id = p.id, .subject = p.subject, .projectName = p.projectName,
                         .updater = p.updaterDisplay, .dueDate = p.dueDate,
                         .updatedOn = p.updatedOn, .assignedToGroup = p.assignedToGroup,
+                        .isBugTracker = p.isBugTracker,
                         .pinned = true, .closed = p.closed,
                         .unread = unread.count(p.id) != 0});
     }
@@ -2607,18 +2669,53 @@ static void initMenuFonts() {
     LOGFONTW lfBold = ncm.lfMenuFont;
     lfBold.lfWeight = FW_BOLD;
     g_hMenuFontBold = CreateFontIndirectW(&lfBold);
+    // ラベル内の一部だけ強調する用（期限切れの日付）。未読行の太字より控えめなウェイトにして、
+    // 行全体の太字（未読）と部分強調を見分けられるようにする。
+    // 半太字は「<フェイス> Semibold」という別ファミリで、ウェイト値だけ FW_SEMIBOLD にしても
+    // GDI は同一ファミリ内の近いウェイト＝太字へ丸める。（実測：Yu Gothic UI・Segoe UI とも 600 → 700）
+    // そのためフェイス名で指定し、得られたウェイトとフェイスを検証して駄目なら太字へ落とす。
+    LOGFONTW lfSemi = ncm.lfMenuFont;
+    lfSemi.lfWeight = FW_SEMIBOLD;
+    wcsncat_s(lfSemi.lfFaceName, L" Semibold", _TRUNCATE);
+    g_hMenuFontSemiBold = CreateFontIndirectW(&lfSemi);
+    if (g_hMenuFontSemiBold) {
+        // フェイスが無い環境では GDI が別書体で代替してしまうため、フェイス名も突き合わせる
+        HDC   hdc = GetDC(nullptr);
+        HFONT old = static_cast<HFONT>(SelectObject(hdc, g_hMenuFontSemiBold));
+        TEXTMETRICW tm = {};
+        wchar_t     face[LF_FACESIZE] = {};
+        GetTextMetricsW(hdc, &tm);
+        GetTextFaceW(hdc, LF_FACESIZE, face);
+        SelectObject(hdc, old);
+        ReleaseDC(nullptr, hdc);
+        if (tm.tmWeight >= FW_BOLD || _wcsicmp(face, lfSemi.lfFaceName) != 0) {
+            DeleteObject(g_hMenuFontSemiBold);
+            g_hMenuFontSemiBold = nullptr;
+            writeLog("menu font: semibold face unavailable, using bold for emphasis");
+        }
+    }
+    // フォントは明示解放せずプロセス終了まで保持するため、太字ハンドルの共有で問題ない
+    if (!g_hMenuFontSemiBold) g_hMenuFontSemiBold = g_hMenuFontBold;
 }
+
+// 注意を促す文字色（期限切れの日付とバグマーカー。更新通知メニューの新バージョン表示と同じ赤）
+static constexpr COLORREF ALERT_TEXT_COLOR = RGB(220, 0, 0);
+
+// ラベル内で文字色とウェイトを変える範囲（オフセットと長さは UTF-16 コードユニット単位）
+struct ColorRange {
+    size_t   offset = 0;
+    size_t   len    = 0;
+    COLORREF color  = 0;
+    bool     bold   = false;  // 半太字で描く（範囲外との幅の差は走査側が吸収する）
+};
 
 // 左クリックポップアップのチケット項目（IDM_ISSUE_BASE + index に対応、WndProc スレッドのみ使用）
 struct IssueItem {
     int          id     = 0;
     std::wstring url;            // {redmine.url}/issues/{id}
     std::wstring label;          // 描画テキスト（WM_DRAWITEM / WM_MEASUREITEM で使用）
-    // 日付部分だけ赤で描くための位置情報。セグメント文字列を別々に持つとラベル全体との
-    // 不整合が起き得るため、label を単一の真実として位置だけを保持する。
-    size_t       dateOffset = 0;
-    size_t       dateLen    = 0;     // 0 = 期限なし（分割描画しない）
-    bool         overdue    = false; // 期限 ≦ 今日（JST）＝日付部分を赤で描く
+    // label 内で文字色とウェイトを変える範囲（空 = 分割描画しない）。buildIssueLabel が組み立てる
+    std::vector<ColorRange> ranges;
     bool         unread     = false; // 未読（まだ一覧から開いていない）＝太字で描く
     bool         pinned = false; // ピン留め中（マーカー列の描画条件。右クリックトグル時にもその場で更新する）
     bool         closed = false; // クローズ済（打ち消し線の描画条件）
@@ -2778,13 +2875,13 @@ static std::wstring truncateText(const std::wstring& s, size_t maxChars, bool el
     return ellipsis ? s.substr(0, cut) + L"…" : s.substr(0, cut);
 }
 
-// 一覧行のラベル（描画テキストと、その中の日付部分の位置）
-// 日付だけ色を変えて描くため位置と長さも返す。幅計測（measureIssueMenuItem）と打ち消し線は
-// text 全体で行うため、text を単一の真実として保つ。
+// 一覧行のラベル（描画テキストと、その中で色とウェイトを変える範囲）
+// セグメント文字列を別々に持つと text 全体との不整合が起き得るため、text を単一の真実とし
+// 位置だけを保持する。幅計測と打ち消し線の長さは walkIssueLabel の走査で求める。
+// ranges はオフセット昇順で重なりなく並べる。（描画側が順に走査する前提）
 struct IssueLabel {
-    std::wstring text;
-    size_t       dateOffset = 0;  // text 内の日付開始位置（dateLen == 0 のとき無意味）
-    size_t       dateLen    = 0;  // 日付部分の文字数（0 = 期限なし）
+    std::wstring            text;
+    std::vector<ColorRange> ranges;
 };
 
 // グループ担当マーカー（👥 + 半角スペース）
@@ -2792,9 +2889,13 @@ struct IssueLabel {
 // 📌 のような D2D カラー描画はしない。（単色でも輪郭が明瞭で意味が通る）
 static constexpr wchar_t GROUP_MARK[] = L"👥 ";
 
+// バグ・障害トラッカーのマーカー（💥 + 半角スペース）
+// 扱いは GROUP_MARK と同じ。（ラベル埋め込みの GDI 単色描画）
+static constexpr wchar_t BUG_MARK[] = L"💥 ";
+
 // 一覧行のラベルを組み立てる
-//   並びは「番号、最終更新者の姓、グループ担当マーカー、[プロジェクト名]、期日、件名」
-//   （例："#12345  山田  👥 [ロケモニ] 7/28 件名"。番号と姓の後は空白 2、
+//   並びは「番号、姓、グループ担当マーカー、[プロジェクト名]、期日、バグマーカー、件名」
+//   （例："#12345  山田  👥 [ロケモニ] 7/28 💥 件名"。番号と姓の後は空白 2、
 //   閉じ角括弧と期日の後は空白 1）
 //   角括弧は半角とし、project_max_chars の計数には含めない。
 //   閉じ角括弧の後に空白を入れるのは、件名が [緊急] のように角括弧で始まる行で
@@ -2802,30 +2903,39 @@ static constexpr wchar_t GROUP_MARK[] = L"👥 ";
 //   プロジェクト名は "…" を付けずに切り詰める。（先頭数文字で判別できる要素のため横幅を最優先する）
 //   期日は今年以外だと "2025/6/30" のように年が付き、文字数が変わる。
 //   更新者不明・期限なしなどの要素は詰めて省く。
+//   期限切れの期日とバグマーカーは ALERT_TEXT_COLOR で描くため、位置を ranges に記録する。
+//   （ranges はオフセット昇順で並べる。ここでの追記順がそのまま昇順になる）
+// 引数に ListRow を丸ごと取るのは、同じ型の要素が増えて位置引数では取り違えを防げないため。
 // ピン記号はラベルに含めない。WM_DRAWITEM が IssueItem::pinned を見てマーカー列に描く。
-static IssueLabel buildIssueLabel(int id, const std::string& subject, const std::string& updater,
-                                  const std::wstring& dateText, bool assignedToGroup,
-                                  const std::string& projectName) {
+static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due) {
     IssueLabel r;
-    r.text = L"#" + std::to_wstring(id) + L"  ";
-    if (!updater.empty()) r.text += toWide(updater) + L"  ";
-    if (assignedToGroup) r.text += GROUP_MARK;
+    r.text = L"#" + std::to_wstring(row.id) + L"  ";
+    if (!row.updater.empty()) r.text += toWide(row.updater) + L"  ";
+    if (row.assignedToGroup) r.text += GROUP_MARK;
     // 0 は非表示
     if (g_currentConfig.projectMaxChars > 0) {
-        auto proj = truncateText(toWide(projectName),
+        auto proj = truncateText(toWide(row.projectName),
                                  static_cast<size_t>(g_currentConfig.projectMaxChars), false);
         // 切り詰め位置が空白だと閉じ角括弧の直前が隙間になり、詰めた 1 桁を無駄にするため落とす
         while (!proj.empty() && (proj.back() == L' ' || proj.back() == L'　')) proj.pop_back();
         // 空判定は切り詰めた後に行う。角括弧だけが残ると意味のない装飾になるため要素ごと省く
         if (!proj.empty()) r.text += L"[" + proj + L"] ";
     }
-    // 期日の位置はここで確定する。前に置く要素が増減しても追記の直前に測るため自動で追従する
-    if (!dateText.empty()) {
-        r.dateOffset = r.text.size();
-        r.dateLen    = dateText.size();
-        r.text += dateText + L" ";
+    // 色付け範囲の位置はここで確定する。前に置く要素が増減しても追記の直前に測るため追従する
+    if (!due.text.empty()) {
+        // 期限切れは赤に加えて半太字にする（色だけでは一覧の中で埋もれる）
+        if (due.overdue)
+            r.ranges.push_back({r.text.size(), due.text.size(), ALERT_TEXT_COLOR, true});
+        r.text += due.text + L" ";
     }
-    r.text += truncateText(toWide(subject), static_cast<size_t>(g_currentConfig.subjectMaxChars));
+    if (row.isBugTracker) {
+        // マーカー自体を赤くする。（絵文字は GDI が現在の文字色で単色描画するため色が乗る）
+        // 末尾の空白は色を変えても見えないので範囲に含めない
+        r.ranges.push_back({r.text.size(), wcslen(BUG_MARK) - 1, ALERT_TEXT_COLOR});
+        r.text += BUG_MARK;
+    }
+    r.text += truncateText(toWide(row.subject),
+                           static_cast<size_t>(g_currentConfig.subjectMaxChars));
     return r;
 }
 
@@ -2847,16 +2957,12 @@ static void showIssuePopup(HWND hWnd) {
         IssueItem it;
         it.id  = row.id;
         it.url = issueUrl(cfg, row.id);
-        auto due = makeDueDateView(row.dueDate, todayYmd);
-        auto lbl = buildIssueLabel(row.id, row.subject, row.updater, due.text,
-                                   row.assignedToGroup, row.projectName);
-        it.label      = std::move(lbl.text);
-        it.dateOffset = lbl.dateOffset;
-        it.dateLen    = lbl.dateLen;
-        it.overdue    = due.overdue;
-        it.unread     = row.unread;
-        it.pinned     = row.pinned;
-        it.closed     = row.closed;
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd));
+        it.label  = std::move(lbl.text);
+        it.ranges = std::move(lbl.ranges);
+        it.unread = row.unread;
+        it.pinned = row.pinned;
+        it.closed = row.closed;
         return it;
     };
 
@@ -3036,7 +3142,7 @@ static BOOL drawVersionMenuItem(DRAWITEMSTRUCT* dis) {
     // 新バージョン部分（選択時はハイライトテキスト色、通常時は赤）
     RECT newVerRect = textRect;
     newVerRect.left += prefixSz.cx;
-    SetTextColor(dis->hDC, selected ? GetSysColor(COLOR_HIGHLIGHTTEXT) : RGB(220, 0, 0));
+    SetTextColor(dis->hDC, selected ? GetSysColor(COLOR_HIGHLIGHTTEXT) : ALERT_TEXT_COLOR);
     DrawTextW(dis->hDC, latest.c_str(), -1, &newVerRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
 
     SelectObject(dis->hDC, oldFont);
@@ -3233,6 +3339,55 @@ static void handleTrayCommand(UINT id) {
     }
 }
 
+// ラベルを色範囲の境界でセグメントに分けて走査し、総幅を返す
+//
+// 範囲ごとにフォントを切り替えるため、幅は各セグメントの合算になる。計測と描画で同じ走査を
+// 通すことが要点で、片方だけ「ラベル全体を 1 回計測」に戻すと行幅・取消線と実描画幅が食い違う。
+// セグメント境界は常に空白の位置に来るため、分割による字形整形の差は視認されない。
+// textRect が nullptr なら描画せず幅だけを返す。（measureIssueMenuItem 用）
+// uniformColor=true は選択行用で、範囲の色を無視して textColor 一色で描く。
+// （ハイライト背景上の赤は読みにくい。ウェイトは幅が変わるため選択行でも維持する）
+static int walkIssueLabel(HDC hdc, const IssueItem& item, const RECT* textRect,
+                          COLORREF textColor, HFONT baseFont, HFONT emphFont,
+                          bool uniformColor) {
+    // DT_NOPREFIX がないと件名中の & がニーモニック指定として食われ、次の文字に下線が付く
+    // （幅は & を 1 文字として計測するため、描画幅とのずれで取消線も伸び過ぎる）
+    constexpr UINT DT_ROW = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX;
+    const wchar_t* base = item.label.c_str();
+    int x = 0;
+    auto segment = [&](size_t from, size_t to, COLORREF color, HFONT font) {
+        // 範囲の指定を信用せずラベル長で丸める。（境界外読み取りと位置の巻き戻りを防ぐ）
+        to = (std::min)(to, item.label.size());
+        if (from >= to) return;
+        SelectObject(hdc, font);
+        int len = static_cast<int>(to - from);
+        SIZE sz = {};
+        GetTextExtentPoint32W(hdc, base + from, len, &sz);
+        if (textRect) {
+            RECT seg = *textRect;
+            seg.left += x;
+            SetTextColor(hdc, uniformColor ? textColor : color);
+            DrawTextW(hdc, base + from, len, &seg, DT_ROW);
+        }
+        x += sz.cx;
+    };
+    size_t done = 0;
+    for (const auto& r : item.ranges) {
+        segment(done, r.offset, textColor, baseFont);
+        segment(r.offset, r.offset + r.len, r.color, r.bold ? emphFont : baseFont);
+        done = r.offset + r.len;
+    }
+    segment(done, item.label.size(), textColor, baseFont);
+    return x;
+}
+
+// 一覧行のラベルに使うフォントの組を返す
+// 未読行は行全体が太字のため、部分強調にはそれ以上のウェイトが無い。太字のまま据え置く。
+static void issueLabelFonts(bool unread, HFONT& baseFont, HFONT& emphFont) {
+    baseFont = unread ? g_hMenuFontBold : g_hMenuFont;
+    emphFont = unread ? g_hMenuFontBold : g_hMenuFontSemiBold;
+}
+
 // 左クリックポップアップの owner-draw 項目サイズ計算
 // 戻り値：TRUE で処理済み、FALSE で未処理（DefWindowProcW へ）
 static BOOL measureIssueMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
@@ -3241,11 +3396,17 @@ static BOOL measureIssueMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
     if (eidx >= g_issueItems.size()) return FALSE;
     const auto& item = g_issueItems[eidx];
     HDC   hdc = GetDC(hWnd);
-    // 未読行はラベルを太字で測る（描画側と同じフォントでないと行幅・取消線が食い違う）
-    HFONT old = static_cast<HFONT>(SelectObject(hdc, item.unread ? g_hMenuFontBold : g_hMenuFont));
-    SIZE  sz  = {};
-    GetTextExtentPoint32W(hdc, item.label.c_str(),
-        static_cast<int>(item.label.size()), &sz);
+    HFONT old = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
+    // ラベル幅は描画と同じ走査で求める（別経路で測ると行幅・取消線が実描画幅と食い違う）
+    HFONT baseFont = nullptr, emphFont = nullptr;
+    issueLabelFonts(item.unread, baseFont, emphFont);
+    SIZE sz = {};
+    sz.cx = walkIssueLabel(hdc, item, nullptr, 0, baseFont, emphFont, false);
+    // 行の高さはフォント由来でセグメント分割に依存しないため、metrics から直接得る
+    SelectObject(hdc, baseFont);
+    TEXTMETRICW tm = {};
+    GetTextMetricsW(hdc, &tm);
+    sz.cy = tm.tmHeight;
     // ピンマーカー列は全行で同幅を保つため、常に通常フォントで測る
     SelectObject(hdc, g_hMenuFont);
     // ピンマーカー列の幅（ピン有無で行幅が変わらないよう全行に確保する）
@@ -3262,13 +3423,10 @@ static BOOL measureIssueMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
     return TRUE;
 }
 
-// 期限切れ日付の文字色（更新通知メニューの新バージョン表示と同じ赤に揃える）
-static constexpr COLORREF OVERDUE_DATE_COLOR = RGB(220, 0, 0);
-
 // 左クリックポップアップの owner-draw 項目描画
 // ODS_SELECTED に応じた背景色・テキスト色を切り替え、closed フラグが立つ項目には
 // DrawTextW 後に 2 px の取消線を手動で重ね描画する。
-// 期限切れ（overdue）の行は日付部分だけ OVERDUE_DATE_COLOR で描く。
+// IssueLabel::ranges に色付け範囲がある行は、範囲ごとに文字色を変えて分割描画する。
 static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
     if (dis->CtlType != ODT_MENU) return FALSE;
     UINT eidx = static_cast<UINT>(dis->itemData);
@@ -3302,45 +3460,14 @@ static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
         }
     }
     textRect.left += markSz.cx;
-    // 未読行はラベルだけ太字で描く（ピンマーカー列の幅は通常フォント基準を保つ。
-    // 以降の幅計測（日付セグメント・取消線）も太字で行われ、描画幅と一致する）
-    if (item.unread) SelectObject(dis->hDC, g_hMenuFontBold);
-    // DT_NOPREFIX がないと件名中の & がニーモニック指定として食われ、次の文字に下線が付く
-    // （幅は & を 1 文字として計測するため、描画幅とのずれで取消線も伸び過ぎる）
-    constexpr UINT DT_ROW = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX;
-    if (item.overdue && item.dateLen > 0 && !selected) {
-        // 期限切れの日付部分だけ赤にするため「前・日付・後」の 3 セグメントに分けて描く。
-        // 選択行は drawVersionMenuItem と同じく赤をやめて textColor 一色（単発描画）。
-        // 送り幅は「ラベル先頭からの累積」で測る。セグメント単位に測って足すと丸め差が
-        // 積み上がり、ラベル全体で計測している行幅・打ち消し線とずれる
-        const wchar_t* base = item.label.c_str();
-        size_t preLen  = item.dateOffset;
-        size_t dateEnd = item.dateOffset + item.dateLen;
-        SIZE szPre = {}, szThroughDate = {};
-        GetTextExtentPoint32W(dis->hDC, base, static_cast<int>(preLen), &szPre);
-        GetTextExtentPoint32W(dis->hDC, base, static_cast<int>(dateEnd), &szThroughDate);
-
-        RECT seg = textRect;
-        DrawTextW(dis->hDC, base, static_cast<int>(preLen), &seg, DT_ROW);
-
-        seg = textRect;
-        seg.left += szPre.cx;
-        SetTextColor(dis->hDC, OVERDUE_DATE_COLOR);
-        DrawTextW(dis->hDC, base + preLen, static_cast<int>(item.dateLen), &seg, DT_ROW);
-
-        seg = textRect;
-        seg.left += szThroughDate.cx;
-        SetTextColor(dis->hDC, textColor);  // 件名は通常色へ戻す（打ち消し線も textColor を使う）
-        DrawTextW(dis->hDC, base + dateEnd,
-            static_cast<int>(item.label.size() - dateEnd), &seg, DT_ROW);
-    }
-    else {
-        DrawTextW(dis->hDC, item.label.c_str(), -1, &textRect, DT_ROW);
-    }
+    // ラベルは色範囲ごとにフォントと色を切り替えて描く。（ピンマーカー列の幅は通常フォント基準）
+    // 走査は measureIssueMenuItem と共有するため、描画幅と行幅・取消線が必ず一致する
+    HFONT baseFont = nullptr, emphFont = nullptr;
+    issueLabelFonts(item.unread, baseFont, emphFont);
+    int labelWidth = walkIssueLabel(dis->hDC, item, &textRect, textColor,
+                                   baseFont, emphFont, selected);
+    SetTextColor(dis->hDC, textColor);  // 打ち消し線が textColor を使うため戻す
     if (item.closed) {
-        SIZE sz = {};
-        GetTextExtentPoint32W(dis->hDC, item.label.c_str(),
-            static_cast<int>(item.label.size()), &sz);
         constexpr int STRIKE_THICKNESS = 2;
         // 中央から 1 px だけ下寄せにして視認性を上げる
         constexpr int STRIKE_Y_OFFSET  = 1;
@@ -3351,7 +3478,7 @@ static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
         RECT strikeRect = {
             textRect.left - STRIKE_MARGIN_LEFT,
             lineY - STRIKE_THICKNESS / 2,
-            textRect.left + sz.cx + STRIKE_MARGIN_RIGHT,
+            textRect.left + labelWidth + STRIKE_MARGIN_RIGHT,
             lineY - STRIKE_THICKNESS / 2 + STRIKE_THICKNESS
         };
         HBRUSH hLineBrush = CreateSolidBrush(textColor);
@@ -3407,6 +3534,7 @@ static void togglePin(UINT itemIdx, HMENU hm) {
                     p.closed          = is.closed;
                     p.dueDate         = is.dueDate;
                     p.assignedToGroup = is.assignedToGroup;
+                    p.isBugTracker    = is.isBugTracker;
                     p.updaterDisplay  = is.updaterDisplay;
                     break;
                 }
@@ -3557,6 +3685,7 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
         if (src && (p.subject != src->subject || p.updatedOn != src->updatedOn
                     || p.closed != src->closed || p.dueDate != src->dueDate
                     || p.projectName != src->projectName
+                    || p.isBugTracker != src->isBugTracker
                     || groupChanged || updaterChanged)) {
             p.subject     = src->subject;
             // project は journals と違って include 不要で常に含まれるため、updaterDisplay の
@@ -3565,6 +3694,8 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
             p.updatedOn   = src->updatedOn;
             p.closed      = src->closed;
             p.dueDate     = src->dueDate;
+            // トラッカー判定は設定との照合だけで決まり、グループ判定のような未解決状態がない
+            p.isBugTracker  = src->isBugTracker;
             if (groupIdsResolved) p.assignedToGroup = src->assignedToGroup;
             if (!src->updaterDisplay.empty()) p.updaterDisplay = src->updaterDisplay;
             changed = true;
@@ -3578,14 +3709,11 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
         std::lock_guard<std::mutex> lk(g_mtx);
         for (auto& gp : g_pins) {
             for (const auto& sp : pinsSnapshot) {
+                // id 一致分は丸ごと代入で足りる。（id は等しく、残りは全て更新対象）
+                // フィールド単位に複写すると、PinEntry へ項目を足したときに追記を忘れて
+                // ポーリングの更新結果が黙って捨てられる
                 if (gp.id == sp.id) {
-                    gp.subject         = sp.subject;
-                    gp.projectName     = sp.projectName;
-                    gp.updatedOn       = sp.updatedOn;
-                    gp.closed          = sp.closed;
-                    gp.dueDate         = sp.dueDate;
-                    gp.assignedToGroup = sp.assignedToGroup;
-                    gp.updaterDisplay  = sp.updaterDisplay;
+                    gp = sp;
                     break;
                 }
             }
