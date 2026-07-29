@@ -2727,11 +2727,13 @@ static void initMenuFonts() {
 static constexpr COLORREF ALERT_TEXT_COLOR = RGB(220, 0, 0);
 
 // ラベル内で文字色とウェイトを変える範囲（オフセットと長さは UTF-16 コードユニット単位）
+// bold と keepColor を組み合わせて「色は据え置き、ウェイトだけ変える」ような部分強調にも使える。
 struct ColorRange {
-    size_t   offset = 0;
-    size_t   len    = 0;
-    COLORREF color  = 0;
-    bool     bold   = false;  // 半太字で描く（範囲外との幅の差は走査側が吸収する）
+    size_t   offset    = 0;
+    size_t   len       = 0;
+    COLORREF color     = 0;
+    bool     bold      = false;  // 半太字で描く（範囲外との幅の差は走査側が吸収する）
+    bool     keepColor = false;  // true なら color を無視して範囲外と同じ色で描く
 };
 
 // 左クリックポップアップのチケット項目（IDM_ISSUE_BASE + index に対応、WndProc スレッドのみ使用）
@@ -2948,9 +2950,11 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due) {
     }
     // 色付け範囲の位置はここで確定する。前に置く要素が増減しても追記の直前に測るため追従する
     if (!due.text.empty()) {
-        // 期限切れは赤に加えて半太字にする（色だけでは一覧の中で埋もれる）
-        if (due.overdue)
-            r.ranges.push_back({r.text.size(), due.text.size(), ALERT_TEXT_COLOR, true});
+        // 期日は常に半太字で強調する。（一覧の中で期日行を素早く拾えるようにする）
+        // 期限切れは加えて赤にし、期限内は色を据え置く。（範囲外と同じ色で描く）
+        ColorRange range{r.text.size(), due.text.size(), ALERT_TEXT_COLOR, true};
+        if (!due.overdue) range.keepColor = true;
+        r.ranges.push_back(range);
         r.text += due.text + L" ";
     }
     if (row.isBugTracker) {
@@ -3410,7 +3414,8 @@ static int walkIssueLabel(HDC hdc, const IssueItem& item, const RECT* textRect,
     size_t done = 0;
     for (const auto& r : item.ranges) {
         segment(done, r.offset, textColor, baseFont);
-        segment(r.offset, r.offset + r.len, r.color, r.bold ? emphFont : baseFont);
+        segment(r.offset, r.offset + r.len,
+                r.keepColor ? textColor : r.color, r.bold ? emphFont : baseFont);
         done = r.offset + r.len;
     }
     segment(done, item.label.size(), textColor, baseFont);
