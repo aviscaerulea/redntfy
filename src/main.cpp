@@ -15,7 +15,7 @@
  *
  * 終了コード：
  *   0  - 正常終了（トレイメニューの「終了」による）
- *   1  - 設定エラー（[redmine] url / api_key / query_ids の未設定）
+ *   1  - 設定エラー（[redmine] url / api_key / query_ids の未設定。api_key 空時は my/account を開いて終了）
  *   2  - 予期しない初期化エラー
  *
  * 依存ライブラリ：WinHTTP, WinRT (Windows.UI.Notifications, Windows.Data.Json), Propsys
@@ -214,6 +214,12 @@ static std::atomic<ULONGLONG> g_lastPollTick{0};
 // GetTickCount64 はシステム起動からの経過時間のため、初期値 0 との減算比較は
 // 「起動後 30 分間はすべて抑制」という誤動作になる。0 は必ずセンチネルとして特別扱いする。
 static std::atomic<ULONGLONG> g_lastErrorToastTime{0};
+
+// 直近のポーリングで HTTP 401（認証エラー、api_key が無効）を検出済みかのフラグ
+// 検出のたびに <url>/my/account を開くとブラウザタブが増えて煩わしいため、初回だけ開く。
+// 一度成功すればリセットし、再び 401 になったときにまた開く。Toast 自体は既存の
+// showErrorToast クールダウンで抑止される（30 分）。
+static std::atomic<bool>       g_authErrorNotified{false};
 
 // TaskbarCreated メッセージ ID（エクスプローラ再起動対策）
 static UINT WM_TASKBAR_CREATED = 0;
@@ -1269,7 +1275,10 @@ static bool isGroupAssignee(const std::vector<int>& groupIds, int assignedToId) 
 // API の sort には依存しない。（query_id 側のソート設定に左右されないため取得後にローカルでソートする）
 // 失敗ログにクエリ id を含めるのは、複数クエリ運用でどのクエリが壊れているかを
 // ログだけで切り分けられるようにするため。
-static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>& outIssues) {
+// outAuthError は省略可（nullptr）。HTTP 401 検出時に true を書き込む。呼び出し側が
+// 認証エラー（api_key 無効）と一般的な取得失敗を区別するために使う。
+static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>& outIssues,
+                             bool* outAuthError = nullptr) {
     using namespace winrt::Windows::Data::Json;
     outIssues.clear();
 
@@ -1284,6 +1293,7 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
         if (status != 200 || body.empty()) {
             writeLog(logTag + ": request failed, status=" + std::to_string(status)
                 + " offset=" + std::to_string(offset));
+            if (status == 401 && outAuthError) *outAuthError = true;
             return false;
         }
         try {
@@ -1322,12 +1332,14 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
 // 「そのチケットが現れたクエリ id」を昇順で保持する。
 // 1 クエリでも失敗したら全体を false として部分結果を破棄する。欠落込みの集合で
 // state.json を上書きすると次回に「新規」誤通知が出るため。（単一クエリ時代の方針を維持）
-static bool fetchIssues(const Config& cfg, std::vector<Issue>& outIssues) {
+// outAuthError は省略可。fetchQueryIssues のいずれかで HTTP 401 を観測したときに true を書く。
+static bool fetchIssues(const Config& cfg, std::vector<Issue>& outIssues,
+                        bool* outAuthError = nullptr) {
     outIssues.clear();
     std::unordered_map<int, size_t> indexById;  // チケット id → outIssues の位置
     for (int qid : cfg.queryIds) {
         std::vector<Issue> part;
-        if (!fetchQueryIssues(cfg, qid, part)) return false;
+        if (!fetchQueryIssues(cfg, qid, part, outAuthError)) return false;
         for (auto& is : part) {
             auto [it, inserted] = indexById.try_emplace(is.id, outIssues.size());
             if (inserted) {
@@ -4087,7 +4099,8 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
 
             std::vector<Issue> issues;
             ULONGLONG t0    = GetTickCount64();
-            bool ok = fetchIssues(cfg, issues);
+            bool authError = false;
+            bool ok = fetchIssues(cfg, issues, &authError);
             ULONGLONG elapsed = GetTickCount64() - t0;
 
             // 取得試行をもって「起動直後の 1 回」は消費とする（成功を待たない）。
@@ -4097,12 +4110,28 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             if (!ok) {
                 if (g_shutdownRequested) break;  // 終了による取得中断は接続エラーではない
                 writeLog("HTTP request failed");
-                // 手動更新の失敗はクールダウンを無視して必ず知らせる。無音のままだと
-                // 操作が届いたのか失敗したのか区別できず、完了通知の目的を果たせない
-                showErrorToast(L"接続エラー", L"Redmine API に接続できません", manualTriggered);
+                if (authError) {
+                    // 401 の初回検出時のみ Redmine の /my/account を開く。
+                    // exchange(true) は「以前 false（未通知）→ true（通知済み）」で今回真になる。
+                    // ホットリロードしない仕様のため、api_key の書き換えには再起動が必要だが、
+                    // 少なくとも API キー画面までは自動で誘導する。
+                    if (!g_authErrorNotified.exchange(true)) {
+                        std::wstring accountUrl = cfg.redmineUrl + L"/my/account";
+                        ShellExecuteW(nullptr, L"open", accountUrl.c_str(),
+                                      nullptr, nullptr, SW_SHOWNORMAL);
+                    }
+                    showErrorToast(L"認証エラー", L"API キーを取得してください", manualTriggered);
+                }
+                else {
+                    // 手動更新の失敗はクールダウンを無視して必ず知らせる。無音のままだと
+                    // 操作が届いたのか失敗したのか区別できず、完了通知の目的を果たせない
+                    showErrorToast(L"接続エラー", L"Redmine API に接続できません", manualTriggered);
+                }
                 waitInterruptible(RETRY_WAIT_MS);
                 continue;
             }
+            // 一度成功したら 401 フラグをリセットする。次に 401 になったときに再度ブラウザで案内する。
+            g_authErrorNotified.store(false);
 
             writeLog("poll: " + std::to_string(issues.size()) + " issues ("
                 + std::to_string(elapsed) + "ms), next: " + nextPollTimeStr(pollsPerHour));
@@ -4215,15 +4244,36 @@ int wmain() {
 
         auto cfg = loadConfig(exeDir);
 
-        // 必須キーの検証。（欠けていれば設定エラーとして起動を中止する）
-        // url のスキームもここで検証し、以降の全経路（API・ブラウザ起動・Toast ボタン）で
-        // http(s) 以外が ShellExecuteW に渡らないことを保証する
-        if (cfg.redmineUrl.empty() || !isHttpUrl(cfg.redmineUrl)
-            || cfg.apiKey.empty() || cfg.queryIds.empty()) {
-            writeLog("config error: [redmine] url (must start with http:// or https://) / api_key / query_ids must be set in redntfy.local.toml");
+        // 必須キーの検証（欠けていれば起動を中止する）
+        // 3 分岐で原因ごとに案内する。url のスキームもここで検証し、以降の全経路
+        // （API・ブラウザ起動・Toast ボタン）で http(s) 以外が ShellExecuteW に渡らないことを保証する。
+        if (cfg.redmineUrl.empty() || !isHttpUrl(cfg.redmineUrl)) {
+            writeLog("config error: [redmine] url is empty or not http(s)");
             try {
                 showToast(L"設定エラー",
-                          L"redntfy.local.toml の [redmine] url / api_key / query_ids を設定してください",
+                          L"設定ファイルで Redmine の項目を確認してください",
+                          L"", false);
+            }
+            catch (...) {}
+            return 1;
+        }
+        if (cfg.apiKey.empty()) {
+            // url が確定しているため /my/account を開いて API キー取得画面へ誘導する。
+            // Toast にリンクは持たせない（要求どおりボタンなし）。ブラウザは自動で前面に来る。
+            writeLog("config error: [redmine] api_key is empty; opening /my/account");
+            std::wstring accountUrl = cfg.redmineUrl + L"/my/account";
+            ShellExecuteW(nullptr, L"open", accountUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            try {
+                showToast(L"認証エラー", L"API キーを取得してください", L"", false);
+            }
+            catch (...) {}
+            return 1;
+        }
+        if (cfg.queryIds.empty()) {
+            writeLog("config error: [redmine] query_ids is empty");
+            try {
+                showToast(L"設定エラー",
+                          L"redntfy.local.toml の [redmine] query_ids を設定してください",
                           L"", false);
             }
             catch (...) {}
