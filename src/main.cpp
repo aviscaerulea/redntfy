@@ -209,6 +209,7 @@ static UINT WM_TASKBAR_CREATED = 0;
 struct Issue {
     int         id        = 0;
     std::string subject;
+    std::string projectName;       // 一覧の表示専用。通知判定にも state.json にも使わない
     std::string updatedOn;
     int         authorId  = 0;     // 自分の起票を通知対象から外すために保持する
     std::string authorName;        // 起票者名（新規流入 Toast の表示用。更新者名が取れない場合のフォールバック）
@@ -230,6 +231,7 @@ struct Issue {
 struct PinEntry {
     int         id = 0;
     std::string subject;
+    std::string projectName;       // プロジェクト名（集合外ピンも表示できるよう永続化）
     std::string updatedOn;
     bool        closed = false;
     std::string dueDate;           // due_date（"YYYY-MM-DD"、期限なしは空。一覧の日付表示に使う）
@@ -249,6 +251,7 @@ struct Config {
     std::vector<int>          schedule;         // 24 要素（0 時〜23 時の 1 時間あたりポーリング回数、0 で休止）
     int                       listLimit;        // 一覧の非ピン表示件数（デフォルト 20）
     int                       subjectMaxChars;  // 件名の省略文字数（デフォルト 40）
+    int                       projectMaxChars;  // プロジェクト名の省略文字数（0 で非表示、デフォルト 5）
     std::vector<std::wstring> duckTargets;      // 通知音再生中にミュートするプロセス名
 
     // [guard] ガードトーン設定（BLE ヘッドホン対処）
@@ -846,6 +849,7 @@ static void savePins(const std::wstring& dir) {
                 JsonObject o;
                 o.Insert(L"id",         JsonValue::CreateNumberValue(p.id));
                 o.Insert(L"subject",    JsonValue::CreateStringValue(winrt::to_hstring(p.subject)));
+                o.Insert(L"project",    JsonValue::CreateStringValue(winrt::to_hstring(p.projectName)));
                 o.Insert(L"updated_on", JsonValue::CreateStringValue(winrt::to_hstring(p.updatedOn)));
                 o.Insert(L"closed",     JsonValue::CreateBooleanValue(p.closed));
                 o.Insert(L"due_date",   JsonValue::CreateStringValue(winrt::to_hstring(p.dueDate)));
@@ -861,9 +865,9 @@ static void savePins(const std::wstring& dir) {
     }
 }
 
-// 件名の全角空白（U+3000、UTF-8 では E3 80 80）を半角空白に置換する
+// 表示用文字列の全角空白（U+3000、UTF-8 では E3 80 80）を半角空白に置換する
 // Toast と一覧の表示幅を無駄にしないため、取込時点で正規化する。
-static std::string normalizeSubject(std::string s) {
+static std::string normalizeSpaces(std::string s) {
     size_t pos = 0;
     while ((pos = s.find("\xE3\x80\x80", pos)) != std::string::npos) {
         s.replace(pos, 3, " ");
@@ -888,11 +892,12 @@ static void loadPins(const std::wstring& dir) {
             auto o = item.GetObject();
             PinEntry p;
             p.id        = static_cast<int>(o.GetNamedNumber(L"id", 0));
-            p.subject   = normalizeSubject(winrt::to_string(o.GetNamedString(L"subject", L"")));
+            p.subject   = normalizeSpaces(winrt::to_string(o.GetNamedString(L"subject", L"")));
             p.updatedOn = winrt::to_string(o.GetNamedString(L"updated_on", L""));
             p.closed    = o.GetNamedBoolean(L"closed", false);
             // 旧形式（キーなし）は既定値で開始し、次のポーリングの refreshPins で実値になる
             p.dueDate   = winrt::to_string(o.GetNamedString(L"due_date", L""));
+            p.projectName     = normalizeSpaces(winrt::to_string(o.GetNamedString(L"project", L"")));
             p.assignedToGroup = o.GetNamedBoolean(L"assigned_to_group", false);
             // updater は集合内ピンのみ refreshPins で実値になる。（集合外ピンの個別取得は
             // journals を含まないため、保存値のまま維持される）
@@ -1030,9 +1035,10 @@ static Config loadConfig(const std::wstring& exeDir) {
         writeLog("config: [redmine] query_id is obsolete; use query_ids = [12, 34]");
     }
 
-    // 一覧の表示件数と件名の省略文字数
+    // 一覧の表示件数と各要素の省略文字数
     cfg.listLimit       = readTopInt("list_limit", 20, 1, 25);
     cfg.subjectMaxChars = readTopInt("subject_max_chars", 40, 10, 120);
+    cfg.projectMaxChars = readTopInt("project_max_chars", 5, 0, 20);
 
     // [guard] ガードトーン設定
     cfg.guardToneMs = (int)readConfigFloat("guard", "tone_ms", 1500.0f, 0.0f, 10000.0f);
@@ -1069,7 +1075,7 @@ static Issue parseIssueObject(const winrt::Windows::Data::Json::JsonObject& obj)
     using namespace winrt::Windows::Data::Json;
     Issue is;
     is.id        = static_cast<int>(obj.GetNamedNumber(L"id", 0));
-    is.subject   = normalizeSubject(winrt::to_string(obj.GetNamedString(L"subject", L"")));
+    is.subject   = normalizeSpaces(winrt::to_string(obj.GetNamedString(L"subject", L"")));
     is.updatedOn = winrt::to_string(obj.GetNamedString(L"updated_on", L""));
     if (obj.HasKey(L"author")) {
         auto author = obj.GetNamedObject(L"author", nullptr);
@@ -1077,6 +1083,12 @@ static Issue parseIssueObject(const winrt::Windows::Data::Json::JsonObject& obj)
             is.authorId   = static_cast<int>(author.GetNamedNumber(L"id", 0));
             is.authorName = winrt::to_string(author.GetNamedString(L"name", L""));
         }
+    }
+    // project は include 指定なしでも issues.json と issues/{id}.json の双方に常に含まれる。
+    // 一覧表示にしか使わないため name だけ採る。
+    if (obj.HasKey(L"project")) {
+        auto proj = obj.GetNamedObject(L"project", nullptr);
+        if (proj) is.projectName = normalizeSpaces(winrt::to_string(proj.GetNamedString(L"name", L"")));
     }
     // assigned_to はキー自体が無ければ未割当。ユーザとグループで形は同じ。（id と name のみ）
     if (obj.HasKey(L"assigned_to")) {
@@ -2448,9 +2460,12 @@ static void clearTrayTooltip(HWND hWnd) {
 }
 
 // 一覧に出す 1 行の素材（表示文字列の組み立て前）
+// 生成側は指定初期化子で書く。同じ型のメンバが連続するため、位置指定だと
+// 順序の取り違えが型エラーにならず表示バグとして黙って現れる
 struct ListRow {
     int         id = 0;
     std::string subject;
+    std::string projectName;          // 空 = 未取得（旧形式の pins.json 由来など）
     std::string updater;
     std::string dueDate;              // "YYYY-MM-DD"（期日なしは空）
     std::string updatedOn;
@@ -2503,14 +2518,20 @@ static std::vector<ListRow> buildListRows(int& visible) {
         else {
             ++visible;
         }
-        rows.push_back({is.id, is.subject, is.updaterDisplay, is.dueDate, is.updatedOn,
-                        is.assignedToGroup, pinned, is.closed, unread.count(is.id) != 0});
+        rows.push_back({.id = is.id, .subject = is.subject, .projectName = is.projectName,
+                        .updater = is.updaterDisplay, .dueDate = is.dueDate,
+                        .updatedOn = is.updatedOn, .assignedToGroup = is.assignedToGroup,
+                        .pinned = pinned, .closed = is.closed,
+                        .unread = unread.count(is.id) != 0});
         shown.insert(is.id);
     }
     for (const auto& p : pins) {
         if (shown.count(p.id)) continue;
-        rows.push_back({p.id, p.subject, p.updaterDisplay, p.dueDate, p.updatedOn,
-                        p.assignedToGroup, true, p.closed, unread.count(p.id) != 0});
+        rows.push_back({.id = p.id, .subject = p.subject, .projectName = p.projectName,
+                        .updater = p.updaterDisplay, .dueDate = p.dueDate,
+                        .updatedOn = p.updatedOn, .assignedToGroup = p.assignedToGroup,
+                        .pinned = true, .closed = p.closed,
+                        .unread = unread.count(p.id) != 0});
     }
 
     if (g_sortByDue.load()) {
@@ -2747,13 +2768,14 @@ static void forceForeground(HWND hWnd) {
     SetForegroundWindow(hWnd);
 }
 
-// 件名を最大文字数で省略する（超過分を切り詰めて "…" を付ける）
+// 表示用文字列を最大文字数で省略する（超過分を切り詰める）
 // UTF-16 単位で数えるため、サロゲートペアの途中で切らないよう上位サロゲート終わりは 1 つ手前で切る。
-static std::wstring truncateSubject(const std::wstring& s, size_t maxChars) {
+// ellipsis=true（デフォルト）で切り詰めた印の "…" を末尾に付ける。
+static std::wstring truncateText(const std::wstring& s, size_t maxChars, bool ellipsis = true) {
     if (s.size() <= maxChars) return s;
     size_t cut = maxChars;
     if (cut > 0 && s[cut - 1] >= 0xD800 && s[cut - 1] <= 0xDBFF) --cut;
-    return s.substr(0, cut) + L"…";
+    return ellipsis ? s.substr(0, cut) + L"…" : s.substr(0, cut);
 }
 
 // 一覧行のラベル（描画テキストと、その中の日付部分の位置）
@@ -2771,23 +2793,39 @@ struct IssueLabel {
 static constexpr wchar_t GROUP_MARK[] = L"👥 ";
 
 // 一覧行のラベルを組み立てる
-//   並びは「番号、最終更新者の姓、期日、グループ担当マーカー、件名」
-//   （例："#12345  山田  7/28 👥 件名"。番号と姓の後は空白 2、日付の後は空白 1）
+//   並びは「番号、最終更新者の姓、グループ担当マーカー、[プロジェクト名]、期日、件名」
+//   （例："#12345  山田  👥 [ロケモニ] 7/28 件名"。番号と姓の後は空白 2、
+//   閉じ角括弧と期日の後は空白 1）
+//   角括弧は半角とし、project_max_chars の計数には含めない。
+//   閉じ角括弧の後に空白を入れるのは、件名が [緊急] のように角括弧で始まる行で
+//   境界を見失うため。
+//   プロジェクト名は "…" を付けずに切り詰める。（先頭数文字で判別できる要素のため横幅を最優先する）
 //   期日は今年以外だと "2025/6/30" のように年が付き、文字数が変わる。
 //   更新者不明・期限なしなどの要素は詰めて省く。
 // ピン記号はラベルに含めない。WM_DRAWITEM が IssueItem::pinned を見てマーカー列に描く。
 static IssueLabel buildIssueLabel(int id, const std::string& subject, const std::string& updater,
-                                  const std::wstring& dateText, bool assignedToGroup) {
+                                  const std::wstring& dateText, bool assignedToGroup,
+                                  const std::string& projectName) {
     IssueLabel r;
     r.text = L"#" + std::to_wstring(id) + L"  ";
     if (!updater.empty()) r.text += toWide(updater) + L"  ";
+    if (assignedToGroup) r.text += GROUP_MARK;
+    // 0 は非表示
+    if (g_currentConfig.projectMaxChars > 0) {
+        auto proj = truncateText(toWide(projectName),
+                                 static_cast<size_t>(g_currentConfig.projectMaxChars), false);
+        // 切り詰め位置が空白だと閉じ角括弧の直前が隙間になり、詰めた 1 桁を無駄にするため落とす
+        while (!proj.empty() && (proj.back() == L' ' || proj.back() == L'　')) proj.pop_back();
+        // 空判定は切り詰めた後に行う。角括弧だけが残ると意味のない装飾になるため要素ごと省く
+        if (!proj.empty()) r.text += L"[" + proj + L"] ";
+    }
+    // 期日の位置はここで確定する。前に置く要素が増減しても追記の直前に測るため自動で追従する
     if (!dateText.empty()) {
         r.dateOffset = r.text.size();
         r.dateLen    = dateText.size();
         r.text += dateText + L" ";
     }
-    if (assignedToGroup) r.text += GROUP_MARK;
-    r.text += truncateSubject(toWide(subject), static_cast<size_t>(g_currentConfig.subjectMaxChars));
+    r.text += truncateText(toWide(subject), static_cast<size_t>(g_currentConfig.subjectMaxChars));
     return r;
 }
 
@@ -2811,7 +2849,7 @@ static void showIssuePopup(HWND hWnd) {
         it.url = issueUrl(cfg, row.id);
         auto due = makeDueDateView(row.dueDate, todayYmd);
         auto lbl = buildIssueLabel(row.id, row.subject, row.updater, due.text,
-                                   row.assignedToGroup);
+                                   row.assignedToGroup, row.projectName);
         it.label      = std::move(lbl.text);
         it.dateOffset = lbl.dateOffset;
         it.dateLen    = lbl.dateLen;
@@ -3356,13 +3394,15 @@ static void togglePin(UINT itemIdx, HMENU hm) {
                 catch (...) {}
                 return;
             }
-            // 件名・更新日時・期限日は g_issues から引く（一覧行のラベルは省略済みで復元できないため）
+            // 件名・プロジェクト名・更新日時・期限日は g_issues から引く。
+            // （一覧行のラベルは省略済みで復元できないため）
             PinEntry p;
             p.id     = item.id;
             p.closed = item.closed;
             for (const auto& is : g_issues) {
                 if (is.id == item.id) {
                     p.subject         = is.subject;
+                    p.projectName     = is.projectName;
                     p.updatedOn       = is.updatedOn;
                     p.closed          = is.closed;
                     p.dueDate         = is.dueDate;
@@ -3516,11 +3556,15 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
             && p.updaterDisplay != src->updaterDisplay;
         if (src && (p.subject != src->subject || p.updatedOn != src->updatedOn
                     || p.closed != src->closed || p.dueDate != src->dueDate
+                    || p.projectName != src->projectName
                     || groupChanged || updaterChanged)) {
-            p.subject   = src->subject;
-            p.updatedOn = src->updatedOn;
-            p.closed    = src->closed;
-            p.dueDate   = src->dueDate;
+            p.subject     = src->subject;
+            // project は journals と違って include 不要で常に含まれるため、updaterDisplay の
+            // ような「非空のときだけ更新」ガードは要らない。（別プロジェクトへの移動を追随する）
+            p.projectName = src->projectName;
+            p.updatedOn   = src->updatedOn;
+            p.closed      = src->closed;
+            p.dueDate     = src->dueDate;
             if (groupIdsResolved) p.assignedToGroup = src->assignedToGroup;
             if (!src->updaterDisplay.empty()) p.updaterDisplay = src->updaterDisplay;
             changed = true;
@@ -3536,6 +3580,7 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
             for (const auto& sp : pinsSnapshot) {
                 if (gp.id == sp.id) {
                     gp.subject         = sp.subject;
+                    gp.projectName     = sp.projectName;
                     gp.updatedOn       = sp.updatedOn;
                     gp.closed          = sp.closed;
                     gp.dueDate         = sp.dueDate;
