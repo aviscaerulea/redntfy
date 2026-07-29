@@ -969,7 +969,7 @@ static std::optional<toml::table> loadToml(const std::wstring& path) {
 // 各要素は [0, 60] にクランプする。（0 = その時間帯は休止）
 static std::optional<std::vector<int>> readSchedule(const std::optional<toml::table>& tbl) {
     if (!tbl) return std::nullopt;
-    const auto* arr = (*tbl)["schedule"].as_array();
+    const auto* arr = (*tbl)["app"]["schedule"].as_array();
     if (!arr) return std::nullopt;
     std::vector<int> sched;
     for (const auto& el : *arr) {
@@ -991,10 +991,11 @@ static Config loadConfig(const std::wstring& exeDir) {
     if (local) writeLog("Loaded redntfy.local.toml (override active)");
 
     // 文字列配列の読み込み（キー不在は nullopt を返し、空配列との区別に使う）
+    // [app] セクション下のキーだけを対象とする。（トップレベルへの記述は無視する）
     auto readStrArray = [](const std::optional<toml::table>& tbl, const char* key)
             -> std::optional<std::vector<std::string>> {
         if (!tbl) return std::nullopt;
-        const auto* arr = (*tbl)[key].as_array();
+        const auto* arr = (*tbl)["app"][key].as_array();
         if (!arr) return std::nullopt;
         std::vector<std::string> out;
         for (const auto& el : *arr) {
@@ -1036,11 +1037,11 @@ static Config loadConfig(const std::wstring& exeDir) {
         else if (base && (*base)[section][key].is_number()) v = (*base)[section][key].value_or(def);
         return static_cast<float>((std::max)((double)lo, (std::min)((double)hi, v)));
     };
-    // トップレベル整数（セクションなし）
-    auto readTopInt = [&](const char* key, int def, int lo, int hi) -> int {
+    // [app] セクション下の整数
+    auto readAppInt = [&](const char* key, int def, int lo, int hi) -> int {
         long long v = def;
-        if (local && (*local)[key].is_integer())      v = **(*local)[key].as_integer();
-        else if (base && (*base)[key].is_integer())   v = **(*base)[key].as_integer();
+        if (local && (*local)["app"][key].is_integer())      v = **(*local)["app"][key].as_integer();
+        else if (base && (*base)["app"][key].is_integer())   v = **(*base)["app"][key].as_integer();
         return static_cast<int>((std::max)((long long)lo, (std::min)((long long)hi, v)));
     };
     // [redmine] セクションの文字列・整数
@@ -1082,9 +1083,9 @@ static Config loadConfig(const std::wstring& exeDir) {
     }
 
     // 一覧の表示件数と各要素の省略文字数
-    cfg.listLimit       = readTopInt("list_limit", 20, 1, 25);
-    cfg.subjectMaxChars = readTopInt("subject_max_chars", 40, 10, 120);
-    cfg.projectMaxChars = readTopInt("project_max_chars", 5, 0, 20);
+    cfg.listLimit       = readAppInt("list_limit", 20, 1, 25);
+    cfg.subjectMaxChars = readAppInt("subject_max_chars", 40, 10, 120);
+    cfg.projectMaxChars = readAppInt("project_max_chars", 5, 0, 20);
 
     // [guard] ガードトーン設定
     cfg.guardToneMs = (int)readConfigFloat("guard", "tone_ms", 1500.0f, 0.0f, 10000.0f);
