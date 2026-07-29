@@ -115,6 +115,7 @@ static constexpr UINT IDM_ASSIGNED_TO_ME      = 40011; // 担当がグループ�
 static constexpr UINT IDM_UPDATE_NOW          = 40012; // 休止時間帯・クールダウンを無視した即時ポーリング
 static constexpr UINT IDM_SORT_BY_DUE         = 40013; // 一覧を期日昇順に並べるトグル
 static constexpr UINT IDM_EXCLUDE_NO_VERSION  = 40014; // バージョン未指定を一覧・tooltip・通知から除外するトグル（期日ありは例外的に残す）
+static constexpr UINT IDM_MUTE_OWN_CHANGES    = 40015; // 自分の操作による起票・更新を通知抑止するトグル（一覧・tooltip は変更しない）
 
 static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/redntfy";
 static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/redntfy/releases";
@@ -185,6 +186,13 @@ static std::atomic<bool> g_sortByDue{false};
 // 追跡集合そのものを絞ると、OFF に戻したとき state.json に無い id が「新規」と誤検知される。
 // 対価として、ON 中に抑止した更新は state.json に記録済みのため OFF に戻しても再通知されない。
 static std::atomic<bool> g_excludeNoVersion{false};
+
+// 自分の操作による起票・更新を通知抑止するトグル（レジストリ永続化。既定 ON）
+// deliverPollResults の 3 か所の判定（新規流入の起票者、新規流入の直近更新者、既存更新の更新者）を
+// 一括で ON/OFF する。抑止対象になったチケットも state.json には全件記録するため、
+// OFF に戻したときに再通知は起きない。
+// 一覧・tooltip・バッジ・並び順は本トグルの影響を受けない（表示ではなく通知のみを制御する）。
+static std::atomic<bool> g_muteOwnChanges{true};
 
 // トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングループと通知スレッドが参照）
 static HWND g_hWnd = nullptr;
@@ -1585,6 +1593,7 @@ static constexpr const wchar_t* REG_MUTE_IN_MEETING   = L"MuteInMeeting";
 static constexpr const wchar_t* REG_ASSIGNED_TO_ME    = L"AssignedToMeOnly";
 static constexpr const wchar_t* REG_SORT_BY_DUE       = L"SortByDue";
 static constexpr const wchar_t* REG_EXCLUDE_NO_VERSION = L"ExcludeNoVersion";
+static constexpr const wchar_t* REG_MUTE_OWN_CHANGES  = L"MuteOwnChanges";
 static constexpr const wchar_t* REG_NOTIFIED_VERSION  = L"NotifiedUpdateVersion";
 
 // Windows スタートアップ登録用レジストリ（HKCU Run キー）
@@ -3219,6 +3228,10 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_STRING | (g_excludeNoVersion ? MF_CHECKED : MF_UNCHECKED),
         IDM_EXCLUDE_NO_VERSION, L"バージョン未指定のチケットを除外");
 
+    // 自分の操作による起票・更新の通知抑止（レジストリ永続化。既定 ON）
+    AppendMenuW(hMenu, MF_STRING | (g_muteOwnChanges ? MF_CHECKED : MF_UNCHECKED),
+        IDM_MUTE_OWN_CHANGES, L"自分の操作による更新を通知しない");
+
     // 一覧の並び順トグル（レジストリ永続化。ON で期日昇順、期日なしは末尾）
     AppendMenuW(hMenu, MF_STRING | (g_sortByDue ? MF_CHECKED : MF_UNCHECKED),
         IDM_SORT_BY_DUE, L"期日順に並べる");
@@ -3313,6 +3326,13 @@ static void handleTrayCommand(UINT id) {
         // 一覧は次に開いた時点で g_issues から組み直されるが、tooltip とバッジは即時に更新する。
         // 取得済みの全件を保持しているため再ポーリングは不要。
         if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
+        return;
+    }
+    if (id == IDM_MUTE_OWN_CHANGES) {
+        g_muteOwnChanges.store(!g_muteOwnChanges.load());
+        writeRegDword(REG_MUTE_OWN_CHANGES, g_muteOwnChanges.load() ? 1u : 0u);
+        // 通知経路のみを切り替える設定で、一覧・tooltip・バッジは影響を受けない。
+        // 表示側の再計算も再ポーリングも不要。次回ポーリング以降の通知に効く。
         return;
     }
     if (id == IDM_EXCLUDE_NO_VERSION) {
@@ -3796,6 +3816,7 @@ static bool hasNewQueryEntry(const std::vector<int>& now, const std::vector<int>
 // 新規流入も検知しない。（設定追加直後の通知の嵐を防ぐ）
 // 自分が起票したチケットの流入は author.id で、自分の操作による更新と自分の更新が原因の
 // 流入は最終 journal の更新者 id で除外する。（g_myUserId == 0 のときは除外せず通知側に倒す）
+// この抑止は g_muteOwnChanges で一括 ON/OFF できる。OFF なら自分の起票・更新も通知する。
 // 担当者フィルタ ON なら、自分が担当でないチケットもあわせて除外する。
 // バージョンフィルタ ON なら、fixed_version 未指定かつ期日なしのチケットもあわせて除外する。
 // ベースライン未確立（初回起動・state.json 破損）の場合は通知せず状態保存のみ行う。
@@ -3847,8 +3868,8 @@ static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         if (!passesVersionFilter(is)) continue;
         auto it = prev.issues.find(is.id);
         if (it == prev.issues.end()) {
-            // 新規流入（自分の起票は通知しない）
-            if (g_myUserId != 0 && is.authorId == g_myUserId) continue;
+            // 新規流入（自分の起票は通知しない。g_muteOwnChanges OFF なら通知に倒す）
+            if (g_muteOwnChanges.load() && g_myUserId != 0 && is.authorId == g_myUserId) continue;
             // 前回追跡していたクエリのいずれにも属さないチケットは、query_ids へ追加した
             // 直後のクエリ固有の既存チケットなので黙って採用する。（既知チケットの流入抑止と
             // 同じ方針。通知するとサマリ Toast・通知音・未読バッジが件数分跳ね上がる）
@@ -3869,7 +3890,7 @@ static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
             // 自分でも通知する。（既知チケットのクエリ流入の扱いと揃える）
             // polled_on の無い旧形式 state.json では判定せず通知側に倒す。
             bool recentUpdate = !prev.polledOn.empty() && is.updatedOn > prev.polledOn;
-            if (recentUpdate && g_myUserId != 0 && is.updaterId == g_myUserId) continue;
+            if (g_muteOwnChanges.load() && recentUpdate && g_myUserId != 0 && is.updaterId == g_myUserId) continue;
             // 表示名も同じ基準で選ぶ。直近の更新が原因の流入はその更新者、時間経過の流入は
             // 起票者を出す。（古い最終更新者を「新規：○○」と出すと起票者と誤読される）
             targets.push_back({&is, NotifyKind::New,
@@ -3882,10 +3903,11 @@ static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         bool entered = pv.hasQueries
             && hasNewQueryEntry(is.queryIds, pv.queryIds, prev.knownQueries);
         if (!updated && !entered) continue;
-        // 自分の操作による更新は通知しない。（最終更新者は resolveUpdaters が確定済み）
+        // 自分の操作による更新は通知しない（g_muteOwnChanges OFF なら通知に倒す）。
+        // 最終更新者は resolveUpdaters が確定済み。
         // updated_on が進んでいない純粋な流入では判定しない：時間経過による流入が典型で
         // 「自分の操作」ではないため。（クエリ流入の Toast は更新者名も出さない）
-        if (updated && g_myUserId != 0 && is.updaterId == g_myUserId) continue;
+        if (g_muteOwnChanges.load() && updated && g_myUserId != 0 && is.updaterId == g_myUserId) continue;
         targets.push_back({&is, updated ? NotifyKind::Updated : NotifyKind::QueryEntered,
                            updated ? is.updaterName : std::string()});
     }
@@ -4221,6 +4243,7 @@ int wmain() {
         g_assignedToMeOnly = readRegDword(REG_ASSIGNED_TO_ME, 0u) != 0;
         g_sortByDue        = readRegDword(REG_SORT_BY_DUE, 0u) != 0;
         g_excludeNoVersion = readRegDword(REG_EXCLUDE_NO_VERSION, 0u) != 0;
+        g_muteOwnChanges   = readRegDword(REG_MUTE_OWN_CHANGES, 1u) != 0;
 
         writeLog("started");
         logSchedule(cfg.schedule);
