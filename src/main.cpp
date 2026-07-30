@@ -2307,10 +2307,14 @@ static std::wstring buildIconTag() {
 //
 // https:// / http:// 以外のスキームは拒否して任意プロトコルハンドラの悪用を防ぐ。
 // xml は </visual> まで構築済みの文字列を渡す。（</toast> は内部で付加する）
-static void dispatchToastXml(std::wstring xml, const std::wstring& permalink) {
+// buttonLabel はボタンの表示文言。既定はチケット通知向けで、新版通知など開く先が
+// チケットでない Toast は呼び出し側が文言を差し替える。
+static void dispatchToastXml(std::wstring xml, const std::wstring& permalink,
+                             const std::wstring& buttonLabel = L"チケットを開く")
+{
     if (!permalink.empty() && isHttpUrl(permalink)) {
         xml += L"<actions>"
-               L"<action activationType=\"protocol\" content=\"チケットを開く\""
+               L"<action activationType=\"protocol\" content=\"" + escapeXml(buttonLabel) + L"\""
                L" arguments=\"" + escapeXml(permalink) + L"\"/>"
                L"</actions>";
     }
@@ -2351,9 +2355,10 @@ static void showToast(const std::wstring& line1, const std::wstring& line2,
 //
 // line1 を title スタイル（太字大）で表示する。
 // silent=true（デフォルト false）で OS 通知音を無効化する。
+// buttonLabel は permalink 付き Toast のボタン文言。（dispatchToastXml の既定と同じ）
 static void showToast3(const std::wstring& line1, const std::wstring& line2,
                        const std::wstring& line3, const std::wstring& permalink,
-                       bool silent = false)
+                       bool silent = false, const std::wstring& buttonLabel = L"チケットを開く")
 {
     std::wstring xml =
         L"<toast>"
@@ -2365,7 +2370,7 @@ static void showToast3(const std::wstring& line1, const std::wstring& line2,
         L"</binding></visual>"
         + (silent ? L"<audio silent=\"true\"/>" : L"");
 
-    dispatchToastXml(std::move(xml), permalink);
+    dispatchToastXml(std::move(xml), permalink, buttonLabel);
 }
 
 // エラー Toast 表示（クールダウン制御付き）
@@ -3163,8 +3168,8 @@ static void checkForUpdates() {
                 try {
                     showToast3(L"新しいバージョンがあります",
                                std::wstring(L"v") + APP_VERSION + L" → " + tagName,
-                               L"クリックしてリリースページを開いてください",
-                               GITHUB_RELEASES_URL);
+                               L"ボタンからリリースページを開いてください",
+                               GITHUB_RELEASES_URL, false, L"リリースページを開く");
                 }
                 catch (...) {}
             }
