@@ -238,7 +238,7 @@ struct Issue {
     int         assignedToId = 0;  // 担当者 id（0 = 未割当）
                                    // Redmine はユーザとグループが同一 id 空間のため、自分の id と
                                    // 一致するかを見るだけでグループ担当を弾ける。型の判別は不要。
-    bool        closed    = false; // closed_on が非 null（一覧で打ち消し線表示）
+    bool        closed    = false; // status.is_closed（一覧で打ち消し線表示）
     std::string dueDate;           // due_date（"YYYY-MM-DD"、期限なしは空。一覧の日付表示に使う）
     std::vector<int> queryIds;     // このチケットが現れた保存クエリ id（昇順）。クエリ流入の検知に使う
     bool assignedToGroup = false;  // 担当がグループ（一覧の 👥 マーカー。取得後にグループ id 集合と突合して設定）
@@ -1154,7 +1154,7 @@ static bool matchesBugTracker(const std::vector<std::string>& patterns, const st
 }
 
 // issue JSON オブジェクトを Issue に変換する
-// closed_on はキー不在と null 値の両方を「未クローズ」として扱う。（Redmine の版による差異対策）
+// status.is_closed はキー不在を「未クローズ」として扱う。（Redmine の版による差異対策）
 static Issue parseIssueObject(const Config& cfg,
                               const winrt::Windows::Data::Json::JsonObject& obj) {
     using namespace winrt::Windows::Data::Json;
@@ -1192,13 +1192,14 @@ static Issue parseIssueObject(const Config& cfg,
         auto ver = obj.GetNamedObject(L"fixed_version", nullptr);
         if (ver) is.hasFixedVersion = true;
     }
-    if (obj.HasKey(L"closed_on")) {
-        auto v = obj.GetNamedValue(L"closed_on", nullptr);
-        is.closed = v && v.ValueType() == JsonValueType::String
-                    && !winrt::to_string(v.GetString()).empty();
+    // closed 判定は status.is_closed を根拠とする。closed_on は再オープン時に null へ
+    // 戻らない（過去のクローズ日時として残る）ため、判定に使うと再開後も取消線が残る。
+    if (obj.HasKey(L"status")) {
+        auto st = obj.GetNamedObject(L"status", nullptr);
+        if (st) is.closed = st.GetNamedBoolean(L"is_closed", false);
     }
     // due_date はキー不在と null（期限なし）の両方を空として扱う。
-    // GetNamedString は値が null のとき例外になるため、closed_on と同じ判定形にする。
+    // GetNamedString は値が null のとき例外になるため、GetNamedValue で型を確かめてから読む。
     if (obj.HasKey(L"due_date")) {
         auto v = obj.GetNamedValue(L"due_date", nullptr);
         if (v && v.ValueType() == JsonValueType::String) is.dueDate = winrt::to_string(v.GetString());
