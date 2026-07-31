@@ -1,53 +1,51 @@
 # redntfy
 
-Redmine の更新チケットを Windows Toast 通知で知らせ、未処理チケットをシステムトレイから一覧できる軽量常駐アプリ。
+[![日本語](https://img.shields.io/badge/lang-日本語-red)](README.md)
+[![English](https://img.shields.io/badge/lang-English-blue)](README.en.md)
+
+[![Release](https://img.shields.io/github/v/release/aviscaerulea/redntfy)](https://github.com/aviscaerulea/redntfy/releases/latest)
+[![Build](https://github.com/aviscaerulea/redntfy/actions/workflows/release.yml/badge.svg)](https://github.com/aviscaerulea/redntfy/actions/workflows/release.yml)
+
+Redmine の更新チケットを Windows Toast 通知で知らせ、未処理チケットをタスクトレイから一覧できる軽量常駐アプリです。
 
 ## 機能
 
-- Redmine の複数のグローバル保存クエリ（和集合）を `schedule` 設定に従って自動ポーリング
-- 追跡集合への新規流入と既知チケットの更新を Toast 通知と通知音で通知
-  - 既知チケットが新たなクエリの条件を満たした場合も更新として通知（設定に追加した直後のクエリは除く）
-  - 自分が起票したチケットの流入、自分の操作による更新、直近の自分の更新が原因の流入は通知しない
-  - 1 件のときはチケット番号、件名、更新者（例「更新：山田太郎」）を表示し、「チケットを開く」でブラウザ表示
-  - 複数件のときは件数のみのサマリ 1 通とし、「チケットを開く」で先頭クエリの画面を表示
-- トレイ左クリックで未処理チケットの一覧を表示
-  - 現在の並び順で先頭 `list_limit`（デフォルト 20）件を表示（ピン留めは上限適用外）
-  - 期限付きチケットは期日を件名の前に表示（今年は `7/28`、他年は `2025/6/30` の形式。期日は常に半太字、期限が当日以前なら赤）
-  - 担当がグループのチケットはプロジェクト名の前に 👥 を表示（admin 権限が無い場合は自分の所属グループのみ判定）
-  - プロジェクト名を期日の前に `[]` 付きで表示（`project_max_chars` でデフォルト 5 文字、0 で非表示）
-  - バグ・障害トラッカーのチケットは件名の直前に 💥 を表示（`bug_trackers` で指定、デフォルト `["*バグ*", "*障害*"]`）
-  - チケット番号の右に最終更新者の姓を表示（姓が取得できない場合はフルネーム）
-  - 未読（まだ一覧から開いていない）のチケットは太字で表示
-  - 行の左クリックでチケットをブラウザ表示して既読化、右クリックでピン留めをトグル（最大 5 件）
-  - ピン留めしたチケットはクローズ、担当変更、担当者フィルタ、バージョンフィルタで対象外になっても一覧に残る（クローズ済は打ち消し線）
-- トレイ右クリックの「今すぐ更新」で、休止時間帯やクールダウンに関わらず直ちに再取得
-  - 完了時に Toast で知らせる（更新を検知した回は更新通知そのものが完了の合図）
-- トレイ右クリックの「担当がグループのチケットを除外」（担当者フィルタ）を一覧・tooltip・通知に適用
-- トレイ右クリックの「バージョン未指定のチケットを除外」を一覧・tooltip・通知に適用（期日ありは例外的に残す）
-- トレイ右クリックの「自分の操作による更新を通知しない」で、自分が起票または更新したチケットの Toast 通知を抑止（既定 ON。一覧・tooltip には影響しない）
-- トレイ右クリックの「期日順に並べる」で、一覧を期日昇順（期日なしは末尾）に切り替え
-- トレイ右クリックの「通知音を鳴らす」「スタートアップ登録」で、通知音の ON/OFF と自動起動を切り替え
-- 未処理件数と未読件数を tooltip に表示し、未読があればトレイアイコンに赤バッジを点灯
-- 通知音の EBU R128 ラウドネス正規化、19kHz ガードトーン、指定プロセスのダッキング
-- マイク・カメラ使用中（会議中）の通知音自動ミュート
-- 起動時の GitHub リリース更新チェック
+- 通知対象を Redmine のカスタムクエリで自由に設定でき、定期チェックで新着や更新を Toast 通知
+- タスクトレイから未処理チケット一覧を表示し、期日、担当、プロジェクトをアイコンで整形
+- 気になるチケットはピン留めで一覧の先頭に固定（クローズしても残る）
+- トレイメニューから即時更新、フィルタ、並び替えを操作
+- 通知音の音量を自動で揃え、会議中（マイクやカメラの使用中）は自動でミュート
+- 起動時に GitHub リリースの新版を確認
+- 常駐時の物理メモリ使用量は約 7MB と軽量
 
-## 動作要件
+## インストール
+
+### 動作要件
 
 - Windows 10/11
-- Redmine の API アクセスキーとグローバル保存クエリ（作成手順は「使用方法」を参照）
+- Redmine の API アクセスキー
+- Redmine のグローバル保存クエリ（プロジェクト指定なしで保存したもの）
 
-## インストール方法
+### 手順
 
-任意フォルダで zip を展開して redntfy.exe を実行。
+Scoop を使う場合。
 
-## 使用方法
+```powershell
+scoop bucket add aviscaerulea https://github.com/aviscaerulea/scoop-bucket
+scoop install redntfy
+```
+
+zip から手動で導入する場合、[Releases](https://github.com/aviscaerulea/redntfy/releases/latest) から zip をダウンロードし、任意のフォルダに展開して `redntfy.exe` を実行してください。
+
+## 使い方
+
+初回セットアップの手順です。
 
 1. Redmine で **プロジェクトを指定せず** にチケット一覧を絞り込み、カスタムクエリとして保存する
    - 特定プロジェクト配下で保存したクエリは API から参照できないため、必ずグローバルクエリとして作成する
    - 保存後の URL `/issues?query_id=N` の `N` を控える（複数クエリを追跡する場合は各クエリ分）
 2. Redmine の「個人設定」→「API アクセスキー」でキーを取得する
-3. exe 同フォルダに `redntfy.local.toml` を作成して接続情報を記載する
+3. `redntfy.exe` と同じフォルダに `redntfy.local.toml` を作成し、接続情報を記載する
 
    ```toml
    [redmine]
@@ -56,31 +54,57 @@ Redmine の更新チケットを Windows Toast 通知で知らせ、未処理チ
    query_ids = [12, 34]
    ```
 
-4. redntfy.exe を起動する
+4. `redntfy.exe` を起動する
 
-動作設定は exe 同フォルダの `redntfy.toml` を参照。
-`redntfy.local.toml` を置くと同名キーをキー単位で上書きできる。（接続情報はこちらに書く）
-検知済み状態は `state.json`、ピン留めは `pins.json` に保存され、再起動しても保持される。
+起動後の日常操作は以下のとおりです。
 
-## ビルド方法
+- トレイアイコン左クリックで未処理チケット一覧を表示
+- 行の左クリックでブラウザ表示して既読化、右クリックでピン留めをトグル
+- トレイアイコン右クリックのメニューから即時更新、フィルタ、並び替えを操作
 
-Visual Studio Build Tools、vcpkg、go-task、PowerShell 7、git が必要。
+## 設定
+
+動作設定は `redntfy.exe` と同じフォルダの `redntfy.toml` に記載します。
+`redntfy.local.toml` を置くとキー単位で上書きされ、接続情報の分離や環境毎の差分管理に使えます。
+検知済み状態は `state.json`、ピン留めは `pins.json` に保存され、再起動後も保持されます。
+
+主要な設定項目は以下のとおりです。詳細は `redntfy.toml` のコメントを参照してください。
+
+| セクション | キー | 説明 |
+| --- | --- | --- |
+| `[app]` | `schedule` | 24 時間分のポーリング回数（回/時） |
+| `[app]` | `list_limit` | 一覧の表示件数（デフォルト 20） |
+| `[app]` | `bug_trackers` | 💥 を付けるトラッカー名のパターン |
+| `[app]` | `duck_targets` | 通知音再生中にミュートするプロセス名 |
+| `[redmine]` | `url`, `api_key`, `query_ids` | 接続情報（必須） |
+| `[loudness]` | `enabled`, `target` | 通知音のラウドネス正規化 |
+| `[update]` | `enabled` | 起動時の更新チェック |
+
+## 制限事項
+
+- 追跡クエリは Redmine のグローバル保存クエリのみ対応（プロジェクト配下のクエリは API から参照できない）
+- グループ担当の判定は admin 権限があれば全グループが対象、無ければ自分の所属グループのみ
+- 設定ファイルはホットリロード非対応で、変更反映には再起動が必要
+
+## ビルド
+
+Visual Studio Build Tools、vcpkg、go-task、PowerShell 7、git が必要です。
 
 ```powershell
 task build      # 通常ビルド（out/redntfy.exe）
 task release    # リリースビルドと zip 作成
 ```
 
-## 技術仕様
+## 技術スタック
 
 - C++20 / Win32 API（単一翻訳単位）
 - WinHTTP（Redmine REST API）
 - C++/WinRT（Windows.UI.Notifications, Windows.Data.Json）
 - WASAPI（通知音再生）
-- libebur128（ラウドネス測定、vcpkg：`libebur128:x64-windows-static`）
+- libebur128（ラウドネス測定）
 - toml++（設定ファイル）
 
 ## ライセンス
 
-アプリケーションアイコンには Redmine 公式ロゴを使用している。
-ロゴは Martin Herr 氏の著作物で、[CC BY-SA 2.5](https://creativecommons.org/licenses/by-sa/2.5/) でライセンスされている。
+アプリケーションアイコンには Redmine 公式ロゴを使用しています。
+ロゴは Martin Herr 氏の著作物で、[CC BY-SA 2.5](https://creativecommons.org/licenses/by-sa/2.5/) でライセンスされています。
