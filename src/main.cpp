@@ -2600,7 +2600,6 @@ static void updateTrayIcon(HWND hWnd, bool hasUnread) {
                         : hasUnread    ? TrayIconStyle::NormalBadged
                                        : TrayIconStyle::Normal;
     if (style == g_trayIconStyle) return;
-    g_trayIconStyle = style;
 
     auto nid   = makeTrayNid(hWnd);
     nid.uFlags = NIF_ICON;
@@ -2617,7 +2616,9 @@ static void updateTrayIcon(HWND hWnd, bool hasUnread) {
         nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
         break;
     }
-    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    // 成功時のみ前回状態を更新する。失敗時に先へ進めると、次回同じ状態の要求が差分なしと
+    // 判定されてスキップされ、実アイコンが古いまま残り続けるため
+    if (Shell_NotifyIconW(NIM_MODIFY, &nid)) g_trayIconStyle = style;
     if (nid.hIcon) DestroyIcon(nid.hIcon);
 }
 
