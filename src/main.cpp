@@ -3188,7 +3188,15 @@ static bool isNewerVersion(const std::wstring& a, const std::wstring& b) {
 // GitHub の最新リリースを確認し、新版があれば Toast 通知とグローバル状態を更新する
 // 起動時に detach したスレッドで 1 回だけ実行する
 static void checkForUpdates() {
-    winrt::init_apartment();
+    // WinRT 初期化も hresult_error を投げ得るため捕捉する。detach スレッドの未捕捉例外は
+    // std::terminate でプロセス全体を落とすため、失敗はログのみ残してスレッドを終える
+    try {
+        winrt::init_apartment();
+    }
+    catch (...) {
+        writeLog("update check: WinRT init failed");
+        return;
+    }
     // 予期しない例外でスレッドが std::terminate しないよう全体を保護する
     try {
         do {
