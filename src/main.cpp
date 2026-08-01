@@ -15,8 +15,10 @@
  *
  * 終了コード：
  *   0  - 正常終了（トレイメニューの「終了」による）
- *   1  - 設定エラー（[redmine] url / api_key / query_ids の未設定。api_key 空時は my/account を開いて終了）
  *   2  - 予期しない初期化エラー
+ * [redmine] url / api_key / query_ids の未設定・無効（実行時 401/404 含む）は終了せず、
+ * 原因別の案内（Toast・設定ファイル・ブラウザ誘導）を出して無効モードで常駐する。
+ * 無効モード：トレイは app-disable.ico・「今すぐ更新」非活性・ポーリング停止。復帰は再起動のみ。
  *
  * 依存ライブラリ：WinHTTP, WinRT (Windows.UI.Notifications, Windows.Data.Json), Propsys
  * 外部依存：libebur128（vcpkg: libebur128:x64-windows-static）
@@ -101,6 +103,11 @@ static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 // トレイアイコン用メッセージ ID
 static constexpr UINT WM_TRAYICON        = WM_USER + 1;
 static constexpr UINT WM_UPDATE_TOOLTIP  = WM_USER + 2;
+
+// 無効モード遷移をメインスレッドへ委譲するメッセージ（wParam = DisabledReason）
+// トレイアイコン更新（Shell_NotifyIconW）をメインスレッドに限定する不変条件を守るため、
+// ポーリングスレッドは直接 UI を触らずこのメッセージを投函する
+static constexpr UINT WM_ENTER_DISABLED  = WM_USER + 3;
 
 // コンテキストメニューコマンド ID
 static constexpr UINT IDM_EXIT             = 40002;
@@ -215,11 +222,28 @@ static std::atomic<ULONGLONG> g_lastPollTick{0};
 // 「起動後 30 分間はすべて抑制」という誤動作になる。0 は必ずセンチネルとして特別扱いする。
 static std::atomic<ULONGLONG> g_lastErrorToastTime{0};
 
-// 直近のポーリングで HTTP 401（認証エラー、api_key が無効）を検出済みかのフラグ
-// 検出のたびに <url>/my/account を開くとブラウザタブが増えて煩わしいため、初回だけ開く。
-// 一度成功すればリセットし、再び 401 になったときにまた開く。Toast 自体は既存の
-// showErrorToast クールダウンで抑止される（30 分）。
-static std::atomic<bool>       g_authErrorNotified{false};
+// 無効モードの原因（設定不備の分類）
+// None 以外のとき無効モード：ポーリング停止・トレイは app-disable.ico・「今すぐ更新」非活性。
+// 起動時の静的検査（wmain）または実行時の確定的判定（401/404）で一度だけ None 以外になり、
+// ホットリロードしない仕様のため復帰は再起動のみ（プロセス生存中に None へは戻らない）。
+// atomic<int> にするのは atomic<enum class> が処理系依存で non lock-free になり得るため。
+enum class DisabledReason : int {
+    None            = 0,
+    InvalidUrl      = 1,  // url 未設定または非 http(s)（静的検査のみ）
+    InvalidApiKey   = 2,  // api_key 未設定（静的）または実行時 HTTP 401
+    InvalidQueryIds = 3,  // query_ids 未設定（静的）または実行時 HTTP 404
+};
+static std::atomic<int> g_disabledReason{ static_cast<int>(DisabledReason::None) };
+
+// 現在の無効モード原因を返す
+static DisabledReason disabledReason() {
+    return static_cast<DisabledReason>(g_disabledReason.load());
+}
+
+// 無効モード中かを返す
+static bool isDisabled() {
+    return disabledReason() != DisabledReason::None;
+}
 
 // TaskbarCreated メッセージ ID（エクスプローラ再起動対策）
 static UINT WM_TASKBAR_CREATED = 0;
@@ -266,7 +290,7 @@ struct PinEntry {
 
 // loadConfig の戻り値
 struct Config {
-    // [redmine] 接続設定（必須。いずれか欠けると起動を中止する）
+    // [redmine] 接続設定（必須。いずれか欠けると無効モードで常駐する）
     std::wstring redmineUrl;       // Redmine の URL（末尾スラッシュを除去して保持する）
     std::wstring apiKey;           // 個人 API アクセスキー
     // 追跡対象のグローバル保存クエリ id（1 個以上必須。設定の記述順を保持し std::set にしない）
@@ -343,9 +367,10 @@ static bool passesVersionFilter(const Issue& is) {
     return is.hasFixedVersion || !is.dueDate.empty();
 }
 
-// トレイアイコンのバッジ状態
-// NIM_MODIFY の無駄な呼び出しを抑制するために直前のバッジ有無を保持する
-static bool                    g_trayBadgeActive  = false;
+// トレイアイコンの表示状態（通常／未読バッジ付き／無効モード）
+// NIM_MODIFY の無駄な呼び出しを抑制するために直前の状態を保持する
+enum class TrayIconStyle { Normal, NormalBadged, Disabled };
+static TrayIconStyle           g_trayIconStyle    = TrayIconStyle::Normal;
 // updateTrayTooltip のリエントランシーガード
 // Shell_NotifyIconW が内部でメッセージポンプして WM_TIMER 等を呼ぶことへの対処
 static bool                    g_tooltipUpdating  = false;
@@ -1068,7 +1093,7 @@ static Config loadConfig(const std::wstring& exeDir) {
         return ids;
     };
 
-    // [redmine] 接続設定（必須。欠落チェックは wmain で行い、欠けていれば起動を中止する）
+    // [redmine] 接続設定（必須。欠落チェックは wmain で行い、欠けていれば無効モードで常駐する）
     cfg.redmineUrl = readRedmineString("url");
     while (!cfg.redmineUrl.empty() && cfg.redmineUrl.back() == L'/')
         cfg.redmineUrl.pop_back();  // 末尾スラッシュを除去して URL 連結を単純化する
@@ -1111,7 +1136,8 @@ static std::wstring issueUrl(const Config& cfg, int id) {
 // 代表クエリ（query_ids の先頭）の画面 URL（{url}/issues?query_id={qid}）
 // 複数件 Toast と一覧フッタの遷移先。和集合を表す URL は Redmine に無いため先頭で代表する。
 static std::wstring queryUrl(const Config& cfg) {
-    // wmain の検証で非空が保証されるが、空でも 0 に落として未定義動作を作らない
+    // query_ids 空は無効モードになり本関数へは到達しない（ポーリング停止・一覧非表示のため）が、
+    // 万一空で呼ばれても 0 に落として未定義動作を作らない
     int qid = cfg.queryIds.empty() ? 0 : cfg.queryIds.front();
     return cfg.redmineUrl + L"/issues?query_id=" + std::to_wstring(qid);
 }
@@ -1279,8 +1305,12 @@ static bool isGroupAssignee(const std::vector<int>& groupIds, int assignedToId) 
 // ログだけで切り分けられるようにするため。
 // outAuthError は省略可（nullptr）。HTTP 401 検出時に true を書き込む。呼び出し側が
 // 認証エラー（api_key 無効）と一般的な取得失敗を区別するために使う。
+// outQueryError は省略可（nullptr）。HTTP 404 検出時に true を書き込む。
+// Redmine は存在しない・削除済み・プロジェクト配下の非グローバル・アクセス権のないクエリの
+// いずれでも 404 を返し、どれも query_ids の修正なしにはリトライで解決しない確定的な失敗。
+// ネットワーク断は status 0、サーバ障害は 5xx になるため 404 と混同しない。
 static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>& outIssues,
-                             bool* outAuthError = nullptr) {
+                             bool* outAuthError = nullptr, bool* outQueryError = nullptr) {
     using namespace winrt::Windows::Data::Json;
     outIssues.clear();
 
@@ -1295,7 +1325,8 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
         if (status != 200 || body.empty()) {
             writeLog(logTag + ": request failed, status=" + std::to_string(status)
                 + " offset=" + std::to_string(offset));
-            if (status == 401 && outAuthError) *outAuthError = true;
+            if (status == 401 && outAuthError)  *outAuthError  = true;
+            if (status == 404 && outQueryError) *outQueryError = true;
             return false;
         }
         try {
@@ -1335,13 +1366,14 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
 // 1 クエリでも失敗したら全体を false として部分結果を破棄する。欠落込みの集合で
 // state.json を上書きすると次回に「新規」誤通知が出るため。（単一クエリ時代の方針を維持）
 // outAuthError は省略可。fetchQueryIssues のいずれかで HTTP 401 を観測したときに true を書く。
+// outQueryError は省略可。同じく HTTP 404（query_id 不正）を観測したときに true を書く。
 static bool fetchIssues(const Config& cfg, std::vector<Issue>& outIssues,
-                        bool* outAuthError = nullptr) {
+                        bool* outAuthError = nullptr, bool* outQueryError = nullptr) {
     outIssues.clear();
     std::unordered_map<int, size_t> indexById;  // チケット id → outIssues の位置
     for (int qid : cfg.queryIds) {
         std::vector<Issue> part;
-        if (!fetchQueryIssues(cfg, qid, part, outAuthError)) return false;
+        if (!fetchQueryIssues(cfg, qid, part, outAuthError, outQueryError)) return false;
         for (auto& is : part) {
             auto [it, inserted] = indexById.try_emplace(is.id, outIssues.size());
             if (inserted) {
@@ -2351,7 +2383,7 @@ static void showToast(const std::wstring& line1, const std::wstring& line2,
     dispatchToastXml(std::move(xml), permalink);
 }
 
-// 3 行 Toast 通知を表示する（更新チェックの新版通知、「今すぐ更新」の完了通知用）
+// 3 行 Toast 通知を表示する（更新チェックの新版通知、「今すぐ更新」の完了通知、無効モードの案内用）
 //
 // line1 を title スタイル（太字大）で表示する。
 // silent=true（デフォルト false）で OS 通知音を無効化する。
@@ -2428,12 +2460,15 @@ static NOTIFYICONDATAW makeTrayNid(HWND hWnd) {
 
 // トレイアイコンの登録
 static void addTrayIcon(HWND hWnd) {
-    g_trayBadgeActive = false;  // バッジ状態をリセットしてアイコン再登録後の差分検出を保証
+    // 無効モードなら最初から無効アイコンで登録する（後からの差し替えによるチラつき防止）
+    // TaskbarCreated（エクスプローラ再起動）の再登録でも同じ経路を通り状態が一致する
+    g_trayIconStyle = isDisabled() ? TrayIconStyle::Disabled : TrayIconStyle::Normal;
     auto nid = makeTrayNid(hWnd);
     nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
     wcscpy_s(nid.szTip, L"読み込み中...");
-    nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
+    UINT iconId = isDisabled() ? IDI_APP_ICON_DISABLE : IDI_APP_ICON;
+    nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(iconId));
     Shell_NotifyIconW(NIM_ADD, &nid);
     if (nid.hIcon) DestroyIcon(nid.hIcon);
 }
@@ -2542,21 +2577,30 @@ static HICON createBadgedIcon() {
     return hResult;
 }
 
-// トレイアイコンのバッジ切り替え（バッジ = 未読チケットあり）
-// hasUnread が g_trayBadgeActive（前回状態）と同じなら NIM_MODIFY をスキップする。
+// トレイアイコンの状態切り替え（無効モード最優先、次いでバッジ = 未読チケットあり）
+// 望ましい状態が前回と同じなら NIM_MODIFY をスキップする。
+// 無効モード中はポーリングが止まっており未読は増えないため、バッジとの複合状態は無い。
 static void updateTrayIcon(HWND hWnd, bool hasUnread) {
-    if (hasUnread == g_trayBadgeActive) return;
-    g_trayBadgeActive = hasUnread;
+    TrayIconStyle style = isDisabled() ? TrayIconStyle::Disabled
+                        : hasUnread    ? TrayIconStyle::NormalBadged
+                                       : TrayIconStyle::Normal;
+    if (style == g_trayIconStyle) return;
+    g_trayIconStyle = style;
 
     auto nid   = makeTrayNid(hWnd);
     nid.uFlags = NIF_ICON;
-    if (hasUnread) {
+    switch (style) {
+    case TrayIconStyle::Disabled:
+        nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON_DISABLE));
+        break;
+    case TrayIconStyle::NormalBadged:
         nid.hIcon = createBadgedIcon();
         if (!nid.hIcon)
             nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
-    }
-    else {
+        break;
+    default:
         nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
+        break;
     }
     Shell_NotifyIconW(NIM_MODIFY, &nid);
     if (nid.hIcon) DestroyIcon(nid.hIcon);
@@ -2682,11 +2726,29 @@ static std::vector<ListRow> buildListRows(int& visible) {
 // トレイアイコンのツールチップを更新する
 // 「未処理 N 件」に未読があれば「（未読 M 件）」を続けて表示し、赤バッジは未読ありを表す。
 // 未読件数は一覧に出る行から数えるため、画面上の太字行数と一致する。
+// 無効モード中は件数の代わりに原因別の設定確認案内を表示する。
 // ポップアップメニュー表示中は更新しない
 static void updateTrayTooltip(HWND hWnd) {
     if (g_popupShowing.load()) return;
     if (g_tooltipUpdating) return;
     g_tooltipUpdating = true;
+
+    // 無効モード：件数の代わりに設定確認の案内を出す（一覧は開けないため件数計算も不要）
+    if (isDisabled()) {
+        std::wstring dtip;
+        switch (disabledReason()) {
+        case DisabledReason::InvalidUrl:      dtip = L"設定ファイルの url を確認してください"; break;
+        case DisabledReason::InvalidApiKey:   dtip = L"設定ファイルの api_key を確認してください"; break;
+        default:                              dtip = L"設定ファイルの query_ids を確認してください"; break;
+        }
+        auto dnid = makeTrayNid(hWnd);
+        dnid.uFlags = NIF_TIP;
+        wcscpy_s(dnid.szTip, dtip.c_str());
+        Shell_NotifyIconW(NIM_MODIFY, &dnid);
+        updateTrayIcon(hWnd, false);
+        g_tooltipUpdating = false;
+        return;
+    }
 
     int visible = 0;
     auto rows = buildListRows(visible);
@@ -3272,7 +3334,9 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
     // 即時ポーリング（明示操作のため休止時間帯・クールダウンを無視する。g_manualPoll 経由）
-    AppendMenuW(hMenu, MF_STRING, IDM_UPDATE_NOW, L"今すぐ更新");
+    // 無効モード中は消費するポーリングスレッドが存在しないため非活性にする
+    UINT updateNowFlags = MF_STRING | (isDisabled() ? (MF_DISABLED | MF_GRAYED) : 0u);
+    AppendMenuW(hMenu, updateNowFlags, IDM_UPDATE_NOW, L"今すぐ更新");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
     // 担当者フィルタ（レジストリ永続化。一覧・tooltip・通知のすべてに効く）
@@ -3318,8 +3382,9 @@ static void showTrayContextMenu(HWND hWnd) {
 }
 
 // トレイアイコン左クリック時の処理
-// チケット一覧ポップアップを表示する。
+// チケット一覧ポップアップを表示する。無効モード中は表示しない。
 static void handleTrayLeftClick(HWND hWnd) {
+    if (isDisabled()) return;  // 無効モード中は一覧を出さない（ポーリング停止中で出すものがない）
     g_popupShowing.store(true);
     clearTrayTooltip(hWnd);
     showIssuePopup(hWnd);
@@ -3360,6 +3425,7 @@ static void markIssueRead(int issueId) {
 // メニュー選択（IDM_*）と一覧クリック（IDM_ISSUE_BASE 以降。開いた 1 件を既読にする）を処理する。
 static void handleTrayCommand(UINT id) {
     if (id == IDM_UPDATE_NOW) {
+        if (isDisabled()) return;  // メニュー非活性と揃えた二重ガード
         // 明示のユーザ操作のため、休止時間帯・クールダウンを無視して直ちに再取得する
         g_manualPoll.store(true);
         return;
@@ -3422,7 +3488,10 @@ static void handleTrayCommand(UINT id) {
         return;
     }
     if (id == IDM_OPEN_QUERY) {
-        // Redmine の保存クエリ画面をブラウザで開く（url は起動時に isHttpUrl 検証済み）
+        // Redmine の保存クエリ画面をブラウザで開く。
+        // 無効モード中は一覧が開けず本来到達しないが、url が isHttpUrl 未検証のまま
+        // ShellExecuteW へ渡る経路を将来にわたり残さないための直接ガード
+        if (isDisabled()) return;
         std::wstring url = queryUrl(g_currentConfig);
         ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         return;
@@ -3681,6 +3750,88 @@ static void togglePin(UINT itemIdx, HMENU hm) {
     writeLog(std::string("pin: ") + (nowPinned ? "added #" : "removed #") + std::to_string(item.id));
 }
 
+// redntfy.local.toml のテンプレートを生成する（既存ファイルは絶対に上書きしない）
+//
+// 無効モード遷移時に「設定ファイルを開く」先を保証するためのブートストラップ。
+// BOM なし UTF-8・LF。内容は redntfy.toml の [redmine] セクションのコメントに準拠する。
+// CREATE_NEW により既存ファイル・同時生成との競合を排他する。
+// 生成失敗は警告ログのみで続行する。（redntfy.toml を直接編集する道が残るため）
+static void ensureLocalTomlTemplate(const std::wstring& exeDir) {
+    std::wstring path = exeDir + L"\\" + CONFIG_LOCAL_FILENAME;
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+
+    static const char kTemplate[] =
+        "# vim: set ft=toml fenc=utf-8 ff=unix sw=4 ts=4 et :\n"
+        "##################################################\n"
+        "# redntfy ローカル設定ファイル\n"
+        "##################################################\n"
+        "# redntfy.toml と同名のキーをキー単位で上書きする。接続情報はこちらに書く。\n"
+        "\n"
+        "# Redmine 接続設定（必須）\n"
+        "# url       ：Redmine の URL（http:// または https:// で始まる）\n"
+        "# api_key   ：Redmine の「個人設定」→「API アクセスキー」で取得した値\n"
+        "# query_ids ：プロジェクトを指定せずに保存したグローバル保存クエリの id を配列で指定する。\n"
+        "[redmine]\n"
+        "# url       = \"https://redmine.example.com\"\n"
+        "# api_key   = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n"
+        "# query_ids = [12, 34]\n";
+
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        writeLog("ensureLocalTomlTemplate: CreateFileW failed, err=" + std::to_string(GetLastError()));
+        return;
+    }
+    DWORD written = 0;
+    WriteFile(h, kTemplate, static_cast<DWORD>(sizeof(kTemplate) - 1), &written, nullptr);
+    CloseHandle(h);
+    writeLog("ensureLocalTomlTemplate: created template");
+}
+
+// 無効モードへ移行する（案内 Toast・設定ファイル/ブラウザ起動・トレイ表示の一式）
+//
+// メインスレッドから呼ぶ。（Shell_NotifyIconW をメインスレッドに限定する不変条件のため。
+// ポーリングスレッドからは WM_ENTER_DISABLED の投函で本関数に委譲する）
+// 呼び出し前に g_disabledReason が設定済みであること。
+// InvalidApiKey / InvalidQueryIds は url の有効性が検証済みの場合のみ到達するため、
+// ここでの ShellExecuteW は http(s) URL しか受け取らない。
+static void enterDisabledMode(HWND hWnd, DisabledReason reason,
+                              const Config& cfg, const std::wstring& exeDir) {
+    // 設定ファイルを開く（不在ならテンプレートを生成してから）
+    ensureLocalTomlTemplate(exeDir);
+    std::wstring configPath = exeDir + L"\\" + CONFIG_LOCAL_FILENAME;
+    ShellExecuteW(nullptr, L"open", configPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+
+    // 原因別のブラウザ誘導と Toast（permalink 空 = ボタンなし。silent=false で OS 通知音）
+    try {
+        if (reason == DisabledReason::InvalidUrl) {
+            showToast3(L"無効な Redmine URL",
+                       L"設定ファイルに url を設定してください",
+                       L"設定後は redntfy を再起動してください", L"");
+        }
+        else if (reason == DisabledReason::InvalidApiKey) {
+            std::wstring accountUrl = cfg.redmineUrl + L"/my/account";
+            ShellExecuteW(nullptr, L"open", accountUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            showToast3(L"認証エラー",
+                       L"Redmine の API アクセスキーを api_key に設定してください",
+                       L"設定後は redntfy を再起動してください", L"");
+        }
+        else {
+            std::wstring issuesUrl = cfg.redmineUrl + L"/issues";
+            ShellExecuteW(nullptr, L"open", issuesUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            showToast3(L"設定エラー",
+                       L"Redmine のマイカスタムクエリを query_ids に設定してください",
+                       L"設定後は redntfy を再起動してください", L"");
+        }
+    }
+    catch (...) {
+        writeLog("enterDisabledMode: toast failed");
+    }
+
+    // トレイ表示を無効モードへ（アイコンは updateTrayTooltip 経由で切り替わる）
+    updateTrayTooltip(hWnd);
+}
+
 static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAYICON) {
         if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU)
@@ -3691,6 +3842,11 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     }
     if (msg == WM_UPDATE_TOOLTIP) {
         updateTrayTooltip(hWnd);
+        return 0;
+    }
+    // ポーリングスレッドからの無効モード遷移依頼（Toast・ブラウザ誘導・トレイ更新を実施）
+    if (msg == WM_ENTER_DISABLED) {
+        enterDisabledMode(hWnd, static_cast<DisabledReason>(wParam), g_currentConfig, g_exeDir);
         return 0;
     }
     if (msg == WM_COMMAND) {
@@ -4143,8 +4299,9 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
 
             std::vector<Issue> issues;
             ULONGLONG t0    = GetTickCount64();
-            bool authError = false;
-            bool ok = fetchIssues(cfg, issues, &authError);
+            bool authError  = false;
+            bool queryError = false;
+            bool ok = fetchIssues(cfg, issues, &authError, &queryError);
             ULONGLONG elapsed = GetTickCount64() - t0;
 
             // 取得試行をもって「起動直後の 1 回」は消費とする（成功を待たない）。
@@ -4154,28 +4311,24 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             if (!ok) {
                 if (g_shutdownRequested) break;  // 終了による取得中断は接続エラーではない
                 writeLog("HTTP request failed");
-                if (authError) {
-                    // 401 の初回検出時のみ Redmine の /my/account を開く。
-                    // exchange(true) は「以前 false（未通知）→ true（通知済み）」で今回真になる。
-                    // ホットリロードしない仕様のため、api_key の書き換えには再起動が必要だが、
-                    // 少なくとも API キー画面までは自動で誘導する。
-                    if (!g_authErrorNotified.exchange(true)) {
-                        std::wstring accountUrl = cfg.redmineUrl + L"/my/account";
-                        ShellExecuteW(nullptr, L"open", accountUrl.c_str(),
-                                      nullptr, nullptr, SW_SHOWNORMAL);
-                    }
-                    showErrorToast(L"認証エラー", L"API キーを取得してください", manualTriggered);
+                // 401/404 は設定不備の確定的なシグナルのためリトライせず無効モードへ遷移する。
+                // Toast・ブラウザ誘導・トレイ更新はメインスレッド（WM_ENTER_DISABLED）に委譲し、
+                // 本スレッドは終了する。（復帰は再起動のみ。ホットリロードしない仕様のため）
+                if (authError || queryError) {
+                    DisabledReason reason = authError ? DisabledReason::InvalidApiKey
+                                                      : DisabledReason::InvalidQueryIds;
+                    writeLog(authError ? "HTTP 401 - entering disabled mode (api_key)"
+                                       : "HTTP 404 - entering disabled mode (query_ids)");
+                    g_disabledReason.store(static_cast<int>(reason));
+                    PostMessage(g_hWnd, WM_ENTER_DISABLED, static_cast<WPARAM>(reason), 0);
+                    break;
                 }
-                else {
-                    // 手動更新の失敗はクールダウンを無視して必ず知らせる。無音のままだと
-                    // 操作が届いたのか失敗したのか区別できず、完了通知の目的を果たせない
-                    showErrorToast(L"接続エラー", L"Redmine API に接続できません", manualTriggered);
-                }
+                // 手動更新の失敗はクールダウンを無視して必ず知らせる。無音のままだと
+                // 操作が届いたのか失敗したのか区別できず、完了通知の目的を果たせない
+                showErrorToast(L"接続エラー", L"Redmine API に接続できません", manualTriggered);
                 waitInterruptible(RETRY_WAIT_MS);
                 continue;
             }
-            // 一度成功したら 401 フラグをリセットする。次に 401 になったときに再度ブラウザで案内する。
-            g_authErrorNotified.store(false);
 
             writeLog("poll: " + std::to_string(issues.size()) + " issues ("
                 + std::to_string(elapsed) + "ms), next: " + nextPollTimeStr(pollsPerHour));
@@ -4288,45 +4441,27 @@ int wmain() {
 
         auto cfg = loadConfig(exeDir);
 
-        // 必須キーの検証（欠けていれば起動を中止する）
-        // 3 分岐で原因ごとに案内する。url のスキームもここで検証し、以降の全経路
-        // （API・ブラウザ起動・Toast ボタン）で http(s) 以外が ShellExecuteW に渡らないことを保証する。
+        // 必須キーの静的検証（欠けていても終了せず、無効モードで常駐する）
+        // 3 分岐で原因ごとに案内する。url のスキームもここで検証する。
+        // InvalidUrl のとき redmineUrl は ShellExecuteW を通るどの経路にも到達しない：
+        // ポーリング停止・一覧非表示（フッタのクエリ画面も開けない）・enterDisabledMode は
+        // InvalidUrl では URL を開かない。これにより http(s) 以外が ShellExecuteW に渡らない
+        // 保証を維持する。
+        DisabledReason initReason = DisabledReason::None;
         if (cfg.redmineUrl.empty() || !isHttpUrl(cfg.redmineUrl)) {
-            writeLog("config error: [redmine] url is empty or not http(s)");
-            try {
-                showToast(L"設定エラー",
-                          L"設定ファイルで Redmine の項目を確認してください",
-                          L"", false);
-            }
-            catch (...) {}
-            return 1;
+            writeLog("config error: [redmine] url is empty or not http(s) - disabled mode");
+            initReason = DisabledReason::InvalidUrl;
         }
-        if (cfg.apiKey.empty()) {
-            // url が確定しているため /my/account を開いて API キー取得画面へ誘導する。
-            // Toast にリンクは持たせない（要求どおりボタンなし）。ブラウザは自動で前面に来る。
-            writeLog("config error: [redmine] api_key is empty; opening /my/account");
-            std::wstring accountUrl = cfg.redmineUrl + L"/my/account";
-            ShellExecuteW(nullptr, L"open", accountUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            try {
-                showToast(L"認証エラー", L"API キーを取得してください", L"", false);
-            }
-            catch (...) {}
-            return 1;
+        else if (cfg.apiKey.empty()) {
+            writeLog("config error: [redmine] api_key is empty - disabled mode");
+            initReason = DisabledReason::InvalidApiKey;
         }
-        if (cfg.queryIds.empty()) {
-            // url が確定しているため /issues を開いてカスタムクエリ作成画面へ誘導する。
-            // /my/account と同じ扱いで、Toast にリンクは持たせない（要求どおりボタンなし）。
-            writeLog("config error: [redmine] query_ids is empty; opening /issues");
-            std::wstring issuesUrl = cfg.redmineUrl + L"/issues";
-            ShellExecuteW(nullptr, L"open", issuesUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            try {
-                showToast(L"設定エラー",
-                          L"カスタムクエリを作成し、query_ids に設定してください",
-                          L"", false);
-            }
-            catch (...) {}
-            return 1;
+        else if (cfg.queryIds.empty()) {
+            writeLog("config error: [redmine] query_ids is empty - disabled mode");
+            initReason = DisabledReason::InvalidQueryIds;
         }
+        // addTrayIcon より前に確定させる（登録時から無効アイコンで出すため）
+        g_disabledReason.store(static_cast<int>(initReason));
 
         g_currentConfig = cfg;  // スレッド起動前に 1 回だけ設定（以降は不変・ロック不要）
 
@@ -4368,10 +4503,17 @@ int wmain() {
         // ピン留めを復元する（起動直後のポーリング前でも一覧にピンを出せるようにする）
         loadPins(exeDir);
 
-        // ポーリングスレッド起動
+        // ポーリングスレッド起動（無効モード時は起動しない：設定はホットリロードしないため
+        // 何度試行しても結果が変わらず、案内はトレイ tooltip と Toast が担う）
         // メインスレッドはメッセージループに専念させるため、Redmine API ポーリング（HTTP I/O）を別スレッドへ分離する。
         // これによりネットワーク状態にかかわらずトレイアイコン右クリック等の UI が常時応答する。
-        std::thread pollThread(pollThreadFunc, exeDir, cfg);
+        std::thread pollThread;
+        if (initReason == DisabledReason::None) {
+            pollThread = std::thread(pollThreadFunc, exeDir, cfg);
+        }
+        else {
+            enterDisabledMode(g_hWnd, initReason, cfg, exeDir);
+        }
 
         // メッセージループ（純粋）
         // GetMessage は WM_QUIT で 0 を返してループを抜ける。
@@ -4390,7 +4532,8 @@ int wmain() {
         if (hNetNotify) CancelMibChangeNotify2(hNetNotify);
 
         // バックグラウンドスレッドを停止（waitInterruptible が 100 ms 単位でフラグを監視している）
-        pollThread.join();
+        // 無効モード起動時はスレッド未起動のため joinable で判定する
+        if (pollThread.joinable()) pollThread.join();
 
         // ループ終了後のクリーンアップ
         WTSUnRegisterSessionNotification(g_hWnd);

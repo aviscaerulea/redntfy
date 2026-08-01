@@ -3,4 +3,5 @@
 
 #include "resource.h"
 
-IDI_APP_ICON    ICON    "app.ico"
+IDI_APP_ICON            ICON    "app.ico"
+IDI_APP_ICON_DISABLE    ICON    "app-disable.ico"
