@@ -4221,7 +4221,15 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     // WinRT アパートメント初期化
     // 本スレッドは JSON パースと Toast 表示（deliverPollResults / showErrorToast）を持つため、
     // WinRT 呼び出しに先立ってアパートメントを初期化する。
-    winrt::init_apartment();
+    // 初期化失敗の hresult_error を捕捉しないと未捕捉例外の std::terminate でプロセス全体が
+    // 落ちるため、失敗はログのみ残して本スレッドだけ終える。（ポーリングなしで常駐は継続）
+    try {
+        winrt::init_apartment();
+    }
+    catch (...) {
+        writeLog("pollThreadFunc: WinRT init failed - polling unavailable");
+        return;
+    }
 
     bool startupPoll = true;  // 起動直後の 1 回だけ schedule・クールダウンに関わらずポーリングする
 
