@@ -622,7 +622,8 @@ static DWORD calcSleepUntilNextPoll(int pollsPerHour) {
 // WinHTTP で HTTPS リクエストを実行する
 // method: L"GET" or L"POST"
 // authHeader: 空でなければ "名前: 値" 形式のヘッダ 1 行としてそのまま付与
-// outStatusCode が非 null の場合、最終 HTTP ステータスコードを書き込む（失敗時は 0）
+// outStatusCode が非 null の場合、最終 HTTP ステータスコードを書き込む
+// （応答ヘッダ受信前の失敗は 0。ボディ受信途中の失敗はヘッダ確定値を保持して空ボディを返す）
 static std::string httpRequest(const wchar_t* method, const std::wstring& url,
     const std::string& body, const wchar_t* contentType,
     const std::wstring& authHeader, DWORD* outStatusCode = nullptr)
@@ -682,18 +683,32 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
         WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
     if (outStatusCode) *outStatusCode = statusCode;
 
+    // ボディ受信（受信途中の失敗はボディ破棄で失敗扱い）
+    // 受信 API の失敗で抜けると途切れたボディを正常応答として返してしまい、呼び出し側が
+    // 部分 JSON を正当な応答と誤解釈しかねないため、失敗時は空ボディを返す。
+    // status はヘッダで確定済みの値を保持する。（401/404 による設定不備の確定的判定を
+    // 接続エラーへ格下げしないため。正常終端は QueryDataAvailable 成功かつ avail == 0）
     std::string respBody;
     std::vector<char> buf;
-    DWORD avail = 0;
-    while (WinHttpQueryDataAvailable(hRequest, &avail) && avail > 0) {
+    bool readOk = true;
+    for (;;) {
+        DWORD avail = 0;
+        if (!WinHttpQueryDataAvailable(hRequest, &avail)) { readOk = false; break; }
+        if (avail == 0) break;
         if (buf.size() < avail) buf.resize(avail);
         DWORD read = 0;
-        if (WinHttpReadData(hRequest, buf.data(), avail, &read)) respBody.append(buf.data(), read);
+        if (!WinHttpReadData(hRequest, buf.data(), avail, &read)) { readOk = false; break; }
+        respBody.append(buf.data(), read);
     }
 
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
+    if (!readOk) {
+        writeLog("httpRequest: response body read failed: " + wideToUtf8(url)
+                 + ", status=" + std::to_string(statusCode));
+        return "";
+    }
     return respBody;
 }
 
