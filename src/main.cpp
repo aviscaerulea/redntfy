@@ -312,7 +312,7 @@ struct Config {
     // [loudness] ラウドネスノーマライズ設定
     bool  loudnessEnabled;      // ノーマライズ有効/無効（デフォルト true）
     float loudnessTarget;       // 目標ラウドネス LUFS（デフォルト -16.0）
-    float loudnessPeakCeiling;  // ピーク上限（デフォルト 0.891 = -1 dBFS）
+    float loudnessPeakCeiling;  // ピーク上限（デフォルト 0.891 = -1dBFS）
 
     // [update] 更新チェック設定
     bool  updateCheckEnabled;   // 起動時の GitHub リリースチェック有効/無効（デフォルト true）
@@ -1858,8 +1858,8 @@ static bool isMeetingActive() {
 // WAV の 16bit PCM サンプルにラウドネスノーマライズを適用する
 //
 // EBU R128 に基づく統合ラウドネス測定（libebur128）でゲインを算出し、
-// 全サンプルに乗算する。peak_ceiling を超える場合はゲインを制限する。
-// ほぼ無音（ピーク < 1e-6f）の場合はスキップする。
+// 全サンプルに乗算する。ピークが peak_ceiling を超えないようゲインを制限する。
+// ほぼ無音（ピーク < 1e-6f）ならスキップする。
 static void normalizeLoudness(std::vector<int16_t>& samples, int channels,
                               int sampleRate, float target, float peakCeiling) {
     if (samples.empty()) return;
@@ -2033,7 +2033,7 @@ static void fillToneBuffer(BYTE* buf, UINT32 frames,
                            const WAVEFORMATEX& wavFmt, double& phase) {
     // BLE 省電力モード抑止用の不可聴高周波トーン固定パラメータ
     constexpr float FREQ      = 19000.0f; // 周波数 Hz（成人不可聴域）
-    constexpr float AMPLITUDE = 0.001f;   // 振幅（約 -60 dB）
+    constexpr float AMPLITUDE = 0.001f;   // 振幅（約 -60dB）
 
     // ナイキスト周波数チェック（例：44.1kHz のナイキスト = 22.05kHz）
     if (static_cast<double>(FREQ) >= static_cast<double>(wavFmt.nSamplesPerSec) / 2.0) {
@@ -3304,8 +3304,7 @@ static BOOL drawVersionMenuItem(DRAWITEMSTRUCT* dis) {
     return TRUE;
 }
 
-// トレイアイコン用ウィンドウプロシージャ
-// 右クリックトレイメニューの構築と表示
+// トレイ右クリックメニューの構築と表示
 // メニュー項目はトグル状態（音声通知・スタートアップ等）を読み取り、
 // その場で構築する。（チェック状態は呼び出し時の最新値を反映）
 static void showTrayContextMenu(HWND hWnd) {
@@ -3832,6 +3831,10 @@ static void enterDisabledMode(HWND hWnd, DisabledReason reason,
     updateTrayTooltip(hWnd);
 }
 
+// トレイ用ウィンドウプロシージャ
+// トレイアイコン操作（左クリック一覧・右クリックメニュー）、tooltip 更新、無効モード遷移、
+// メニューのオーナードロー（新版通知・チケット行）、ポップアップ右クリックのピン留めトグル、
+// スリープ復帰・ロック解除の即時ポーリング、エクスプローラ再起動時のアイコン再登録を振り分ける。
 static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAYICON) {
         if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU)
@@ -4383,6 +4386,11 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     winrt::uninit_apartment();
 }
 
+// エントリポイント
+// ログ初期化 → 多重起動制御（Job Object、新プロセス優先）→ WinRT・トレイ・NIC 監視の初期化
+// → 設定読込と必須キーの静的検証 → ポーリングスレッド起動 → メッセージループ → 終了処理の順。
+// 設定不備では終了せず無効モードで常駐する。
+// 終了コード：0 = 正常、2 = 予期しない初期化エラー。
 int wmain() {
     // ログ初期化（Job Object 処理前に実施してすべてのイベントをログに残す）
     auto exeDir = getExeDir();
