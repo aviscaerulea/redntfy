@@ -202,7 +202,7 @@ static std::atomic<bool> g_excludeNoVersion{false};
 // deliverPollResults の 3 か所の判定（新規流入の起票者、新規流入の直近更新者、既存更新の更新者）を
 // 一括で ON/OFF する。抑止対象になったチケットも state.json には全件記録するため、
 // OFF に戻したときに再通知は起きない。
-// 一覧・tooltip・バッジ・並び順は本トグルの影響を受けない（表示ではなく通知のみを制御する）。
+// 一覧・tooltip・バッジ・並び順は本トグルの影響を受けない。（表示ではなく通知のみを制御する）
 static std::atomic<bool> g_muteOwnChanges{true};
 
 // トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングループと通知スレッドが参照）
@@ -229,7 +229,7 @@ static std::atomic<ULONGLONG> g_lastErrorToastTime{0};
 // 無効モードの原因（設定不備の分類）
 // None 以外のとき無効モード：ポーリング停止・トレイは app-disable.ico・「今すぐ更新」非活性。
 // 起動時の静的検査（wmain）または実行時の確定的判定（401/404）で一度だけ None 以外になり、
-// ホットリロードしない仕様のため復帰は再起動のみ（プロセス生存中に None へは戻らない）。
+// ホットリロードしない仕様のため復帰は再起動のみ。（プロセス生存中に None へは戻らない）
 // atomic<int> にするのは atomic<enum class> が処理系依存で non lock-free になり得るため。
 enum class DisabledReason : int {
     None            = 0,
@@ -1499,6 +1499,8 @@ static int fetchMyUserId(const Config& cfg, std::vector<int>& outOwnGroups) {
 // /groups.json から全グループの id を取得する（グループ担当マーカーの判定用、起動時 1 回）
 // この API は admin 権限が必要。403（権限なし）は確定的な失敗として outStatus で呼び出し側に
 // 伝え、所属グループへのフォールバックを促す。接続エラー等は nullopt で再試行対象とする。
+// この API はページングされず全グループを一括で返す（groups_controller.rb の
+// format.api が scope.to_a で全件取得するため。limit/offset 対応は API 側に無い）
 static std::optional<std::vector<int>> fetchAllGroupIds(const Config& cfg, DWORD* outStatus) {
     DWORD status = 0;
     auto body = redmineGet(cfg.redmineUrl + L"/groups.json", cfg.apiKey, &status);
@@ -4053,8 +4055,8 @@ static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
 }
 
 // チケット項目のピン留めをトグルする（左クリックポップアップ上の右クリック）
-// g_pins と item.pinned をトグルし、自スレッド所有のメニューウィンドウを再描画する
-// （マーカーの描画自体は WM_DRAWITEM が pinned を参照して行う）。
+// g_pins と item.pinned をトグルし、自スレッド所有のメニューウィンドウを再描画する。
+// （マーカーの描画自体は WM_DRAWITEM が pinned を参照して行う）
 // ピンが上限（PIN_LIMIT）に達している場合の追加は行わず、Toast で上限をユーザに知らせる。
 static void togglePin(UINT itemIdx, HMENU hm) {
     UINT id = GetMenuItemID(hm, static_cast<int>(itemIdx));
@@ -4506,7 +4508,7 @@ static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         bool entered = pv.hasQueries
             && hasNewQueryEntry(is.queryIds, pv.queryIds, prev.knownQueries);
         if (!updated && !entered) continue;
-        // 自分の操作による更新は通知しない（g_muteOwnChanges OFF なら通知に倒す）。
+        // 自分の操作による更新は通知しない。（g_muteOwnChanges OFF なら通知に倒す）
         // 最終更新者は resolveUpdaters が確定済み。
         // updated_on が進んでいない純粋な流入では判定しない：時間経過による流入が典型で
         // 「自分の操作」ではないため。（クエリ流入の Toast は更新者名も出さない）
@@ -4745,7 +4747,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             bool ok = fetchIssues(cfg, issues, &authError, &queryError);
             ULONGLONG elapsed = GetTickCount64() - t0;
 
-            // 取得試行をもって「起動直後の 1 回」は消費とする（成功を待たない）。
+            // 取得試行をもって「起動直後の 1 回」は消費とする。（成功を待たない）
             // オフラインのまま休止時間帯に入った場合に、朝まで 60 秒間隔のリトライを続けないため
             startupPoll = false;
 
