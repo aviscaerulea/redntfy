@@ -23,6 +23,16 @@ jobs:
         env:
           GITHUB_EVENT_RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
 
+      # テストが落ちたらリリースビルドへ進まない（リグレッションゲート）
+      - name: Test
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          ./build.ps1 -Version "${{ steps.version.outputs.version }}" -Test
+          if ($LASTEXITCODE) { exit 1 }
+          ./out/redntfy_test.exe
+          if ($LASTEXITCODE) { exit 1 }
+
       # build.ps1 が vcpkg の libebur128 導入と VC++ 環境の初期化を自前で行う
       - name: Build
         shell: pwsh

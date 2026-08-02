@@ -13,16 +13,19 @@
 
 ```powershell
 task build      # 通常ビルド（out/redntfy.exe。アセットも out/ にコピー）
+task test       # 単体テストをビルドして実行（out/redntfy_test.exe）
 task rebuild    # クリーンビルドして再起動
 task release    # リリースビルド（最適化＋zip 作成）
 task clean      # 成果物削除（実行中プロセスは強制終了）
 ```
 
-build.ps1 は `Microsoft.VisualStudio.DevShell.dll` + `Enter-VsDevShell` で VC++ 環境をロードし、rc → `out/version.h`（`APP_VERSION`）生成 → cl の順に実行する。
+build.ps1 は `Microsoft.VisualStudio.DevShell.dll` + `Enter-VsDevShell` で VC++ 環境をロードし、`out/version.h`（`APP_VERSION`）生成 →（`-Test` ならテスト exe の cl で終了）→ rc → cl の順に実行する。
 
 ## テスト方法
 
-自動テストは無い。`out/redntfy.exe` を起動して動作確認する。
+単体テストは `task test` で実行する。実体は tests/test_main.cpp で、src/main.cpp を丸ごと
+include して static 関数を直接検査する自前ミニハーネスだ。対象は純粋ロジックのみで、
+HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/redntfy.exe` を起動して行う。
 
 - `[redmine]` の url / api_key / query_ids がどちらの toml にも無い場合、終了せず無効モードで常駐する（接続情報なしでの起動確認に使える）
   - 無効モード：トレイが `app-disable.ico`、tooltip が原因別の案内文言、「今すぐ更新」非活性、左クリック一覧なし、ポーリングなし。復帰は再起動のみ

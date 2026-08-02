@@ -1,7 +1,7 @@
 # vi: ts=4 sw=4 ff=unix fenc=utf-8
 # redntfy ビルドスクリプト
 # DevShell モジュール経由で VC++ ビルド環境を初期化し、rc/cl でビルドする。
-param([string]$Version = "0.0.0", [switch]$Release)
+param([string]$Version = "0.0.0", [switch]$Release, [switch]$Test)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 $Version = $Version -replace '^v', ''
@@ -40,10 +40,23 @@ $devShellDll = Join-Path $vsPath "Common7\Tools\Microsoft.VisualStudio.DevShell.
 Import-Module $devShellDll
 Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments "-arch=x64"
 
+"#define APP_VERSION L`"$Version`"" | Set-Content -Encoding UTF8NoBOM out\version.h
+
+# 単体テストのビルド（-Test 時のみ。rc は不要で、最適化なしでコンパイル時間を優先する）
+# テストはコンソール exe のため main をエントリに明示し、main.cpp 側の wmain と共存させる
+if ($Test) {
+    cl /nologo /utf-8 /std:c++20 /EHsc /Od /I out\ /I "$vcpkgInclude" `
+        /Foout\ /Feout\redntfy_test.exe `
+        tests\test_main.cpp `
+        /link /SUBSYSTEM:CONSOLE /ENTRY:mainCRTStartup `
+        windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib gdi32.lib `
+        "$vcpkgLib\ebur128.lib"
+    if ($LASTEXITCODE) { exit 1 }
+    exit 0
+}
+
 rc /nologo /fo out\resource.res src\resource.rc
 if ($LASTEXITCODE) { exit 1 }
-
-"#define APP_VERSION L`"$Version`"" | Set-Content -Encoding UTF8NoBOM out\version.h
 
 # リリースモード時の追加フラグ
 $clExtra   = if ($Release) { @('/DNDEBUG', '/GL', '/Gy') } else { @() }

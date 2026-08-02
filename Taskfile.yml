@@ -51,6 +51,13 @@ tasks:
       - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}}
       - task: copy-assets
 
+  test:
+    desc: 単体テストをビルドして実行
+    cmds:
+      - mkdir -p {{.OUT_DIR}}
+      # ビルド直後の exe がウイルス対策ソフトに隔離される前に実行するため、同一コマンドで連結する
+      - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}} -Test && {{.OUT_DIR}}/redntfy_test.exe
+
   rebuild:
     desc: 実行中のバイナリを停止し、クリーンビルドして再起動する
     cmds:
