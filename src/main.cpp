@@ -452,6 +452,9 @@ static SYSTEMTIME shiftSystemTime(SYSTEMTIME st, long long offsetHns) {
 // JST オフセット（100 ナノ秒単位で +9 時間）
 static constexpr long long JST_OFFSET_HNS = 9LL * 60 * 60 * 10000000LL;
 
+// 100 ナノ秒単位の 1 日（通算日の算出用）
+static constexpr long long HNS_PER_DAY = 24LL * 60 * 60 * 10000000LL;
+
 // UTC SYSTEMTIME を JST SYSTEMTIME に変換する
 static SYSTEMTIME utcToJst(SYSTEMTIME st) { return shiftSystemTime(st, +JST_OFFSET_HNS); }
 
@@ -485,6 +488,46 @@ static DueDateView makeDueDateView(const std::string& due, int todayYmd) {
     if (y != todayYmd / 10000) v.text = std::to_wstring(y) + L"/" + v.text;
     v.overdue = (y * 10000 + m * 100 + d) <= todayYmd;
     return v;
+}
+
+// UTC の SYSTEMTIME を JST の通算日（1601-01-01 起点の日数）へ変換する
+// カレンダー日付差の算出用。YYYYMMDD 整数と違い月またぎの引き算がそのまま日数になる。
+static long long jstDaySerial(const SYSTEMTIME& utc) {
+    return static_cast<long long>(systemTimeToUli(utcToJst(utc)).QuadPart / HNS_PER_DAY);
+}
+
+// JST の今日を通算日で返す（経過日数表示の基準日）
+// 呼び出し側で 1 回だけ求めて全行に使い、一覧の途中で日付が変わって表示が揺れることを防ぐ。
+static long long todayJstDaySerial() {
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    return jstDaySerial(st);
+}
+
+// updated_on（UTC ISO 8601）から一覧行末尾の経過日数表示を作る
+// JST のカレンダー日付差で「（今日）」「（昨日）」「（x 日前）」を返す。
+// 解釈不能・空（旧形式 pins.json 由来のピン等）は空文字列を返し、何も表示しない。
+// クロックずれで未来になったら「（今日）」へ丸める。
+static std::wstring makeUpdatedAgoText(const std::string& updatedOn, long long todayDays) {
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+    if (sscanf_s(updatedOn.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6)
+        return L"";
+    SYSTEMTIME st = {};
+    st.wYear   = static_cast<WORD>(y);
+    st.wMonth  = static_cast<WORD>(mo);
+    st.wDay    = static_cast<WORD>(d);
+    st.wHour   = static_cast<WORD>(h);
+    st.wMinute = static_cast<WORD>(mi);
+    st.wSecond = static_cast<WORD>(s);
+    // 実在しない日付（2/31 等）や範囲外の時分秒は変換失敗で弾く。systemTimeToUli は
+    // 変換失敗を検知せずゼロを返すため、ここで検証しないと通算日 0 との差が
+    // 桁外れの「x 日前」表示になる
+    FILETIME ft;
+    if (!SystemTimeToFileTime(&st, &ft)) return L"";
+    long long diff = todayDays - jstDaySerial(st);
+    if (diff <= 0) return L"（今日）";
+    if (diff == 1) return L"（昨日）";
+    return L"（" + std::to_wstring(diff) + L" 日前）";
 }
 
 // 現在時刻を Redmine の updated_on と同形式の UTC ISO 8601 文字列で返す
@@ -3126,9 +3169,10 @@ static constexpr wchar_t GROUP_MARK[] = L"👥 ";
 static constexpr wchar_t BUG_MARK[] = L"💥 ";
 
 // 一覧行のラベルを組み立てる
-//   並びは「番号、姓、グループ担当マーカー、[プロジェクト名]、期日、バグマーカー、件名」
-//   （例："#12345  山田  👥 [ロケモニ] 7/28 💥 件名"。番号と姓の後は空白 2、
+//   並びは「番号、姓、グループ担当マーカー、[プロジェクト名]、期日、バグマーカー、件名、経過日数」
+//   （例："#12345  山田  👥 [ロケモニ] 7/28 💥 件名（3 日前）"。番号と姓の後は空白 2、
 //   閉じ角括弧と期日の後は空白 1）
+//   経過日数（今日／昨日／x 日前）は件名の切り詰めの後に通常色で付け、更新の古さをひと目で示す。
 //   角括弧は半角とし、project_max_chars の計数には含めない。
 //   閉じ角括弧の後に空白を入れるのは、件名が [緊急] のように角括弧で始まる行で
 //   境界を見失うため。
@@ -3139,7 +3183,8 @@ static constexpr wchar_t BUG_MARK[] = L"💥 ";
 //   （ranges はオフセット昇順で並べる。ここでの追記順がそのまま昇順になる）
 // 引数に ListRow を丸ごと取るのは、同じ型の要素が増えて位置引数では取り違えを防げないため。
 // ピン記号はラベルに含めない。WM_DRAWITEM が IssueItem::pinned を見てマーカー列に描く。
-static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due) {
+static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
+                                  long long todayDays) {
     IssueLabel r;
     r.text = L"#" + std::to_wstring(row.id) + L"  ";
     if (!row.updater.empty()) r.text += toWide(row.updater) + L"  ";
@@ -3170,6 +3215,8 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due) {
     }
     r.text += truncateText(toWide(row.subject),
                            static_cast<size_t>(g_currentConfig.subjectMaxChars));
+    // 経過日数は件名の切り詰めの外に置き、長い件名でも必ず見えるようにする
+    r.text += makeUpdatedAgoText(row.updatedOn, todayDays);
     return r;
 }
 
@@ -3219,14 +3266,15 @@ static void showIssuePopup(HWND hWnd) {
     int visible = 0;
     auto rows = buildListRows(visible);
 
-    // 「今日」は 1 回だけ求めて全行に使う。行ごとに求めると日付境界をまたいだ瞬間に
-    // 同じ一覧内で赤判定が揺れる
+    // 「今日」（期日の赤判定用）と経過日数の基準日は 1 回だけ求めて全行に使う。
+    // 行ごとに求めると日付境界をまたいだ瞬間に同じ一覧内で判定が揺れる
     const int todayYmd = todayJstYmd();
+    const long long todayDays = todayJstDaySerial();
     auto makeItem = [&](const ListRow& row) {
         IssueItem it;
         it.id  = row.id;
         it.url = issueUrl(cfg, row.id);
-        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd));
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), todayDays);
         it.label  = std::move(lbl.text);
         it.ranges = std::move(lbl.ranges);
         it.unread = row.unread;
