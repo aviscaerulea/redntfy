@@ -1618,8 +1618,11 @@ static std::wstring issuesFilterQuery(int queryId) {
 }
 
 // 保存クエリ 1 件の結果を total_count に達するまでページングして取得する
-// 成功時 true。ソートは行わない。（呼び出し側が和集合を作ってからまとめてソートする）
-// API の sort には依存しない。（query_id 側のソート設定に左右されないため取得後にローカルでソートする）
+// 成功時 true。表示順のソートは行わない。（呼び出し側が和集合を作ってからまとめてソートする）
+// API には sort=id を明示指定する。既定やクエリ設定のソート（updated_on 等）は
+// ページ取得の合間にチケットが更新されると順位が動き、オフセット走査で同一チケットの
+// 重複や取りこぼしが起きる。取りこぼしは次回ポーリングで「新規」誤通知になるため、
+// ページング中に順位が変わらない安定キー id で走査する。（表示順には使わない）
 // 失敗ログにクエリ id を含めるのは、複数クエリ運用でどのクエリが壊れているかを
 // ログだけで切り分けられるようにするため。
 // outAuthError は省略可（nullptr）。HTTP 401 検出時に true を書き込む。呼び出し側が
@@ -1640,7 +1643,7 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
     int total  = 0;
     do {
         std::wstring url = cfg.redmineUrl + L"/issues.json?" + issuesFilterQuery(queryId)
-            + L"&limit=100&offset=" + std::to_wstring(offset);
+            + L"&sort=id&limit=100&offset=" + std::to_wstring(offset);
         DWORD status = 0;
         auto body = redmineGet(url, cfg.apiKey, &status);
         if (status != 200 || body.empty()) {
