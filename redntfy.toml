@@ -56,14 +56,15 @@ bug_trackers = ["*バグ*", "*障害*"]
 # デフォルト 24。（1〜168）
 # version_meta_refresh_hours = 24
 
-# Redmine 接続設定（必須）
-# 3 キーとも redntfy.local.toml に記載する。
-# いずれかが欠けると無効モードで常駐する。（トレイの案内に従い、設定後に再起動）
+# Redmine 接続設定（url と api_key は必須）
+# redntfy.local.toml に記載する。
+# url と api_key のどちらかが欠けると無効モードで常駐する。（トレイの案内に従い、設定後に再起動）
 # url       ：Redmine の URL（http:// または https:// で始まる）
 # api_key   ：Redmine の「個人設定」→「API アクセスキー」で取得した値
 # query_ids ：プロジェクトを指定せずに保存したグローバル保存クエリの id を配列で指定する。
 #             複数指定時は全クエリの和集合を追跡する。先頭の id は複数件通知・一覧フッタから
 #             開くクエリ画面に使う。
+#             省略時は自分（と所属グループ）が担当のオープンチケットを対象にする。
 [redmine]
 # url       = "https://redmine.example.com"
 # api_key   = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"

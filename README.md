@@ -43,22 +43,26 @@ zip から手動で導入する場合、[Releases](https://github.com/aviscaerul
 初回セットアップの手順です。
 画像付きの詳しい手順は [セットアップガイド](https://aviscaerulea.github.io/redntfy/) を参照してください。
 
-1. Redmine で **プロジェクトを指定せず** にチケット一覧を絞り込み、カスタムクエリとして保存する
-   - 特定プロジェクト配下で保存したクエリは API から参照できないため、必ずグローバルクエリとして作成する
-   - 保存後の URL `/issues?query_id=N` の `N` を控える（複数クエリを追跡する場合は各クエリ分）
-2. Redmine の「個人設定」→「API アクセスキー」でキーを取得する
-3. `redntfy.exe` と同じフォルダに `redntfy.local.toml` を作成し、接続情報を記載する
+1. Redmine の「個人設定」→「API アクセスキー」でキーを取得する
+2. `redntfy.exe` と同じフォルダに `redntfy.local.toml` を作成し、接続情報を記載する
 
    ```toml
    [redmine]
-   url       = "https://redmine.example.com"
-   api_key   = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-   query_ids = [12, 34]
+   url     = "https://redmine.example.com"
+   api_key = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
    ```
 
-4. `redntfy.exe` を起動する
+3. `redntfy.exe` を起動する
 
 `redntfy.local.toml` が無いまま起動しても大丈夫です。テンプレートを自動生成して設定ファイルを開き、キーの取得ページへ案内します。
+
+これだけで、自分（と所属グループ）が担当のオープンチケットの追跡が始まります。
+追跡範囲を自分で調整したい場合は、Redmine のカスタムクエリを作成して `query_ids` を設定します。
+
+1. Redmine で **プロジェクトを指定せず** にチケット一覧を絞り込み、カスタムクエリとして保存する
+   - 特定プロジェクト配下で保存したクエリは API から参照できないため、必ずグローバルクエリとして作成する
+2. 保存後の URL `/issues?query_id=N` の `N` を控える（複数クエリを追跡する場合は各クエリ分）
+3. `redntfy.local.toml` に `query_ids = [12, 34]` の形式で追記して再起動する
 
 起動後の日常操作は以下のとおりです。
 
@@ -81,9 +85,24 @@ zip から手動で導入する場合、[Releases](https://github.com/aviscaerul
 | `[app]` | `list_format` | 一覧の行フォーマット（プレースホルダ指定） |
 | `[app]` | `bug_trackers` | 💥 を付けるトラッカー名のパターン |
 | `[app]` | `duck_targets` | 通知音再生中にミュートするプロセス名 |
-| `[redmine]` | `url`, `api_key`, `query_ids` | 接続情報（必須） |
+| `[redmine]` | `url`, `api_key` | 接続情報（必須） |
+| `[redmine]` | `query_ids` | 追跡する保存クエリの id（省略時は担当チケットを追跡） |
 | `[loudness]` | `enabled`, `target` | 通知音のラウドネス正規化 |
 | `[update]` | `enabled` | 起動時の更新チェック |
+
+### query_ids の設定あり・なしの違い
+
+`query_ids` は省略できます。設定の有無で追跡対象が次のように変わります。
+
+| 項目 | 設定あり | 設定なし |
+| --- | --- | --- |
+| 追跡対象 | 指定した保存クエリの和集合 | 自分（と所属グループ）が担当のオープンチケット |
+| 事前準備 | Redmine でカスタムクエリの作成が必要 | `url` と `api_key` だけで使える |
+| 追跡範囲の調整 | クエリのフィルタで自由に絞り込める | 固定（絞り込み不可） |
+| 通知・一覧から開く画面 | 先頭クエリの一覧画面 | 担当者を自分で絞ったチケット一覧 |
+
+まずは設定なしで使い始め、追跡範囲を調整したくなったらカスタムクエリを作成して `query_ids` を設定する使い方がおすすめです。
+設定の切り替え時に通知があふれることはありません。
 
 ## 制限事項
 

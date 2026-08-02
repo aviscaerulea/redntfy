@@ -27,13 +27,16 @@ build.ps1 は `Microsoft.VisualStudio.DevShell.dll` + `Enter-VsDevShell` で VC+
 include して static 関数を直接検査する自前ミニハーネスだ。対象は純粋ロジックのみで、
 HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/redntfy.exe` を起動して行う。
 
-- `[redmine]` の url / api_key / query_ids がどちらの toml にも無い場合、終了せず無効モードで常駐する（接続情報なしでの起動確認に使える）
+- `[redmine]` の url / api_key がどちらの toml にも無い場合、終了せず無効モードで常駐する（接続情報なしでの起動確認に使える）
   - 無効モード：トレイが `app-disable.ico`、tooltip が原因別の案内文言、「今すぐ更新」非活性、左クリック一覧なし、ポーリングなし。復帰は再起動のみ
-  - 3 分岐とも `redntfy.local.toml` 不在ならテンプレートを自動生成して設定ファイルを開き、セットアップガイド（GitHub Pages）をブラウザで開く
+  - 静的 2 分岐とも `redntfy.local.toml` 不在ならテンプレートを自動生成して設定ファイルを開き、セットアップガイド（GitHub Pages）をブラウザで開く
   - url 空・非 http(s)：Toast「無効な Redmine URL」（ブラウザはガイドのみ）
   - api_key 空：Toast「認証エラー／Redmine の API アクセスキーを api_key に設定してください」＋ `<url>/my/account` もブラウザで開く
-  - query_ids 空：Toast「設定エラー／Redmine のマイカスタムクエリを query_ids に設定してください」＋ `<url>/issues` もブラウザで開く
-- ポーリング中の HTTP 401（api_key 無効）と 404（query_ids 無効）は確定的な設定不備として上記の無効モードへ遷移する（Toast・設定ファイル・ブラウザ誘導も同じ）。それ以外の接続エラーは従来どおり 60 秒リトライ＋30 分クールダウンの Toast
+- query_ids 空はフォールバックモードとして正常動作する（ゼロ設定起動：url と api_key だけで使える）
+  - 取得は `/issues.json?assigned_to_id=me`（me は Redmine がサーバ側で自分＋所属グループに展開するため、グループ宛も含まれる）
+  - state.json 上は擬似クエリ id 0（`FALLBACK_QUERY_ID`）で表現し、流入検知・黙って採用の既存ロジックにそのまま乗る（query_ids の設定・解除の切替も無通知で移行する）
+  - 複数件 Toast・一覧フッタの遷移先は `<url>/issues?set_filter=1&assigned_to_id=me`（Web 側も同じ展開のため表示集合と一致する）
+- ポーリング中の HTTP 401（api_key 無効）と、query_ids 設定時の 404（query_ids 無効）は確定的な設定不備として上記の無効モードへ遷移する（Toast・設定ファイル・ブラウザ誘導は 404 なら `<url>/issues` を開く）。フォールバックモードの 404 は通常の接続エラー扱い。それ以外の接続エラーは従来どおり 60 秒リトライ＋30 分クールダウンの Toast
 - ログは `out/logs/YYYY-MM-DD.log` に出力される
 
 ## 実装上の注意点

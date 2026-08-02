@@ -5,6 +5,7 @@
  * exe 同フォルダの redntfy.toml（redntfy.local.toml がキー単位で上書き）から設定を読み込み、
  * [redmine] で指定した複数のグローバル保存クエリ（query_ids）を schedule に従ってポーリングし、
  * チケット id で重複排除した和集合を追跡する。
+ * query_ids 省略時はフォールバックモードとして、自分（と所属グループ）が担当のオープンチケットを追跡する。
  * schedule は 0 時〜23 時の 24 要素配列。（回/時、0 でその時間帯は休止）
  * 追跡集合への新規流入と既知チケットの updated_on 進行・新クエリ流入を Toast 通知と音声で知らせる。
  * 自分が起票したチケットの流入（author.id で判定）は通知しない。
@@ -16,7 +17,7 @@
  * 終了コード：
  *   0  - 正常終了（トレイメニューの「終了」による）
  *   2  - 予期しない初期化エラー
- * [redmine] url / api_key / query_ids の未設定・無効（実行時 401/404 含む）は終了せず、
+ * [redmine] url / api_key の未設定・無効（実行時 401 含む）と query_ids 設定時の実行時 404 は終了せず、
  * 原因別の案内（Toast・設定ファイル・ブラウザ誘導）を出して無効モードで常駐する。
  * 無効モード：トレイは app-disable.ico・「今すぐ更新」非活性・ポーリング停止。復帰は再起動のみ。
  *
@@ -116,7 +117,7 @@ static constexpr UINT IDM_SOUND_ENABLED       = 40005;
 static constexpr UINT IDM_OPEN_CONFIG         = 40006;
 static constexpr UINT IDM_OPEN_LOG            = 40007;
 static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリページを開く
-static constexpr UINT IDM_OPEN_QUERY          = 40009; // Redmine の保存クエリ画面を開く
+static constexpr UINT IDM_OPEN_QUERY          = 40009; // Redmine の代表画面（保存クエリ画面、フォールバック時は担当一覧）を開く
 static constexpr UINT IDM_STARTUP             = 40010; // Windows スタートアップ登録トグル
 static constexpr UINT IDM_ASSIGNED_TO_ME      = 40011; // 担当がグループのチケットを一覧・tooltip・通知から除外するトグル
 static constexpr UINT IDM_UPDATE_NOW          = 40012; // 休止時間帯・クールダウンを無視した即時ポーリング
@@ -234,7 +235,7 @@ enum class DisabledReason : int {
     None            = 0,
     InvalidUrl      = 1,  // url 未設定または非 http(s)（静的検査のみ）
     InvalidApiKey   = 2,  // api_key 未設定（静的）または実行時 HTTP 401
-    InvalidQueryIds = 3,  // query_ids 未設定（静的）または実行時 HTTP 404
+    InvalidQueryIds = 3,  // 実行時 HTTP 404（query_ids 設定時のみ。未設定はフォールバックモードで正常動作）
 };
 static std::atomic<int> g_disabledReason{ static_cast<int>(DisabledReason::None) };
 
@@ -319,13 +320,19 @@ struct FormatToken {
 static constexpr wchar_t LIST_FORMAT_DEFAULT[] =
     L"#{id}  {lastname}  {group}[{project:5}] {due} {bug}{subject:40}{ago}";
 
+// フォールバックモード（query_ids 省略）の擬似クエリ id
+// Redmine のクエリ id は正の整数のため 0 は衝突しない。state.json の queries／
+// 各チケットの所属クエリにそのまま流し、流入検知・黙って採用の既存ロジックに乗せる
+static constexpr int FALLBACK_QUERY_ID = 0;
+
 // loadConfig の戻り値
 struct Config {
-    // [redmine] 接続設定（必須。いずれか欠けると無効モードで常駐する）
+    // [redmine] 接続設定（url・api_key は必須。いずれか欠けると無効モードで常駐する）
     std::wstring redmineUrl;       // Redmine の URL（末尾スラッシュを除去して保持する）
     std::wstring apiKey;           // 個人 API アクセスキー
-    // 追跡対象のグローバル保存クエリ id（1 個以上必須。設定の記述順を保持し std::set にしない）
+    // 追跡対象のグローバル保存クエリ id（省略可。設定の記述順を保持し std::set にしない）
     // 先頭要素は「代表クエリ」で、複数件 Toast と一覧フッタから開く URL に使う。
+    // 空のときはフォールバックモードとして、自分（と所属グループ）が担当のチケットを追跡する。
     std::vector<int> queryIds;
 
     std::vector<int>          schedule;         // 24 要素（0 時〜23 時の 1 時間あたりポーリング回数、0 で休止）
@@ -924,7 +931,8 @@ static PollState loadState(const std::wstring& dir) {
         if (obj.HasKey(L"queries")) {
             for (auto q : obj.GetNamedArray(L"queries")) {
                 int qid = static_cast<int>(q.GetNumber());
-                if (qid > 0) st.knownQueries.push_back(qid);
+                // 0 はフォールバックモードの擬似クエリ（FALLBACK_QUERY_ID）として有効
+                if (qid >= 0) st.knownQueries.push_back(qid);
             }
             std::sort(st.knownQueries.begin(), st.knownQueries.end());
         }
@@ -943,7 +951,8 @@ static PollState loadState(const std::wstring& dir) {
                     e.hasQueries = true;
                     for (auto q : o.GetNamedArray(L"queries")) {
                         int qid = static_cast<int>(q.GetNumber());
-                        if (qid > 0) e.queryIds.push_back(qid);
+                        // 0 はフォールバックモードの擬似クエリ（FALLBACK_QUERY_ID）として有効
+                        if (qid >= 0) e.queryIds.push_back(qid);
                     }
                     std::sort(e.queryIds.begin(), e.queryIds.end());
                 }
@@ -956,6 +965,14 @@ static PollState loadState(const std::wstring& dir) {
         writeLog("state: parse failed, re-establishing baseline");
         return PollState{};  // 破損時はベースライン未確立として通知せず作り直す
     }
+}
+
+// 今回追跡するクエリ id 集合を返す
+// query_ids 省略（フォールバックモード）時は擬似クエリ FALLBACK_QUERY_ID の 1 件とし、
+// state.json の queries・新規追跡ログを通常クエリと同じ仕組みで扱えるようにする。
+static std::vector<int> trackedQueryIds(const Config& cfg) {
+    if (cfg.queryIds.empty()) return {FALLBACK_QUERY_ID};
+    return cfg.queryIds;
 }
 
 // 検知済み状態の保存
@@ -973,7 +990,7 @@ static bool saveState(const std::wstring& dir, const Config& cfg, const std::vec
         root.Insert(L"baseline", JsonValue::CreateBooleanValue(true));
         root.Insert(L"polled_on", JsonValue::CreateStringValue(winrt::to_hstring(nowUtcIso())));
         JsonArray qarr;
-        for (int q : cfg.queryIds) qarr.Append(JsonValue::CreateNumberValue(q));
+        for (int q : trackedQueryIds(cfg)) qarr.Append(JsonValue::CreateNumberValue(q));
         root.Insert(L"queries", qarr);
         JsonArray arr;
         for (const auto& is : issues) {
@@ -1271,7 +1288,8 @@ static Config loadConfig(const std::wstring& exeDir) {
         return ids;
     };
 
-    // [redmine] 接続設定（必須。欠落チェックは wmain で行い、欠けていれば無効モードで常駐する）
+    // [redmine] 接続設定（url・api_key の欠落チェックは wmain で行い、欠けていれば無効モードで常駐する。
+    // query_ids は省略可でフォールバックモードになる）
     cfg.redmineUrl = readRedmineString("url");
     while (!cfg.redmineUrl.empty() && cfg.redmineUrl.back() == L'/')
         cfg.redmineUrl.pop_back();  // 末尾スラッシュを除去して URL 連結を単純化する
@@ -1326,13 +1344,14 @@ static std::wstring issueUrl(const Config& cfg, int id) {
     return cfg.redmineUrl + L"/issues/" + std::to_wstring(id);
 }
 
-// 代表クエリ（query_ids の先頭）の画面 URL（{url}/issues?query_id={qid}）
-// 複数件 Toast と一覧フッタの遷移先。和集合を表す URL は Redmine に無いため先頭で代表する。
+// 代表画面の URL（複数件 Toast と一覧フッタの遷移先）
+// 通常は代表クエリ（query_ids の先頭）の画面。和集合を表す URL は Redmine に無いため先頭で代表する。
+// フォールバックモード（query_ids 空）は担当フィルタ付き一覧。Web 側も me を
+// 自分＋所属グループに展開するため、アプリの表示集合と同じ範囲が開く。
 static std::wstring queryUrl(const Config& cfg) {
-    // query_ids 空は無効モードになり本関数へは到達しない（ポーリング停止・一覧非表示のため）が、
-    // 万一空で呼ばれても 0 に落として未定義動作を作らない
-    int qid = cfg.queryIds.empty() ? 0 : cfg.queryIds.front();
-    return cfg.redmineUrl + L"/issues?query_id=" + std::to_wstring(qid);
+    if (cfg.queryIds.empty())
+        return cfg.redmineUrl + L"/issues?set_filter=1&assigned_to_id=me";
+    return cfg.redmineUrl + L"/issues?query_id=" + std::to_wstring(cfg.queryIds.front());
 }
 
 // ワイルドカード照合（`*` は 0 文字以上の任意列に一致する）
@@ -1574,6 +1593,16 @@ static bool projectHasAnyVersion(const Config& cfg, int projectId,
     }
 }
 
+// /issues.json のフィルタクエリ文字列を組み立てる（純粋関数。単体テスト対象）
+// 通常クエリは query_id=N。FALLBACK_QUERY_ID は assigned_to_id=me とする。
+// me は Redmine がサーバ側で「自分の user id ＋所属グループ id」に展開するため
+// （query.rb の me 置換。Redmine 2.1 以降）、グループ宛チケットも取得に含まれる。
+static std::wstring issuesFilterQuery(int queryId) {
+    if (queryId != FALLBACK_QUERY_ID)
+        return L"query_id=" + std::to_wstring(queryId);
+    return L"assigned_to_id=me";
+}
+
 // 保存クエリ 1 件の結果を total_count に達するまでページングして取得する
 // 成功時 true。ソートは行わない。（呼び出し側が和集合を作ってからまとめてソートする）
 // API の sort には依存しない。（query_id 側のソート設定に左右されないため取得後にローカルでソートする）
@@ -1584,6 +1613,8 @@ static bool projectHasAnyVersion(const Config& cfg, int projectId,
 // outQueryError は省略可（nullptr）。HTTP 404 検出時に true を書き込む。
 // Redmine は存在しない・削除済み・プロジェクト配下の非グローバル・アクセス権のないクエリの
 // いずれでも 404 を返し、どれも query_ids の修正なしにはリトライで解決しない確定的な失敗。
+// ただし queryId が FALLBACK_QUERY_ID のときは書き込まない。（担当フィルタの 404 は
+// 設定不備を意味しないため、無効モードに落とさず通常の接続エラーとして扱う）
 // ネットワーク断は status 0、サーバ障害は 5xx になるため 404 と混同しない。
 static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>& outIssues,
                              bool* outAuthError = nullptr, bool* outQueryError = nullptr) {
@@ -1594,7 +1625,7 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
     int offset = 0;
     int total  = 0;
     do {
-        std::wstring url = cfg.redmineUrl + L"/issues.json?query_id=" + std::to_wstring(queryId)
+        std::wstring url = cfg.redmineUrl + L"/issues.json?" + issuesFilterQuery(queryId)
             + L"&limit=100&offset=" + std::to_wstring(offset);
         DWORD status = 0;
         auto body = redmineGet(url, cfg.apiKey, &status);
@@ -1602,7 +1633,7 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
             writeLog(logTag + ": request failed, status=" + std::to_string(status)
                 + " offset=" + std::to_string(offset));
             if (status == 401 && outAuthError)  *outAuthError  = true;
-            if (status == 404 && outQueryError) *outQueryError = true;
+            if (status == 404 && queryId != FALLBACK_QUERY_ID && outQueryError) *outQueryError = true;
             return false;
         }
         try {
@@ -1639,6 +1670,8 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
 // query_ids の全クエリを取得し、チケット id で重複排除した和集合を返す
 // 成功時 true。outIssues は updated_on 降順ソート済みで、各要素の queryIds に
 // 「そのチケットが現れたクエリ id」を昇順で保持する。
+// query_ids 省略（フォールバックモード）時は擬似クエリ FALLBACK_QUERY_ID の 1 件として
+// 自分（と所属グループ）が担当のチケットを取得し、所属は {FALLBACK_QUERY_ID} になる。
 // 1 クエリでも失敗したら全体を false として部分結果を破棄する。欠落込みの集合で
 // state.json を上書きすると次回に「新規」誤通知が出るため。（単一クエリ時代の方針を維持）
 // outAuthError は省略可。fetchQueryIssues のいずれかで HTTP 401 を観測したときに true を書く。
@@ -1647,7 +1680,7 @@ static bool fetchIssues(const Config& cfg, std::vector<Issue>& outIssues,
                         bool* outAuthError = nullptr, bool* outQueryError = nullptr) {
     outIssues.clear();
     std::unordered_map<int, size_t> indexById;  // チケット id → outIssues の位置
-    for (int qid : cfg.queryIds) {
+    for (int qid : trackedQueryIds(cfg)) {
         std::vector<Issue> part;
         if (!fetchQueryIssues(cfg, qid, part, outAuthError, outQueryError)) return false;
         for (auto& is : part) {
@@ -3815,7 +3848,7 @@ static void handleTrayCommand(UINT id) {
         return;
     }
     if (id == IDM_OPEN_QUERY) {
-        // Redmine の保存クエリ画面をブラウザで開く。
+        // Redmine の代表画面（queryUrl）をブラウザで開く。
         // 無効モード中は一覧が開けず本来到達しないが、url が isHttpUrl 未検証のまま
         // ShellExecuteW へ渡る経路を将来にわたり残さないための直接ガード
         if (isDisabled()) return;
@@ -4095,10 +4128,11 @@ static void ensureLocalTomlTemplate(const std::wstring& exeDir) {
         "##################################################\n"
         "# redntfy.toml と同名のキーをキー単位で上書きする。接続情報はこちらに書く。\n"
         "\n"
-        "# Redmine 接続設定（必須）\n"
+        "# Redmine 接続設定（url と api_key は必須）\n"
         "# url       ：Redmine の URL（http:// または https:// で始まる）\n"
         "# api_key   ：Redmine の「個人設定」→「API アクセスキー」で取得した値\n"
         "# query_ids ：プロジェクトを指定せずに保存したグローバル保存クエリの id を配列で指定する。\n"
+        "#             省略時は自分（と所属グループ）が担当のオープンチケットを対象にする。\n"
         "[redmine]\n"
         "# url       = \"https://redmine.example.com\"\n"
         "# api_key   = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n"
@@ -4400,7 +4434,7 @@ static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         writeLog("state: v1 format (no query membership), adopting membership silently");
     }
     else {
-        for (int q : cfg.queryIds) {
+        for (int q : trackedQueryIds(cfg)) {
             if (std::find(prev.knownQueries.begin(), prev.knownQueries.end(), q)
                     == prev.knownQueries.end())
                 writeLog("state: query " + std::to_string(q)
@@ -4477,7 +4511,7 @@ static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
                           kind, issueUrl(cfg, t->id));
             }
             else {
-                // 複数件：合計件数のみのサマリ 1 通とし、クリックで代表クエリ画面（query_ids の先頭）を開く
+                // 複数件：合計件数のみのサマリ 1 通とし、クリックで代表画面（queryUrl）を開く
                 showToast(L"チケットが " + std::to_wstring(targets.size()) + L" 件更新されました",
                           L"",
                           queryUrl(cfg));
@@ -4849,7 +4883,7 @@ int wmain() {
         auto cfg = loadConfig(exeDir);
 
         // 必須キーの静的検証（欠けていても終了せず、無効モードで常駐する）
-        // 3 分岐で原因ごとに案内する。url のスキームもここで検証する。
+        // 2 分岐（url・api_key）で原因ごとに案内する。url のスキームもここで検証する。
         // InvalidUrl のとき redmineUrl は ShellExecuteW を通るどの経路にも到達しない：
         // ポーリング停止・一覧非表示（フッタのクエリ画面も開けない）・enterDisabledMode は
         // InvalidUrl では Redmine 由来の URL を開かない。（定数のガイド URL は開く）
@@ -4863,10 +4897,9 @@ int wmain() {
             writeLog("config error: [redmine] api_key is empty - disabled mode");
             initReason = DisabledReason::InvalidApiKey;
         }
-        else if (cfg.queryIds.empty()) {
-            writeLog("config error: [redmine] query_ids is empty - disabled mode");
-            initReason = DisabledReason::InvalidQueryIds;
-        }
+        // query_ids 省略はフォールバックモード（担当チケット追跡）として正常動作する
+        if (initReason == DisabledReason::None && cfg.queryIds.empty())
+            writeLog("config: query_ids not set - assigned-to-me fallback mode");
         // addTrayIcon より前に確定させる（登録時から無効アイコンで出すため）
         g_disabledReason.store(static_cast<int>(initReason));
 
@@ -4891,7 +4924,8 @@ int wmain() {
         {
             std::string s;
             for (int q : cfg.queryIds) s += (s.empty() ? "" : ",") + std::to_string(q);
-            writeLog("query_ids: [" + s + "]");
+            writeLog("query_ids: [" + s + "]"
+                + (cfg.queryIds.empty() ? " (assigned-to-me fallback)" : ""));
         }
 
         // 更新チェックスレッド起動（起動時に 1 回のみ実行、detach で分離）

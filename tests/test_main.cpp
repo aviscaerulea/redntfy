@@ -356,6 +356,33 @@ static void testNormalizeSpaces() {
     CHECK(normalizeSpaces("no wide") == "no wide");
 }
 
+// ==================== issuesFilterQuery / trackedQueryIds / queryUrl ====================
+
+static void testIssuesFilterQuery() {
+    CHECK_WSTR(issuesFilterQuery(12), L"query_id=12");
+    // フォールバックモード：me は Redmine がサーバ側で自分＋所属グループに展開する
+    CHECK_WSTR(issuesFilterQuery(FALLBACK_QUERY_ID), L"assigned_to_id=me");
+}
+
+static void testTrackedQueryIds() {
+    Config cfg;
+    cfg.queryIds = {12, 34};
+    CHECK(trackedQueryIds(cfg) == (std::vector<int>{12, 34}));
+    // 省略時は擬似クエリ 1 件
+    cfg.queryIds.clear();
+    CHECK(trackedQueryIds(cfg) == (std::vector<int>{FALLBACK_QUERY_ID}));
+}
+
+static void testQueryUrl() {
+    Config cfg;
+    cfg.redmineUrl = L"https://r.example";
+    cfg.queryIds = {12, 34};
+    CHECK_WSTR(queryUrl(cfg), L"https://r.example/issues?query_id=12");
+    // フォールバックモードは担当フィルタ付き一覧
+    cfg.queryIds.clear();
+    CHECK_WSTR(queryUrl(cfg), L"https://r.example/issues?set_filter=1&assigned_to_id=me");
+}
+
 // ==================== passesVersionFilter ====================
 
 static void testPassesVersionFilter() {
@@ -402,6 +429,9 @@ int main() {
     testEscapeXml();
     testIsHttpUrl();
     testNormalizeSpaces();
+    testIssuesFilterQuery();
+    testTrackedQueryIds();
+    testQueryUrl();
     testPassesVersionFilter();
     printf("checks: %d, failed: %d\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

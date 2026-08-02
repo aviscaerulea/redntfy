@@ -44,22 +44,26 @@ Initial setup:
 
 A step-by-step guide with screenshots is available in the [setup guide](https://aviscaerulea.github.io/redntfy/) (written in Japanese).
 
-1. In Redmine, filter the issue list **without specifying a project** and save it as a custom query
-   - Queries saved under a specific project cannot be referenced via the API, so they must be created as global queries
-   - Take note of `N` in the resulting URL `/issues?query_id=N` (one per query if you track multiple)
-2. Obtain an API key from "My account" → "API access key" in Redmine
-3. Create `redntfy.local.toml` next to `redntfy.exe` and write the connection settings
+1. Obtain an API key from "My account" → "API access key" in Redmine
+2. Create `redntfy.local.toml` next to `redntfy.exe` and write the connection settings
 
    ```toml
    [redmine]
-   url       = "https://redmine.example.com"
-   api_key   = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-   query_ids = [12, 34]
+   url     = "https://redmine.example.com"
+   api_key = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
    ```
 
-4. Launch `redntfy.exe`
+3. Launch `redntfy.exe`
 
 It is fine to launch without `redntfy.local.toml`. The app generates a template automatically, opens the configuration file, and guides you to the page where the key can be obtained.
+
+That is all it takes — the app starts tracking open tickets assigned to you (and your groups).
+If you want to tune the tracking scope yourself, create custom queries in Redmine and set `query_ids`.
+
+1. In Redmine, filter the issue list **without specifying a project** and save it as a custom query
+   - Queries saved under a specific project cannot be referenced via the API, so they must be created as global queries
+2. Take note of `N` in the resulting URL `/issues?query_id=N` (one per query if you track multiple)
+3. Add `query_ids = [12, 34]` to `redntfy.local.toml` and restart
 
 Everyday operations:
 
@@ -82,9 +86,24 @@ The main configuration keys are listed below. See the comments in `redntfy.toml`
 | `[app]` | `list_format` | Row format of the list (placeholder based) |
 | `[app]` | `bug_trackers` | Tracker-name patterns that get a 💥 icon |
 | `[app]` | `duck_targets` | Process names to mute while a sound plays |
-| `[redmine]` | `url`, `api_key`, `query_ids` | Connection settings (required) |
+| `[redmine]` | `url`, `api_key` | Connection settings (required) |
+| `[redmine]` | `query_ids` | Saved-query ids to track (if omitted, tracks tickets assigned to you) |
 | `[loudness]` | `enabled`, `target` | Loudness normalization for the notification sound |
 | `[update]` | `enabled` | Update check at startup |
+
+### With and without query_ids
+
+`query_ids` is optional. Tracking behaves as follows depending on whether it is set.
+
+| Aspect | Set | Not set |
+| --- | --- | --- |
+| Tracked tickets | Union of the specified saved queries | Open tickets assigned to you (and your groups) |
+| Preparation | Requires creating custom queries in Redmine | Works with just `url` and `api_key` |
+| Scope tuning | Freely adjustable via query filters | Fixed (no filtering) |
+| Screen opened from notifications/list | The first query's issue list | The issue list filtered by assignee = me |
+
+A good way to start is without `query_ids`, then create custom queries and set it once you want to tune the tracking scope.
+Switching the setting does not flood you with notifications.
 
 ## Limitations
 
