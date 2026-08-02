@@ -76,6 +76,7 @@ zip から手動で導入する場合、[Releases](https://github.com/aviscaerul
 | --- | --- | --- |
 | `[app]` | `schedule` | 24 時間分のポーリング回数（回/時） |
 | `[app]` | `list_limit` | 一覧の表示件数（デフォルト 20） |
+| `[app]` | `list_format` | 一覧の行フォーマット（プレースホルダ指定） |
 | `[app]` | `bug_trackers` | 💥 を付けるトラッカー名のパターン |
 | `[app]` | `duck_targets` | 通知音再生中にミュートするプロセス名 |
 | `[redmine]` | `url`, `api_key`, `query_ids` | 接続情報（必須） |

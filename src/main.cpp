@@ -279,6 +279,7 @@ struct Issue {
     int         updaterId = 0;     // 自分の操作による通知の抑止判定に使う（0 = 未確定）
     std::string updaterName;       // フルネーム（Toast の「更新：○○」表示用）
     std::string updaterDisplay;    // 一覧の表示名（姓。取得できない場合はフルネーム）
+    std::string updaterFirstName;  // 一覧の {firstname} 用（姓と違いフォールバックせず、未取得は空）
 };
 
 // ピン留め 1 件分
@@ -293,7 +294,27 @@ struct PinEntry {
     bool assignedToGroup = false;  // 担当がグループ（👥 マーカー。集合外ピンも表示できるよう永続化）
     bool isBugTracker    = false;  // バグ・障害トラッカー（💥 マーカー。集合外ピンも表示できるよう永続化）
     std::string updaterDisplay;    // 最終更新者の表示名（姓。集合外ピンも表示できるよう永続化）
+    std::string updaterFirst;      // 最終更新者の名（{firstname} 用。集合外ピンも表示できるよう永続化）
 };
+
+// 一覧行フォーマットの要素種別（FormatToken::element の値）
+enum FormatElement {
+    FMT_LITERAL = -1,  // リテラル文字列（未知プレースホルダの原文もこれで保持）
+    FMT_ID, FMT_LASTNAME, FMT_FIRSTNAME, FMT_GROUP, FMT_PROJECT,
+    FMT_DUE, FMT_BUG, FMT_SUBJECT, FMT_AGO,
+};
+
+// list_format の解析済みトークン
+// 起動時に 1 回解析して保持し、行組み立て（buildIssueLabel）はこの列の走査だけで済ませる。
+struct FormatToken {
+    std::wstring literal;              // FMT_LITERAL のときの出力文字列
+    int          element = FMT_LITERAL;
+    int          maxChars = 0;         // 最大文字数（0 = 切り詰めなし）
+};
+
+// list_format の既定値（v1.4 までの固定並びと同一の表示になる）
+static constexpr wchar_t LIST_FORMAT_DEFAULT[] =
+    L"#{id}  {lastname}  {group}[{project:5}] {due} {bug}{subject:40}{ago}";
 
 // loadConfig の戻り値
 struct Config {
@@ -306,8 +327,8 @@ struct Config {
 
     std::vector<int>          schedule;         // 24 要素（0 時〜23 時の 1 時間あたりポーリング回数、0 で休止）
     int                       listLimit;        // 一覧の非ピン表示件数（デフォルト 20）
-    int                       subjectMaxChars;  // 件名の省略文字数（デフォルト 40）
-    int                       projectMaxChars;  // プロジェクト名の省略文字数（0 で非表示、デフォルト 5）
+    // 一覧の行フォーマット（解析済みトークン列。既定は従来の固定並びと同一）
+    std::vector<FormatToken>  listFormat;
     // 💥 を付けるトラッカー名（* のワイルドカード可。既定は空＝どのチケットにも付けない）
     // 比較対象の Redmine のトラッカー名が UTF-8 のため、wstring へ変換せず持つ
     std::vector<std::string>  bugTrackers;
@@ -867,6 +888,7 @@ struct StateEntry {
     // 最終更新者のキャッシュ（updated_on が変わっていなければ journals を引き直さないため）
     int              updaterId = 0;
     std::string      updaterDisplay;
+    std::string      updaterFirst;  // 名（旧形式はキー不在＝空で読まれ、チケット更新時に埋まる）
 };
 
 // state.json の読み込み結果
@@ -913,6 +935,7 @@ static PollState loadState(const std::wstring& dir) {
                 e.updatedOn      = std::move(up);
                 e.updaterId      = static_cast<int>(o.GetNamedNumber(L"updater_id", 0));
                 e.updaterDisplay = winrt::to_string(o.GetNamedString(L"updater", L""));
+                e.updaterFirst   = winrt::to_string(o.GetNamedString(L"updater_first", L""));
                 if (o.HasKey(L"queries")) {
                     e.hasQueries = true;
                     for (auto q : o.GetNamedArray(L"queries")) {
@@ -956,6 +979,7 @@ static bool saveState(const std::wstring& dir, const Config& cfg, const std::vec
             o.Insert(L"updated_on", JsonValue::CreateStringValue(winrt::to_hstring(is.updatedOn)));
             o.Insert(L"updater_id", JsonValue::CreateNumberValue(is.updaterId));
             o.Insert(L"updater",    JsonValue::CreateStringValue(winrt::to_hstring(is.updaterDisplay)));
+            o.Insert(L"updater_first", JsonValue::CreateStringValue(winrt::to_hstring(is.updaterFirstName)));
             JsonArray iq;
             for (int q : is.queryIds) iq.Append(JsonValue::CreateNumberValue(q));
             o.Insert(L"queries", iq);
@@ -989,6 +1013,7 @@ static void savePins(const std::wstring& dir) {
                 o.Insert(L"assigned_to_group", JsonValue::CreateBooleanValue(p.assignedToGroup));
                 o.Insert(L"bug_tracker", JsonValue::CreateBooleanValue(p.isBugTracker));
                 o.Insert(L"updater",    JsonValue::CreateStringValue(winrt::to_hstring(p.updaterDisplay)));
+                o.Insert(L"updater_first", JsonValue::CreateStringValue(winrt::to_hstring(p.updaterFirst)));
                 arr.Append(o);
             }
         }
@@ -1037,6 +1062,7 @@ static void loadPins(const std::wstring& dir) {
             // updater は集合内ピンのみ refreshPins で実値になる。（集合外ピンの個別取得は
             // journals を含まないため、保存値のまま維持される）
             p.updaterDisplay  = winrt::to_string(o.GetNamedString(L"updater", L""));
+            p.updaterFirst    = winrt::to_string(o.GetNamedString(L"updater_first", L""));
             if (p.id > 0) g_pins.push_back(std::move(p));
         }
         writeLog("pins: loaded " + std::to_string(g_pins.size()) + " entries");
@@ -1047,6 +1073,78 @@ static void loadPins(const std::wstring& dir) {
 }
 
 // ==================== 設定読み込み ====================
+
+// list_format 文字列をトークン列へ解析する
+// {要素名} または {要素名:最大文字数} を認識する。（最大文字数は 1 以上の 10 進整数のみ有効）
+// 解釈できない部分（未知の要素名・不正な長さ・閉じ括弧なし）はリテラルとして原文のまま残し、
+// ログに記録する。誤記が一覧にそのまま現れるため、ユーザが確実に気付ける。
+static std::vector<FormatToken> parseListFormat(const std::wstring& fmt) {
+    static const std::pair<const wchar_t*, int> NAMES[] = {
+        { L"id", FMT_ID }, { L"lastname", FMT_LASTNAME }, { L"firstname", FMT_FIRSTNAME },
+        { L"group", FMT_GROUP }, { L"project", FMT_PROJECT }, { L"due", FMT_DUE },
+        { L"bug", FMT_BUG }, { L"subject", FMT_SUBJECT }, { L"ago", FMT_AGO },
+    };
+    std::vector<FormatToken> tokens;
+    std::wstring lit;  // 連続するリテラル文字の蓄積（プレースホルダ確定時にトークン化する）
+    auto flushLiteral = [&]() {
+        if (!lit.empty()) {
+            tokens.push_back({.literal = std::move(lit)});
+            lit.clear();
+        }
+    };
+    size_t pos = 0;
+    while (pos < fmt.size()) {
+        if (fmt[pos] != L'{') {
+            lit += fmt[pos++];
+            continue;
+        }
+        size_t close = fmt.find(L'}', pos);
+        if (close == std::wstring::npos) {
+            // 閉じ括弧なし。残り全部をリテラルへ
+            lit += fmt.substr(pos);
+            break;
+        }
+        std::wstring inner = fmt.substr(pos + 1, close - pos - 1);
+        std::wstring name  = inner;
+        int maxChars = 0;
+        bool valid   = true;
+        if (auto colon = inner.find(L':'); colon != std::wstring::npos) {
+            name = inner.substr(0, colon);
+            std::wstring len = inner.substr(colon + 1);
+            // 桁数を 4 桁までに抑えて stoi の桁あふれも防ぐ（実用上は 3 桁で十分）
+            valid = !len.empty() && len.size() <= 4
+                && std::all_of(len.begin(), len.end(),
+                               [](wchar_t c) { return c >= L'0' && c <= L'9'; });
+            if (valid) {
+                maxChars = std::stoi(len);
+                valid = maxChars >= 1;
+            }
+        }
+        int element = FMT_LITERAL;
+        if (valid) {
+            valid = false;
+            for (const auto& [n, e] : NAMES) {
+                if (name == n) {
+                    element = e;
+                    valid   = true;
+                    break;
+                }
+            }
+        }
+        if (valid) {
+            flushLiteral();
+            tokens.push_back({.element = element, .maxChars = maxChars});
+        }
+        else {
+            std::wstring raw = fmt.substr(pos, close - pos + 1);
+            writeLog("config: list_format unrecognized placeholder: " + wideToUtf8(raw));
+            lit += raw;
+        }
+        pos = close + 1;
+    }
+    flushLiteral();
+    return tokens;
+}
 
 // TOML ファイルをパースして table を返す（ファイル不在・パースエラーは nullopt）
 static std::optional<toml::table> loadToml(const std::wstring& path) {
@@ -1140,6 +1238,12 @@ static Config loadConfig(const std::wstring& exeDir) {
         else if (base && (*base)["app"][key].is_integer())   v = **(*base)["app"][key].as_integer();
         return static_cast<int>((std::max)((long long)lo, (std::min)((long long)hi, v)));
     };
+    // [app] セクション下の文字列
+    auto readAppString = [&](const char* key) -> std::wstring {
+        if (local && (*local)["app"][key].is_string()) return toWide(**(*local)["app"][key].as_string());
+        if (base && (*base)["app"][key].is_string())   return toWide(**(*base)["app"][key].as_string());
+        return {};
+    };
     // [redmine] セクションの文字列・整数
     auto readRedmineString = [&](const char* key) -> std::wstring {
         if (local && (*local)["redmine"][key].is_string()) return toWide(**(*local)["redmine"][key].as_string());
@@ -1178,10 +1282,22 @@ static Config loadConfig(const std::wstring& exeDir) {
         writeLog("config: [redmine] query_id is obsolete; use query_ids = [12, 34]");
     }
 
-    // 一覧の表示件数と各要素の省略文字数
-    cfg.listLimit       = readAppInt("list_limit", 20, 1, 25);
-    cfg.subjectMaxChars = readAppInt("subject_max_chars", 40, 10, 120);
-    cfg.projectMaxChars = readAppInt("project_max_chars", 5, 0, 20);
+    // 一覧の表示件数と行フォーマット
+    cfg.listLimit = readAppInt("list_limit", 20, 1, 25);
+
+    // 一覧の行フォーマット（空・未指定は既定テンプレート）
+    std::wstring fmtStr = readAppString("list_format");
+    if (fmtStr.empty()) fmtStr = LIST_FORMAT_DEFAULT;
+    cfg.listFormat = parseListFormat(fmtStr);
+
+    // 旧キーは廃止。読み捨てられていることをログで補う（query_id の前例に倣う）
+    for (const char* obsolete : { "subject_max_chars", "project_max_chars" }) {
+        if ((local && (*local)["app"][obsolete].is_integer())
+            || (base && (*base)["app"][obsolete].is_integer())) {
+            writeLog(std::string("config: [app] ") + obsolete
+                + " is obsolete; use list_format placeholders like {subject:40}");
+        }
+    }
 
     // バージョン欄判定情報の再取得間隔（時間）
     cfg.versionMetaRefreshHours = readAppInt("version_meta_refresh_hours", 24, 1, 168);
@@ -1610,17 +1726,23 @@ static LastUpdater fetchLastUpdater(const Config& cfg, int id) {
     }
 }
 
-// ユーザ id から姓を取得する（セッション内キャッシュ）
-// Redmine のユーザ名文字列は姓名が無区切りで分割できない。一覧の最終更新者列に姓だけを
-// 出すため /users/{id}.json の lastname を引く。取得失敗は空をキャッシュして毎回の再試行を
-// 抑える。（呼び出し側がフルネームへフォールバックし、再起動で再試行される）
-static std::string resolveLastName(const Config& cfg, int userId,
-                                   std::unordered_map<int, std::string>& cache)
+// ユーザの姓・名（/users/{id}.json の lastname / firstname）
+struct UserNames {
+    std::string lastName;
+    std::string firstName;
+};
+
+// ユーザ id から姓・名を取得する（セッション内キャッシュ）
+// Redmine のユーザ名文字列は姓名が無区切りで分割できない。一覧の {lastname} と {firstname} に
+// 使うため /users/{id}.json を引く。取得失敗は両方空をキャッシュして毎回の再試行を抑える。
+// （呼び出し側が姓をフルネームへフォールバックし、再起動で再試行される）
+static UserNames resolveUserNames(const Config& cfg, int userId,
+                                  std::unordered_map<int, UserNames>& cache)
 {
     if (userId <= 0) return {};
     auto it = cache.find(userId);
     if (it != cache.end()) return it->second;
-    std::string lastName;
+    UserNames names;
     DWORD status = 0;
     auto body = redmineGet(cfg.redmineUrl + L"/users/" + std::to_wstring(userId) + L".json",
                            cfg.apiKey, &status);
@@ -1628,18 +1750,21 @@ static std::string resolveLastName(const Config& cfg, int userId,
         try {
             auto obj  = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
             auto user = obj.GetNamedObject(L"user", nullptr);
-            if (user) lastName = winrt::to_string(user.GetNamedString(L"lastname", L""));
+            if (user) {
+                names.lastName  = winrt::to_string(user.GetNamedString(L"lastname", L""));
+                names.firstName = winrt::to_string(user.GetNamedString(L"firstname", L""));
+            }
         }
         catch (...) {
-            writeLog("resolveLastName: JSON parse failed (user=" + std::to_string(userId) + ")");
+            writeLog("resolveUserNames: JSON parse failed (user=" + std::to_string(userId) + ")");
         }
     }
     else {
-        writeLog("resolveLastName: request failed, status=" + std::to_string(status)
+        writeLog("resolveUserNames: request failed, status=" + std::to_string(status)
             + " (user=" + std::to_string(userId) + ")");
     }
-    cache[userId] = lastName;
-    return lastName;
+    cache[userId] = names;
+    return names;
 }
 
 // 一覧・Toast 用に各チケットの最終更新者を確定する
@@ -1650,15 +1775,16 @@ static std::string resolveLastName(const Config& cfg, int userId,
 // 使うため、journals の取得は本関数だけで行う。
 static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
                             const PollState& prev,
-                            std::unordered_map<int, std::string>& lastNameCache)
+                            std::unordered_map<int, UserNames>& nameCache)
 {
     for (auto& is : issues) {
         if (g_shutdownRequested) return;
         auto it = prev.issues.find(is.id);
         if (it != prev.issues.end() && it->second.updatedOn == is.updatedOn
             && !it->second.updaterDisplay.empty()) {
-            is.updaterId      = it->second.updaterId;
-            is.updaterDisplay = it->second.updaterDisplay;
+            is.updaterId        = it->second.updaterId;
+            is.updaterDisplay   = it->second.updaterDisplay;
+            is.updaterFirstName = it->second.updaterFirst;
             continue;
         }
         LastUpdater lu = fetchLastUpdater(cfg, is.id);
@@ -1670,7 +1796,9 @@ static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
         // journal の無いチケットは起票者を最終更新者として扱う
         int         dispId   = lu.userId != 0 ? lu.userId : is.authorId;
         std::string dispName = lu.userId != 0 ? lu.userName : is.authorName;
-        is.updaterDisplay = resolveLastName(cfg, dispId, lastNameCache);
+        auto names = resolveUserNames(cfg, dispId, nameCache);
+        is.updaterDisplay   = names.lastName;
+        is.updaterFirstName = names.firstName;
         if (is.updaterDisplay.empty()) is.updaterDisplay = dispName;
     }
 }
@@ -2779,7 +2907,8 @@ struct ListRow {
     int         id = 0;
     std::string subject;
     std::string projectName;          // 空 = 未取得（旧形式の pins.json 由来など）
-    std::string updater;
+    std::string updater;              // 最終更新者の姓（{lastname}。取得できない場合はフルネーム）
+    std::string updaterFirst;         // 最終更新者の名（{firstname}。未取得は空）
     std::string dueDate;              // "YYYY-MM-DD"（期日なしは空）
     std::string updatedOn;
     bool        assignedToGroup = false;
@@ -2834,7 +2963,8 @@ static std::vector<ListRow> buildListRows(int& visible) {
             ++visible;
         }
         rows.push_back({.id = is.id, .subject = is.subject, .projectName = is.projectName,
-                        .updater = is.updaterDisplay, .dueDate = is.dueDate,
+                        .updater = is.updaterDisplay, .updaterFirst = is.updaterFirstName,
+                        .dueDate = is.dueDate,
                         .updatedOn = is.updatedOn, .assignedToGroup = is.assignedToGroup,
                         .isBugTracker = is.isBugTracker,
                         .pinned = pinned, .closed = is.closed,
@@ -2844,7 +2974,8 @@ static std::vector<ListRow> buildListRows(int& visible) {
     for (const auto& p : pins) {
         if (shown.count(p.id)) continue;
         rows.push_back({.id = p.id, .subject = p.subject, .projectName = p.projectName,
-                        .updater = p.updaterDisplay, .dueDate = p.dueDate,
+                        .updater = p.updaterDisplay, .updaterFirst = p.updaterFirst,
+                        .dueDate = p.dueDate,
                         .updatedOn = p.updatedOn, .assignedToGroup = p.assignedToGroup,
                         .isBugTracker = p.isBugTracker,
                         .pinned = true, .closed = p.closed,
@@ -3169,54 +3300,71 @@ static constexpr wchar_t GROUP_MARK[] = L"👥 ";
 static constexpr wchar_t BUG_MARK[] = L"💥 ";
 
 // 一覧行のラベルを組み立てる
-//   並びは「番号、姓、グループ担当マーカー、[プロジェクト名]、期日、バグマーカー、件名、経過日数」
-//   （例："#12345  山田  👥 [ロケモニ] 7/28 💥 件名（3 日前）"。番号と姓の後は空白 2、
-//   閉じ角括弧と期日の後は空白 1）
-//   経過日数（今日／昨日／x 日前）は件名の切り詰めの後に通常色で付け、更新の古さをひと目で示す。
-//   角括弧は半角とし、project_max_chars の計数には含めない。
-//   閉じ角括弧の後に空白を入れるのは、件名が [緊急] のように角括弧で始まる行で
-//   境界を見失うため。
-//   プロジェクト名は "…" を付けずに切り詰める。（先頭数文字で判別できる要素のため横幅を最優先する）
-//   期日は今年以外だと "2025/6/30" のように年が付き、文字数が変わる。
-//   更新者不明・期限なしなどの要素は詰めて省く。
+//   並びは list_format（g_currentConfig.listFormat）のトークン列に従う。
+//   既定は「番号、姓、グループ担当マーカー、[プロジェクト名]、期日、バグマーカー、件名、経過日数」
+//   （例："#12345  山田  👥 [ロケモニ] 7/28 💥 件名…（3 日前）"）。
+//   {要素:N} の最大文字数で切り詰める。「…」は自由文の {subject} のみ付け、
+//   識別子的な要素（プロジェクト名・姓・名など）は横幅を優先して付けない。
+//   空に展開された要素（期限なし・更新者不明など）は、直後のリテラル先頭空白を
+//   出力末尾が空白または行頭なら取り除いて詰める。（従来の「詰めて省く」を再現）
+//   {group}＝"👥 "・{bug}＝"💥 "・{ago}＝"（3 日前）" は装飾込みで展開し、空なら装飾ごと消える。
 //   期限切れの期日とバグマーカーは ALERT_TEXT_COLOR で描くため、位置を ranges に記録する。
-//   （ranges はオフセット昇順で並べる。ここでの追記順がそのまま昇順になる）
+//   （ranges はオフセット昇順で並べる契約。展開順の追記がそのまま昇順になる）
 // 引数に ListRow を丸ごと取るのは、同じ型の要素が増えて位置引数では取り違えを防げないため。
 // ピン記号はラベルに含めない。WM_DRAWITEM が IssueItem::pinned を見てマーカー列に描く。
 static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
                                   long long todayDays) {
     IssueLabel r;
-    r.text = L"#" + std::to_wstring(row.id) + L"  ";
-    if (!row.updater.empty()) r.text += toWide(row.updater) + L"  ";
-    if (row.assignedToGroup) r.text += GROUP_MARK;
-    // 0 は非表示
-    if (g_currentConfig.projectMaxChars > 0) {
-        auto proj = truncateText(toWide(row.projectName),
-                                 static_cast<size_t>(g_currentConfig.projectMaxChars), false);
-        // 切り詰め位置が空白だと閉じ角括弧の直前が隙間になり、詰めた 1 桁を無駄にするため落とす
-        while (!proj.empty() && (proj.back() == L' ' || proj.back() == L'　')) proj.pop_back();
-        // 空判定は切り詰めた後に行う。角括弧だけが残ると意味のない装飾になるため要素ごと省く
-        if (!proj.empty()) r.text += L"[" + proj + L"] ";
+    bool prevEmpty = false;  // 直前のプレースホルダが空に展開されたか（空白整理の条件）
+    for (const auto& tk : g_currentConfig.listFormat) {
+        if (tk.element == FMT_LITERAL) {
+            std::wstring lit = tk.literal;
+            if (prevEmpty && (r.text.empty() || r.text.back() == L' ')) {
+                size_t i = 0;
+                while (i < lit.size() && lit[i] == L' ') ++i;
+                lit.erase(0, i);
+            }
+            if (!lit.empty()) {
+                r.text += lit;
+                prevEmpty = false;
+            }
+            continue;
+        }
+        std::wstring val;
+        switch (tk.element) {
+        case FMT_ID:        val = std::to_wstring(row.id); break;
+        case FMT_LASTNAME:  val = toWide(row.updater); break;
+        case FMT_FIRSTNAME: val = toWide(row.updaterFirst); break;
+        case FMT_GROUP:     if (row.assignedToGroup) val = GROUP_MARK; break;
+        case FMT_PROJECT:   val = toWide(row.projectName); break;
+        case FMT_DUE:       val = due.text; break;
+        case FMT_BUG:       if (row.isBugTracker) val = BUG_MARK; break;
+        case FMT_SUBJECT:   val = toWide(row.subject); break;
+        case FMT_AGO:       val = makeUpdatedAgoText(row.updatedOn, todayDays); break;
+        }
+        if (tk.maxChars > 0)
+            val = truncateText(val, static_cast<size_t>(tk.maxChars), tk.element == FMT_SUBJECT);
+        if (val.empty()) {
+            prevEmpty = true;
+            continue;
+        }
+        if (tk.element == FMT_DUE) {
+            // 期日は常に半太字で強調する。（一覧の中で期日行を素早く拾えるようにする）
+            // 期限切れは加えて赤にし、期限内は色を据え置く。（範囲外と同じ色で描く）
+            ColorRange range{r.text.size(), val.size(), ALERT_TEXT_COLOR, true};
+            if (!due.overdue) range.keepColor = true;
+            r.ranges.push_back(range);
+        }
+        if (tk.element == FMT_BUG) {
+            // マーカー自体を赤くする。（絵文字は GDI が現在の文字色で単色描画するため色が乗る）
+            // 末尾の空白は色を変えても見えないので範囲に含めない
+            size_t len = val.size() - (val.back() == L' ' ? 1 : 0);
+            if (len > 0) r.ranges.push_back({r.text.size(), len, ALERT_TEXT_COLOR});
+        }
+        r.text += val;
+        prevEmpty = false;
     }
-    // 色付け範囲の位置はここで確定する。前に置く要素が増減しても追記の直前に測るため追従する
-    if (!due.text.empty()) {
-        // 期日は常に半太字で強調する。（一覧の中で期日行を素早く拾えるようにする）
-        // 期限切れは加えて赤にし、期限内は色を据え置く。（範囲外と同じ色で描く）
-        ColorRange range{r.text.size(), due.text.size(), ALERT_TEXT_COLOR, true};
-        if (!due.overdue) range.keepColor = true;
-        r.ranges.push_back(range);
-        r.text += due.text + L" ";
-    }
-    if (row.isBugTracker) {
-        // マーカー自体を赤くする。（絵文字は GDI が現在の文字色で単色描画するため色が乗る）
-        // 末尾の空白は色を変えても見えないので範囲に含めない
-        r.ranges.push_back({r.text.size(), wcslen(BUG_MARK) - 1, ALERT_TEXT_COLOR});
-        r.text += BUG_MARK;
-    }
-    r.text += truncateText(toWide(row.subject),
-                           static_cast<size_t>(g_currentConfig.subjectMaxChars));
-    // 経過日数は件名の切り詰めの外に置き、長い件名でも必ず見えるようにする
-    r.text += makeUpdatedAgoText(row.updatedOn, todayDays);
+    while (!r.text.empty() && r.text.back() == L' ') r.text.pop_back();
     return r;
 }
 
@@ -3892,6 +4040,7 @@ static void togglePin(UINT itemIdx, HMENU hm) {
                     p.assignedToGroup = is.assignedToGroup;
                     p.isBugTracker    = is.isBugTracker;
                     p.updaterDisplay  = is.updaterDisplay;
+                    p.updaterFirst    = is.updaterFirstName;
                     break;
                 }
             }
@@ -4128,7 +4277,8 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
         // 最終更新者は src 側で確定している場合だけ比較・更新する。集合外ピンの個別取得
         // （fetchIssue）は journals を含まず updaterDisplay が空のため、保存済みの値を保つ
         bool updaterChanged = src && !src->updaterDisplay.empty()
-            && p.updaterDisplay != src->updaterDisplay;
+            && (p.updaterDisplay != src->updaterDisplay
+                || p.updaterFirst != src->updaterFirstName);
         if (src && (p.subject != src->subject || p.updatedOn != src->updatedOn
                     || p.closed != src->closed || p.dueDate != src->dueDate
                     || p.projectName != src->projectName
@@ -4144,7 +4294,10 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
             // トラッカー判定は設定との照合だけで決まり、グループ判定のような未解決状態がない
             p.isBugTracker  = src->isBugTracker;
             if (groupIdsResolved) p.assignedToGroup = src->assignedToGroup;
-            if (!src->updaterDisplay.empty()) p.updaterDisplay = src->updaterDisplay;
+            if (!src->updaterDisplay.empty()) {
+                p.updaterDisplay = src->updaterDisplay;
+                p.updaterFirst   = src->updaterFirstName;
+            }
             changed = true;
         }
     }
@@ -4401,8 +4554,8 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     std::vector<int> groupIds;         // 判定に使う集合（全グループ、権限不足時は所属グループ）
     bool groupIdsResolved = false;
 
-    // ユーザ id → 姓のセッション内キャッシュ（一覧の最終更新者列。resolveLastName が使う）
-    std::unordered_map<int, std::string> userLastNames;
+    // ユーザ id → 姓・名のセッション内キャッシュ（一覧の最終更新者表示。resolveUserNames が使う）
+    std::unordered_map<int, UserNames> userNames;
 
     // バージョン欄が有効なトラッカー id 集合（本スレッド専用でロック不要）
     // nullopt = 未取得または enabled_standard_fields 非対応（Redmine 5.0 未満）。
@@ -4583,7 +4736,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
 
             // 前回状態はここで 1 回だけ読み、最終更新者の解決と通知判定で共有する
             PollState prevState = loadState(exeDir);
-            resolveUpdaters(cfg, issues, prevState, userLastNames);
+            resolveUpdaters(cfg, issues, prevState, userNames);
             if (g_shutdownRequested) break;  // resolveUpdaters は HTTP を伴うため中断を確認する
 
             int notified = deliverPollResults(exeDir, cfg, issues, prevState);

@@ -60,6 +60,13 @@ build.ps1 は `Microsoft.VisualStudio.DevShell.dll` + `Enter-VsDevShell` で VC+
   `/projects/:id/versions.json`（プロジェクト単位のキャッシュ）。  
   起動時・「今すぐ更新」・`version_meta_refresh_hours`（デフォルト 24 時間）超過で再取得する。
 
+- 一覧の行は `list_format`（[app]）のプレースホルダテンプレートで組み立てる  
+  語彙は {id} {lastname} {firstname} {group} {project} {due} {bug} {subject} {ago} の 9 要素で、
+  `{要素:N}` で最大文字数を指定できる。（「…」は件名のみ）
+  解釈できないトークンはリテラルのまま行に表示して起動ログに残す。（アプリは止めない）
+  空に展開された要素の直後のリテラル先頭空白は、出力末尾が空白か行頭なら取り除く。
+  `subject_max_chars`・`project_max_chars` は廃止。（読み捨て＋廃止ログ）
+
 - schedule の 0（休止時間帯）は force poll・stale 判定より優先される  
   この順序を崩すと深夜に通知が鳴る。起動直後の 1 回だけは休止時間帯でも実行する。
   トレイメニューの「今すぐ更新」（`g_manualPoll`）だけは明示操作として休止時間帯・クールダウンを無視する。
