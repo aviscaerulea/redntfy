@@ -10,7 +10,8 @@ A lightweight resident app that notifies you of Redmine ticket updates via Windo
 
 ## Features
 
-- Notification targets are fully customizable via Redmine saved queries; polls on a schedule and shows toast notifications for new or updated tickets
+- Starts tracking tickets assigned to you with just a URL and an API key; polls on a schedule and shows toast notifications for new or updated tickets
+- Notification targets are freely adjustable via Redmine saved queries (query_ids)
 - Displays an open-ticket list from the tray, formatted with icons for due dates, assignees, and projects
 - The order and items of each list row are fully customizable via placeholders in the configuration
 - Pins keep important tickets at the top of the list (they stay even after being closed)
@@ -25,7 +26,6 @@ A lightweight resident app that notifies you of Redmine ticket updates via Windo
 
 - Windows 10/11
 - A Redmine API access key
-- Redmine global saved queries (created without specifying a project)
 
 ### Steps
 
