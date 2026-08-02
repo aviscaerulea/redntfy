@@ -3552,9 +3552,11 @@ static bool isNewerVersion(const std::wstring& a, const std::wstring& b) {
 }
 
 // GitHub の最新リリースを確認し、新版があれば Toast 通知とグローバル状態を更新する
-// 起動時に detach したスレッドで 1 回だけ実行する
+// 起動時のスレッドで 1 回だけ実行する。スレッドは detach せず wmain が終了時に join する。
+// （detach だとプロセス終了時の静的破棄と実行中の本関数が競合し、破棄済みの
+// g_mtx・g_latestVersion・g_logDir 等に触れる未定義動作になり得るため）
 static void checkForUpdates() {
-    // WinRT 初期化も hresult_error を投げ得るため捕捉する。detach スレッドの未捕捉例外は
+    // WinRT 初期化も hresult_error を投げ得るため捕捉する。スレッドの未捕捉例外は
     // std::terminate でプロセス全体を落とすため、失敗はログのみ残してスレッドを終える
     try {
         winrt::init_apartment();
@@ -4947,10 +4949,13 @@ int wmain() {
                 + (cfg.queryIds.empty() ? " (assigned-to-me fallback)" : ""));
         }
 
-        // 更新チェックスレッド起動（起動時に 1 回のみ実行、detach で分離）
+        // 更新チェックスレッド起動（起動時に 1 回のみ実行）
+        // detach しない。プロセス終了時の静的破棄と競合しないよう、シャットダウン時に join する。
+        // （HTTP タイムアウトは最大 30 秒のため、起動直後に即終了した場合のみ join が待つ）
+        std::thread updateThread;
         if (cfg.updateCheckEnabled) {
             try {
-                std::thread(checkForUpdates).detach();
+                updateThread = std::thread(checkForUpdates);
             }
             catch (const std::system_error& e) {
                 writeLog(std::string("failed to start update check thread: ") + e.what());
@@ -4994,6 +4999,9 @@ int wmain() {
         // バックグラウンドスレッドを停止（waitInterruptible が 100 ms 単位でフラグを監視している）
         // 無効モード起動時はスレッド未起動のため joinable で判定する
         if (pollThread.joinable()) pollThread.join();
+
+        // 更新チェックスレッドの完了を待つ（未起動・起動失敗時は joinable が false）
+        if (updateThread.joinable()) updateThread.join();
 
         // ループ終了後のクリーンアップ
         WTSUnRegisterSessionNotification(g_hWnd);
