@@ -3570,6 +3570,9 @@ static void checkForUpdates() {
         do {
             DWORD status = 0;
             std::string body = httpGet(GITHUB_API_RELEASES_LATEST, &status);
+            // HTTP 中にシャットダウンが始まっていたら以降（Toast・レジストリ書き込み）を
+            // 行わない。終了操作の直後に更新 Toast が出る違和感と、join 待ちの延伸を防ぐ
+            if (g_shutdownRequested) break;
             if (status != 200 || body.empty()) {
                 writeLog("update check: request failed, status=" + std::to_string(status));
                 break;
@@ -5000,13 +5003,15 @@ int wmain() {
         // 無効モード起動時はスレッド未起動のため joinable で判定する
         if (pollThread.joinable()) pollThread.join();
 
-        // 更新チェックスレッドの完了を待つ（未起動・起動失敗時は joinable が false）
-        if (updateThread.joinable()) updateThread.join();
-
         // ループ終了後のクリーンアップ
         WTSUnRegisterSessionNotification(g_hWnd);
         removeTrayIcon(g_hWnd);
         DestroyWindow(g_hWnd);
+
+        // 更新チェックスレッドの完了を待つ（未起動・起動失敗時は joinable が false）
+        // HTTP がブロック中だと最大タイムアウト（約 45 秒）まで待ち得るため、
+        // トレイアイコン削除より後に置き、ユーザから見た終了は即座に完了させる
+        if (updateThread.joinable()) updateThread.join();
 
         writeLog("shutdown");
     }
