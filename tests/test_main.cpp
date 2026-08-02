@@ -356,6 +356,27 @@ static void testNormalizeSpaces() {
     CHECK(normalizeSpaces("no wide") == "no wide");
 }
 
+// ==================== toWide / wideToUtf8 ====================
+
+static void testStringConversion() {
+    // 往復変換（ASCII・日本語・サロゲートペア）
+    CHECK_WSTR(toWide("abc"), L"abc");
+    CHECK(wideToUtf8(L"abc") == "abc");
+    CHECK_WSTR(toWide(wideToUtf8(L"日本語テスト")), L"日本語テスト");
+    CHECK_WSTR(toWide(wideToUtf8(L"a\U0001F600b")), L"a\U0001F600b");
+
+    // 空入力は空を返す
+    CHECK(toWide("").empty());
+    CHECK(wideToUtf8(L"").empty());
+
+    // 不正な UTF-8 バイト列でもクラッシュ・巨大確保せず安全に返る
+    // （CP_UTF8 の既定動作では不正シーケンスは U+FFFD に置換される。
+    // 変換 API が 0 を返す環境・入力でも n - 1 のアンダーフローで落ちないことが契約）
+    std::string broken = "\xFF\xFE\x80";
+    auto w = toWide(broken);
+    CHECK(w.size() <= broken.size());
+}
+
 // ==================== issuesFilterQuery / trackedQueryIds / queryUrl ====================
 
 static void testIssuesFilterQuery() {
@@ -429,6 +450,7 @@ int main() {
     testEscapeXml();
     testIsHttpUrl();
     testNormalizeSpaces();
+    testStringConversion();
     testIssuesFilterQuery();
     testTrackedQueryIds();
     testQueryUrl();
