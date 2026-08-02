@@ -42,6 +42,8 @@ To install manually from a zip archive, download the zip from [Releases](https:/
 
 Initial setup:
 
+A step-by-step guide with screenshots is available in the [setup guide](https://aviscaerulea.github.io/redntfy/) (written in Japanese).
+
 1. In Redmine, filter the issue list **without specifying a project** and save it as a custom query
    - Queries saved under a specific project cannot be referenced via the API, so they must be created as global queries
    - Take note of `N` in the resulting URL `/issues?query_id=N` (one per query if you track multiple)

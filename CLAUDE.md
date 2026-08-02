@@ -26,10 +26,10 @@ build.ps1 は `Microsoft.VisualStudio.DevShell.dll` + `Enter-VsDevShell` で VC+
 
 - `[redmine]` の url / api_key / query_ids がどちらの toml にも無い場合、終了せず無効モードで常駐する（接続情報なしでの起動確認に使える）
   - 無効モード：トレイが `app-disable.ico`、tooltip が原因別の案内文言、「今すぐ更新」非活性、左クリック一覧なし、ポーリングなし。復帰は再起動のみ
-  - 3 分岐とも `redntfy.local.toml` 不在ならテンプレートを自動生成して設定ファイルを開く
-  - url 空・非 http(s)：Toast「無効な Redmine URL」（設定ファイルのみ開く）
-  - api_key 空：Toast「認証エラー／Redmine の API アクセスキーを api_key に設定してください」＋ `<url>/my/account` をブラウザで開く
-  - query_ids 空：Toast「設定エラー／Redmine のマイカスタムクエリを query_ids に設定してください」＋ `<url>/issues` をブラウザで開く
+  - 3 分岐とも `redntfy.local.toml` 不在ならテンプレートを自動生成して設定ファイルを開き、セットアップガイド（GitHub Pages）をブラウザで開く
+  - url 空・非 http(s)：Toast「無効な Redmine URL」（ブラウザはガイドのみ）
+  - api_key 空：Toast「認証エラー／Redmine の API アクセスキーを api_key に設定してください」＋ `<url>/my/account` もブラウザで開く
+  - query_ids 空：Toast「設定エラー／Redmine のマイカスタムクエリを query_ids に設定してください」＋ `<url>/issues` もブラウザで開く
 - ポーリング中の HTTP 401（api_key 無効）と 404（query_ids 無効）は確定的な設定不備として上記の無効モードへ遷移する（Toast・設定ファイル・ブラウザ誘導も同じ）。それ以外の接続エラーは従来どおり 60 秒リトライ＋30 分クールダウンの Toast
 - ログは `out/logs/YYYY-MM-DD.log` に出力される
 

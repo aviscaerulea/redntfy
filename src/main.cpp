@@ -123,8 +123,11 @@ static constexpr UINT IDM_UPDATE_NOW          = 40012; // 休止時間帯・ク�
 static constexpr UINT IDM_SORT_BY_DUE         = 40013; // 一覧を期日昇順に並べるトグル
 static constexpr UINT IDM_EXCLUDE_NO_VERSION  = 40014; // バージョン未指定を一覧・tooltip・通知から除外するトグル（期日ありは例外的に残す）
 static constexpr UINT IDM_MUTE_OWN_CHANGES    = 40015; // 自分の操作による起票・更新を通知抑止するトグル（一覧・tooltip は変更しない）
+static constexpr UINT IDM_OPEN_GUIDE          = 40016; // セットアップガイド（GitHub Pages）を開く
 
 static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/redntfy";
+// セットアップガイド（GitHub Pages。docs/ 配下の内容が公開される）
+static constexpr wchar_t GUIDE_URL[]                  = L"https://aviscaerulea.github.io/redntfy/";
 static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/redntfy/releases";
 static constexpr wchar_t GITHUB_API_RELEASES_LATEST[] = L"https://api.github.com/repos/aviscaerulea/redntfy/releases/latest";
 
@@ -3687,6 +3690,8 @@ static void showTrayContextMenu(HWND hWnd) {
         IDM_STARTUP, L"スタートアップ登録");
 
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+    // 設定に詰まったユーザの導線のため、無効モードでも活性のままにする
+    AppendMenuW(hMenu, MF_STRING, IDM_OPEN_GUIDE,  L"使い方ガイド");
     AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONFIG, L"設定ファイルを開く");
     AppendMenuW(hMenu, MF_STRING, IDM_OPEN_LOG,    L"ログファイルを開く");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
@@ -3798,6 +3803,10 @@ static void handleTrayCommand(UINT id) {
     if (id == IDM_STARTUP) {
         if (isStartupRegistered()) unregisterStartup();
         else                       registerStartup();
+        return;
+    }
+    if (id == IDM_OPEN_GUIDE) {
+        ShellExecuteW(nullptr, L"open", GUIDE_URL, nullptr, nullptr, SW_SHOWNORMAL);
         return;
     }
     if (id == IDM_OPEN_GITHUB) {
@@ -4112,6 +4121,7 @@ static void ensureLocalTomlTemplate(const std::wstring& exeDir) {
 // メインスレッドから呼ぶ。（Shell_NotifyIconW をメインスレッドに限定する不変条件のため。
 // ポーリングスレッドからは WM_ENTER_DISABLED の投函で本関数に委譲する）
 // 呼び出し前に g_disabledReason が設定済みであること。
+// 全分岐共通でセットアップガイド（定数 URL）を開き、原因別の Redmine ページ誘導と併用する。
 // InvalidApiKey / InvalidQueryIds は url の有効性が検証済みの場合のみ到達するため、
 // ここでの ShellExecuteW は http(s) URL しか受け取らない。
 static void enterDisabledMode(HWND hWnd, DisabledReason reason,
@@ -4120,6 +4130,9 @@ static void enterDisabledMode(HWND hWnd, DisabledReason reason,
     ensureLocalTomlTemplate(exeDir);
     std::wstring configPath = exeDir + L"\\" + CONFIG_LOCAL_FILENAME;
     ShellExecuteW(nullptr, L"open", configPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+
+    // 設定不備の解消手順を示すセットアップガイドを開く（原因別の Redmine ページ誘導と併用）
+    ShellExecuteW(nullptr, L"open", GUIDE_URL, nullptr, nullptr, SW_SHOWNORMAL);
 
     // 原因別のブラウザ誘導と Toast（permalink 空 = ボタンなし。silent=false で OS 通知音）
     try {
@@ -4839,8 +4852,8 @@ int wmain() {
         // 3 分岐で原因ごとに案内する。url のスキームもここで検証する。
         // InvalidUrl のとき redmineUrl は ShellExecuteW を通るどの経路にも到達しない：
         // ポーリング停止・一覧非表示（フッタのクエリ画面も開けない）・enterDisabledMode は
-        // InvalidUrl では URL を開かない。これにより http(s) 以外が ShellExecuteW に渡らない
-        // 保証を維持する。
+        // InvalidUrl では Redmine 由来の URL を開かない。（定数のガイド URL は開く）
+        // これにより http(s) 以外が ShellExecuteW に渡らない保証を維持する。
         DisabledReason initReason = DisabledReason::None;
         if (cfg.redmineUrl.empty() || !isHttpUrl(cfg.redmineUrl)) {
             writeLog("config error: [redmine] url is empty or not http(s) - disabled mode");
