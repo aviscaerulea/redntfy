@@ -12,6 +12,7 @@ A lightweight resident app that notifies you of Redmine ticket updates via Windo
 
 - Notification targets are fully customizable via Redmine saved queries; polls on a schedule and shows toast notifications for new or updated tickets
 - Displays an open-ticket list from the tray, formatted with icons for due dates, assignees, and projects
+- The order and items of each list row are fully customizable via placeholders in the configuration
 - Pins keep important tickets at the top of the list (they stay even after being closed)
 - Instant refresh, filters, and sort orders are available from the tray menu
 - Notification sounds are loudness-normalized, and auto-muted while a microphone or camera is in use (e.g. during meetings)
@@ -56,6 +57,8 @@ Initial setup:
 
 4. Launch `redntfy.exe`
 
+It is fine to launch without `redntfy.local.toml`. The app generates a template automatically, opens the configuration file, and guides you to the page where the key can be obtained.
+
 Everyday operations:
 
 - Left-click the tray icon to show the open-ticket list
@@ -74,6 +77,7 @@ The main configuration keys are listed below. See the comments in `redntfy.toml`
 | --- | --- | --- |
 | `[app]` | `schedule` | Polls per hour for each of the 24 hours |
 | `[app]` | `list_limit` | Number of rows in the list (default 20) |
+| `[app]` | `list_format` | Row format of the list (placeholder based) |
 | `[app]` | `bug_trackers` | Tracker-name patterns that get a 💥 icon |
 | `[app]` | `duck_targets` | Process names to mute while a sound plays |
 | `[redmine]` | `url`, `api_key`, `query_ids` | Connection settings (required) |
@@ -85,6 +89,7 @@ The main configuration keys are listed below. See the comments in `redntfy.toml`
 - Only Redmine global saved queries are supported (queries under a specific project cannot be referenced via the API)
 - Group-assignee detection covers all groups only with admin privileges; otherwise it only checks your own groups
 - The configuration file is not hot-reloaded; a restart is required to apply changes
+- If the configuration is incomplete, the app stays resident in a guidance mode without notifications (follow the tray icon and its tooltip, fix the settings, and restart)
 
 ## Build
 
@@ -94,15 +99,6 @@ Visual Studio Build Tools, vcpkg, go-task, PowerShell 7, and git are required.
 task build      # Standard build (out/redntfy.exe)
 task release    # Release build with zip packaging
 ```
-
-## Tech Stack
-
-- C++20 / Win32 API (single translation unit)
-- WinHTTP (Redmine REST API)
-- C++/WinRT (Windows.UI.Notifications, Windows.Data.Json)
-- WASAPI (notification sound playback)
-- libebur128 (loudness measurement)
-- toml++ (configuration file)
 
 ## License
 

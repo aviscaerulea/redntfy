@@ -12,6 +12,7 @@ Redmine の更新チケットを Windows Toast 通知で知らせ、未処理チ
 
 - 通知対象を Redmine のカスタムクエリで自由に設定でき、定期チェックで新着や更新を Toast 通知
 - タスクトレイから未処理チケット一覧を表示し、期日、担当、プロジェクトをアイコンで整形
+- 一覧の行の並びや表示項目は設定のプレースホルダ指定で自由にカスタマイズ可能
 - 気になるチケットはピン留めで一覧の先頭に固定（クローズしても残る）
 - トレイメニューから即時更新、フィルタ、並び替えを操作
 - 通知音の音量を自動で揃え、会議中（マイクやカメラの使用中）は自動でミュート
@@ -28,7 +29,7 @@ Redmine の更新チケットを Windows Toast 通知で知らせ、未処理チ
 
 ### 手順
 
-Scoop を使う場合。
+Scoop を使う場合の手順です。
 
 ```powershell
 scoop bucket add aviscaerulea https://github.com/aviscaerulea/scoop-bucket
@@ -98,15 +99,6 @@ Visual Studio Build Tools、vcpkg、go-task、PowerShell 7、git が必要です
 task build      # 通常ビルド（out/redntfy.exe）
 task release    # リリースビルドと zip 作成
 ```
-
-## 技術スタック
-
-- C++20 / Win32 API（単一翻訳単位）
-- WinHTTP（Redmine REST API）
-- C++/WinRT（Windows.UI.Notifications, Windows.Data.Json）
-- WASAPI（通知音再生）
-- libebur128（ラウドネス測定）
-- toml++（設定ファイル）
 
 ## ライセンス
 
