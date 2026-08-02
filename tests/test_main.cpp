@@ -369,7 +369,7 @@ static void testStringConversion() {
     CHECK(toWide("").empty());
     CHECK(wideToUtf8(L"").empty());
 
-    // 不正な UTF-8 バイト列でもクラッシュ・巨大確保せず安全に返る
+    // 不正な UTF-8 バイト列でもクラッシュ・巨大確保せず安全に返る。
     // （CP_UTF8 の既定動作では不正シーケンスは U+FFFD に置換される。
     // 変換 API が 0 を返す環境・入力でも n - 1 のアンダーフローで落ちないことが契約）
     std::string broken = "\xFF\xFE\x80";

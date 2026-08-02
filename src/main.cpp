@@ -714,7 +714,7 @@ static DWORD calcSleepUntilNextPoll(int pollsPerHour) {
 // WinHTTP で HTTPS リクエストを実行する
 // method: L"GET" or L"POST"
 // authHeader: 空でなければ "名前: 値" 形式のヘッダ 1 行としてそのまま付与
-// authHeader 付きのリクエストは自動リダイレクトを無効化し、3xx をそのままステータスとして返す
+// authHeader 付きのリクエストは自動リダイレクトを無効化し、3xx をそのままステータスとして返す。
 // （WinHTTP の既定はカスタムヘッダを保持したまま追従するため、別ドメインへの 3xx で
 // API キーが第三者に送られる。認証なしのリクエストは従来どおり追従する）
 // outStatusCode が非 null の場合、最終 HTTP ステータスコードを書き込む
@@ -1499,7 +1499,7 @@ static int fetchMyUserId(const Config& cfg, std::vector<int>& outOwnGroups) {
 // /groups.json から全グループの id を取得する（グループ担当マーカーの判定用、起動時 1 回）
 // この API は admin 権限が必要。403（権限なし）は確定的な失敗として outStatus で呼び出し側に
 // 伝え、所属グループへのフォールバックを促す。接続エラー等は nullopt で再試行対象とする。
-// この API はページングされず全グループを一括で返す（groups_controller.rb の
+// この API はページングされず全グループを一括で返す。（groups_controller.rb の
 // format.api が scope.to_a で全件取得するため。limit/offset 対応は API 側に無い）
 static std::optional<std::vector<int>> fetchAllGroupIds(const Config& cfg, DWORD* outStatus) {
     DWORD status = 0;
