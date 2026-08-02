@@ -1466,19 +1466,41 @@ static Issue parseIssueObject(const Config& cfg,
     return is;
 }
 
+// Redmine API へ GET し JSON オブジェクトを得る（取得系関数の共通骨格）
+// 非 200・空応答・パース失敗は nullptr を返し、logTag 付きの失敗ログを残す。
+// outStatus は省略可。HTTP ステータスをそのまま書き込む。（401・403・404 の判別用）
+// パース成功後のフィールド抽出は本関数の範囲外。キー欠落はデフォルト値アクセスで安全に扱える。
+// 型不一致は WinRT が例外を投げるため、配列走査などを行う呼び出し側は従来どおり
+// try-catch で囲む。
+static winrt::Windows::Data::Json::JsonObject redmineGetJson(
+    const Config& cfg, const std::wstring& url, const std::string& logTag,
+    DWORD* outStatus = nullptr)
+{
+    DWORD status = 0;
+    auto body = redmineGet(url, cfg.apiKey, &status);
+    if (outStatus) *outStatus = status;
+    if (status != 200 || body.empty()) {
+        writeLog(logTag + ": request failed, status=" + std::to_string(status));
+        return nullptr;
+    }
+    try {
+        return winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
+    }
+    catch (...) {
+        writeLog(logTag + ": JSON parse failed");
+        return nullptr;
+    }
+}
+
 // /users/current.json から自分の user id と所属グループ id を取得する（起動時 1 回）
 // 失敗時は 0 を返す。0 のときは自分の操作の除外判定を行わない。（通知欠落より過剰通知側に倒す）
 // outOwnGroups は成功時のみ上書きする。グループ担当判定（/groups.json）が権限不足で
 // 使えない場合のフォールバック用。
 static int fetchMyUserId(const Config& cfg, std::vector<int>& outOwnGroups) {
-    DWORD status = 0;
-    auto body = redmineGet(cfg.redmineUrl + L"/users/current.json?include=groups", cfg.apiKey, &status);
-    if (status != 200 || body.empty()) {
-        writeLog("fetchMyUserId: request failed, status=" + std::to_string(status));
-        return 0;
-    }
+    auto obj = redmineGetJson(cfg, cfg.redmineUrl + L"/users/current.json?include=groups",
+                              "fetchMyUserId");
+    if (!obj) return 0;
     try {
-        auto obj  = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
         auto user = obj.GetNamedObject(L"user", nullptr);
         if (!user) return 0;
         if (user.HasKey(L"groups")) {
@@ -1491,7 +1513,7 @@ static int fetchMyUserId(const Config& cfg, std::vector<int>& outOwnGroups) {
         return static_cast<int>(user.GetNamedNumber(L"id", 0));
     }
     catch (...) {
-        writeLog("fetchMyUserId: JSON parse failed");
+        writeLog("fetchMyUserId: unexpected JSON structure");
         return 0;
     }
 }
@@ -1502,15 +1524,9 @@ static int fetchMyUserId(const Config& cfg, std::vector<int>& outOwnGroups) {
 // この API はページングされず全グループを一括で返す。（groups_controller.rb の
 // format.api が scope.to_a で全件取得するため。limit/offset 対応は API 側に無い）
 static std::optional<std::vector<int>> fetchAllGroupIds(const Config& cfg, DWORD* outStatus) {
-    DWORD status = 0;
-    auto body = redmineGet(cfg.redmineUrl + L"/groups.json", cfg.apiKey, &status);
-    if (outStatus) *outStatus = status;
-    if (status != 200 || body.empty()) {
-        writeLog("fetchAllGroupIds: request failed, status=" + std::to_string(status));
-        return std::nullopt;
-    }
+    auto obj = redmineGetJson(cfg, cfg.redmineUrl + L"/groups.json", "fetchAllGroupIds", outStatus);
+    if (!obj) return std::nullopt;
     try {
-        auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
         std::vector<int> ids;
         if (obj.HasKey(L"groups")) {
             for (auto g : obj.GetNamedArray(L"groups")) {
@@ -1521,7 +1537,7 @@ static std::optional<std::vector<int>> fetchAllGroupIds(const Config& cfg, DWORD
         return ids;
     }
     catch (...) {
-        writeLog("fetchAllGroupIds: JSON parse failed");
+        writeLog("fetchAllGroupIds: unexpected JSON structure");
         return std::nullopt;
     }
 }
@@ -1541,14 +1557,9 @@ static bool isGroupAssignee(const std::vector<int>& groupIds, int assignedToId) 
 // admin 権限は不要。（/groups.json と異なり認証済みユーザなら取得できる）
 static bool fetchVersionedTrackerIds(const Config& cfg,
                                      std::optional<std::unordered_set<int>>& out) {
-    DWORD status = 0;
-    auto body = redmineGet(cfg.redmineUrl + L"/trackers.json", cfg.apiKey, &status);
-    if (status != 200 || body.empty()) {
-        writeLog("fetchVersionedTrackerIds: request failed, status=" + std::to_string(status));
-        return false;
-    }
+    auto obj = redmineGetJson(cfg, cfg.redmineUrl + L"/trackers.json", "fetchVersionedTrackerIds");
+    if (!obj) return false;
     try {
-        auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
         std::unordered_set<int> ids;
         bool sawFields = false;
         if (obj.HasKey(L"trackers")) {
@@ -1570,7 +1581,7 @@ static bool fetchVersionedTrackerIds(const Config& cfg,
         return true;
     }
     catch (...) {
-        writeLog("fetchVersionedTrackerIds: JSON parse failed");
+        writeLog("fetchVersionedTrackerIds: unexpected JSON structure");
         return false;
     }
 }
@@ -1587,23 +1598,21 @@ static bool projectHasAnyVersion(const Config& cfg, int projectId,
     if (projectId <= 0) return true;
     auto it = cache.find(projectId);
     if (it != cache.end()) return it->second;
-    DWORD status = 0;
-    auto body = redmineGet(cfg.redmineUrl + L"/projects/" + std::to_wstring(projectId)
-        + L"/versions.json", cfg.apiKey, &status);
-    if (status != 200 || body.empty()) {
-        writeLog("projectHasAnyVersion: request failed, project=" + std::to_string(projectId)
-            + ", status=" + std::to_string(status));
+    auto obj = redmineGetJson(cfg,
+        cfg.redmineUrl + L"/projects/" + std::to_wstring(projectId) + L"/versions.json",
+        "projectHasAnyVersion(project=" + std::to_string(projectId) + ")");
+    if (!obj) {
         cache[projectId] = true;
         return true;
     }
     try {
-        auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
         bool has = obj.HasKey(L"versions") && obj.GetNamedArray(L"versions").Size() > 0;
         cache[projectId] = has;
         return has;
     }
     catch (...) {
-        writeLog("projectHasAnyVersion: JSON parse failed, project=" + std::to_string(projectId));
+        writeLog("projectHasAnyVersion: unexpected JSON structure, project="
+            + std::to_string(projectId));
         cache[projectId] = true;
         return true;
     }
@@ -1637,7 +1646,6 @@ static std::wstring issuesFilterQuery(int queryId) {
 // ネットワーク断は status 0、サーバ障害は 5xx になるため 404 と混同しない。
 static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>& outIssues,
                              bool* outAuthError = nullptr, bool* outQueryError = nullptr) {
-    using namespace winrt::Windows::Data::Json;
     outIssues.clear();
 
     const std::string logTag = "fetchQueryIssues(" + std::to_string(queryId) + ")";
@@ -1647,16 +1655,13 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
         std::wstring url = cfg.redmineUrl + L"/issues.json?" + issuesFilterQuery(queryId)
             + L"&sort=id&limit=100&offset=" + std::to_wstring(offset);
         DWORD status = 0;
-        auto body = redmineGet(url, cfg.apiKey, &status);
-        if (status != 200 || body.empty()) {
-            writeLog(logTag + ": request failed, status=" + std::to_string(status)
-                + " offset=" + std::to_string(offset));
+        auto obj = redmineGetJson(cfg, url, logTag + " offset=" + std::to_string(offset), &status);
+        if (!obj) {
             if (status == 401 && outAuthError)  *outAuthError  = true;
             if (status == 404 && queryId != FALLBACK_QUERY_ID && outQueryError) *outQueryError = true;
             return false;
         }
         try {
-            auto obj = JsonObject::Parse(winrt::to_hstring(body));
             if (obj.HasKey(L"errors")) {
                 writeLog(logTag + ": API error response");
                 return false;
@@ -1671,7 +1676,7 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
             offset += static_cast<int>(arr.Size());
         }
         catch (...) {
-            writeLog(logTag + ": JSON parse failed");
+            writeLog(logTag + ": unexpected JSON structure");
             return false;
         }
     } while (offset < total && !g_shutdownRequested);
@@ -1728,18 +1733,17 @@ static bool fetchIssues(const Config& cfg, std::vector<Issue>& outIssues,
 // 単一チケットを取得する（保存クエリの集合から外れたピンの表示用）
 // 成功時 true。404（削除済み等）や接続エラーは false。
 static bool fetchIssue(const Config& cfg, int id, Issue& out) {
-    DWORD status = 0;
-    auto body = redmineGet(issueUrl(cfg, id) + L".json", cfg.apiKey, &status);
-    if (status != 200 || body.empty()) return false;
+    auto obj = redmineGetJson(cfg, issueUrl(cfg, id) + L".json",
+                              "fetchIssue(" + std::to_string(id) + ")");
+    if (!obj) return false;
     try {
-        auto obj   = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
         auto issue = obj.GetNamedObject(L"issue", nullptr);
         if (!issue) return false;
         out = parseIssueObject(cfg, issue);
         return out.id > 0;
     }
     catch (...) {
-        writeLog("fetchIssue: JSON parse failed (id=" + std::to_string(id) + ")");
+        writeLog("fetchIssue: unexpected JSON structure (id=" + std::to_string(id) + ")");
         return false;
     }
 }
@@ -1759,11 +1763,10 @@ struct LastUpdater {
 // 取得失敗時は userId 0 のまま返し、呼び出し側の抑止判定は通知する側に倒れる。
 static LastUpdater fetchLastUpdater(const Config& cfg, int id) {
     LastUpdater lu;
-    DWORD status = 0;
-    auto body = redmineGet(issueUrl(cfg, id) + L".json?include=journals", cfg.apiKey, &status);
-    if (status != 200 || body.empty()) return lu;
+    auto obj = redmineGetJson(cfg, issueUrl(cfg, id) + L".json?include=journals",
+                              "fetchLastUpdater(" + std::to_string(id) + ")");
+    if (!obj) return lu;
     try {
-        auto obj   = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
         auto issue = obj.GetNamedObject(L"issue", nullptr);
         if (!issue || !issue.HasKey(L"journals")) return lu;
         auto journals = issue.GetNamedArray(L"journals");
@@ -1798,12 +1801,10 @@ static UserNames resolveUserNames(const Config& cfg, int userId,
     auto it = cache.find(userId);
     if (it != cache.end()) return it->second;
     UserNames names;
-    DWORD status = 0;
-    auto body = redmineGet(cfg.redmineUrl + L"/users/" + std::to_wstring(userId) + L".json",
-                           cfg.apiKey, &status);
-    if (status == 200 && !body.empty()) {
+    auto obj = redmineGetJson(cfg, cfg.redmineUrl + L"/users/" + std::to_wstring(userId) + L".json",
+                              "resolveUserNames(user=" + std::to_string(userId) + ")");
+    if (obj) {
         try {
-            auto obj  = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
             auto user = obj.GetNamedObject(L"user", nullptr);
             if (user) {
                 names.lastName  = winrt::to_string(user.GetNamedString(L"lastname", L""));
@@ -1811,12 +1812,9 @@ static UserNames resolveUserNames(const Config& cfg, int userId,
             }
         }
         catch (...) {
-            writeLog("resolveUserNames: JSON parse failed (user=" + std::to_string(userId) + ")");
+            writeLog("resolveUserNames: unexpected JSON structure (user="
+                + std::to_string(userId) + ")");
         }
-    }
-    else {
-        writeLog("resolveUserNames: request failed, status=" + std::to_string(status)
-            + " (user=" + std::to_string(userId) + ")");
     }
     cache[userId] = names;
     return names;
