@@ -709,6 +709,9 @@ static DWORD calcSleepUntilNextPoll(int pollsPerHour) {
 // WinHTTP で HTTPS リクエストを実行する
 // method: L"GET" or L"POST"
 // authHeader: 空でなければ "名前: 値" 形式のヘッダ 1 行としてそのまま付与
+// authHeader 付きのリクエストは自動リダイレクトを無効化し、3xx をそのままステータスとして返す
+// （WinHTTP の既定はカスタムヘッダを保持したまま追従するため、別ドメインへの 3xx で
+// API キーが第三者に送られる。認証なしのリクエストは従来どおり追従する）
 // outStatusCode が非 null の場合、最終 HTTP ステータスコードを書き込む
 // （応答ヘッダ受信前の失敗は 0。ボディ受信途中の失敗はヘッダ確定値を保持して空ボディを返す）
 static std::string httpRequest(const wchar_t* method, const std::wstring& url,
@@ -744,6 +747,12 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
         return "";
+    }
+
+    // 認証ヘッダ付きは自動リダイレクトを禁止（API キー漏洩防止。関数コメント参照）
+    if (!authHeader.empty()) {
+        DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
     }
 
     // ヘッダ構築
