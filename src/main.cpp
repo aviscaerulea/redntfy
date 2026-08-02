@@ -268,6 +268,13 @@ struct Issue {
     bool assignedToGroup = false;  // 担当がグループ（一覧の 👥 マーカー。取得後にグループ id 集合と突合して設定）
     bool isBugTracker    = false;  // トラッカーが bug_trackers に一致（一覧の 💥 マーカー。パース時に判定）
     bool hasFixedVersion = false;  // fixed_version が JSON に含まれ非 null。バージョンフィルタで見る
+    int  trackerId = 0;            // トラッカー id（バージョン欄の有無判定用。0 = 不明）
+    int  projectId = 0;            // プロジェクト id（バージョン欄の有無判定用。0 = 不明）
+    // バージョン欄がこのチケットに設けられているか（取得後にポーリングスレッドが付与）
+    // トラッカーで欄が無効、またはプロジェクトにバージョン未定義なら false。
+    // false のチケットは「バージョン未指定の除外」の対象にしない。（設定しようがないため）
+    // 不明・判定不能時は true = 従来どおり除外対象。
+    bool hasVersionField = true;
     // 最終更新者（resolveUpdaters が journals から確定する。journal なしは起票者で代替）
     int         updaterId = 0;     // 自分の操作による通知の抑止判定に使う（0 = 未確定）
     std::string updaterName;       // フルネーム（Toast の「更新：○○」表示用）
@@ -305,6 +312,9 @@ struct Config {
     // 比較対象の Redmine のトラッカー名が UTF-8 のため、wstring へ変換せず持つ
     std::vector<std::string>  bugTrackers;
     std::vector<std::wstring> duckTargets;      // 通知音再生中にミュートするプロセス名
+    // バージョン欄判定情報（トラッカー定義・プロジェクトのバージョン定義）の再取得間隔（時間）
+    // 超過していたら次のポーリングで直ちに再取得する。デフォルト 24。（1〜168）
+    int versionMetaRefreshHours;
 
     // [guard] ガードトーン設定（BLE ヘッドホン対処）
     int   guardToneMs;      // ガードトーン長（冒頭・末尾共通、ms。0 で無効、デフォルト 1500）
@@ -360,11 +370,14 @@ static bool passesAssigneeFilter(const Issue& is) {
 }
 
 // 一覧・tooltip・通知に出す対象かを判定する（トレイメニューの「バージョン未指定のチケットを除外」）
-// バージョン未指定でも期日が設定されていれば「時限のある未来課題」として通す。
+// バージョン未指定でも以下は通す：
+// - 期日あり（時限のある未来課題）
+// - バージョン欄がそもそも無いチケット（トラッカーで欄が無効、またはプロジェクトに
+//   バージョン未定義。設定しようがないものは「将来の課題」と見なせない）
 // 「将来の課題として起票しておいた」チケットを日常の一覧から外すのが本フィルタの意図。
 static bool passesVersionFilter(const Issue& is) {
     if (!g_excludeNoVersion.load()) return true;
-    return is.hasFixedVersion || !is.dueDate.empty();
+    return is.hasFixedVersion || !is.dueDate.empty() || !is.hasVersionField;
 }
 
 // トレイアイコンの表示状態（通常／未読バッジ付き／無効モード）
@@ -1127,6 +1140,9 @@ static Config loadConfig(const std::wstring& exeDir) {
     cfg.subjectMaxChars = readAppInt("subject_max_chars", 40, 10, 120);
     cfg.projectMaxChars = readAppInt("project_max_chars", 5, 0, 20);
 
+    // バージョン欄判定情報の再取得間隔（時間）
+    cfg.versionMetaRefreshHours = readAppInt("version_meta_refresh_hours", 24, 1, 168);
+
     // [guard] ガードトーン設定
     cfg.guardToneMs = (int)readConfigFloat("guard", "tone_ms", 1500.0f, 0.0f, 10000.0f);
 
@@ -1211,16 +1227,23 @@ static Issue parseIssueObject(const Config& cfg,
         }
     }
     // project は include 指定なしでも issues.json と issues/{id}.json の双方に常に含まれる。
-    // 一覧表示にしか使わないため name だけ採る。
+    // name は一覧表示用、id はバージョン欄の有無判定用。
     if (obj.HasKey(L"project")) {
         auto proj = obj.GetNamedObject(L"project", nullptr);
-        if (proj) is.projectName = normalizeSpaces(winrt::to_string(proj.GetNamedString(L"name", L"")));
+        if (proj) {
+            is.projectName = normalizeSpaces(winrt::to_string(proj.GetNamedString(L"name", L"")));
+            is.projectId   = static_cast<int>(proj.GetNamedNumber(L"id", 0));
+        }
     }
-    // tracker も include 指定なしで常に含まれる。設定との照合結果だけを持ち、名前は残さない。
+    // tracker も include 指定なしで常に含まれる。
+    // 名前は bug_trackers 照合だけに使い残さない。id はバージョン欄の有無判定用。
     if (obj.HasKey(L"tracker")) {
         auto tracker = obj.GetNamedObject(L"tracker", nullptr);
-        if (tracker) is.isBugTracker = matchesBugTracker(
-            cfg.bugTrackers, winrt::to_string(tracker.GetNamedString(L"name", L"")));
+        if (tracker) {
+            is.isBugTracker = matchesBugTracker(
+                cfg.bugTrackers, winrt::to_string(tracker.GetNamedString(L"name", L"")));
+            is.trackerId = static_cast<int>(tracker.GetNamedNumber(L"id", 0));
+        }
     }
     // assigned_to はキー自体が無ければ未割当。ユーザとグループで形は同じ。（id と name のみ）
     if (obj.HasKey(L"assigned_to")) {
@@ -1311,6 +1334,82 @@ static std::optional<std::vector<int>> fetchAllGroupIds(const Config& cfg, DWORD
 static bool isGroupAssignee(const std::vector<int>& groupIds, int assignedToId) {
     return assignedToId != 0
         && std::find(groupIds.begin(), groupIds.end(), assignedToId) != groupIds.end();
+}
+
+// /trackers.json からバージョン欄（fixed_version_id）が有効なトラッカー id 集合を取得する
+//
+// 戻り値 true = 取得成功（結果を out に確定）。false = 接続失敗等（呼び出し側が再試行）。
+// enabled_standard_fields は Redmine 5.0 以降のみ返る。1 件も現れない旧版は判定不能として
+// out = nullopt で成功扱いにし、全トラッカー有効（従来動作）へ縮退する。
+// admin 権限は不要。（/groups.json と異なり認証済みユーザなら取得できる）
+static bool fetchVersionedTrackerIds(const Config& cfg,
+                                     std::optional<std::unordered_set<int>>& out) {
+    DWORD status = 0;
+    auto body = redmineGet(cfg.redmineUrl + L"/trackers.json", cfg.apiKey, &status);
+    if (status != 200 || body.empty()) {
+        writeLog("fetchVersionedTrackerIds: request failed, status=" + std::to_string(status));
+        return false;
+    }
+    try {
+        auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
+        std::unordered_set<int> ids;
+        bool sawFields = false;
+        if (obj.HasKey(L"trackers")) {
+            for (auto t : obj.GetNamedArray(L"trackers")) {
+                auto tr = t.GetObject();
+                if (!tr.HasKey(L"enabled_standard_fields")) continue;
+                sawFields = true;
+                for (auto f : tr.GetNamedArray(L"enabled_standard_fields")) {
+                    if (f.GetString() == L"fixed_version_id") {
+                        int tid = static_cast<int>(tr.GetNamedNumber(L"id", 0));
+                        if (tid > 0) ids.insert(tid);
+                        break;
+                    }
+                }
+            }
+        }
+        if (sawFields) out = std::move(ids);
+        else           out = std::nullopt;
+        return true;
+    }
+    catch (...) {
+        writeLog("fetchVersionedTrackerIds: JSON parse failed");
+        return false;
+    }
+}
+
+// プロジェクトにバージョンが 1 件でも定義されているかを判定する（セッション内キャッシュ付き）
+//
+// /projects/:id/versions.json は他プロジェクトからの共有バージョンも含めて返すため、
+// 空配列 = バージョン欄が画面に出ない（設定不能）と判定できる。
+// 取得失敗時も true（従来どおり除外対象）をキャッシュする。失敗をキャッシュしないと、
+// 権限不足などで恒常的に失敗するプロジェクトのチケット件数分だけ毎ポーリングで
+// 同じ問合せを繰り返すため。次の再取得契機（「今すぐ更新」・間隔超過・再起動）で解消する。
+static bool projectHasAnyVersion(const Config& cfg, int projectId,
+                                 std::unordered_map<int, bool>& cache) {
+    if (projectId <= 0) return true;
+    auto it = cache.find(projectId);
+    if (it != cache.end()) return it->second;
+    DWORD status = 0;
+    auto body = redmineGet(cfg.redmineUrl + L"/projects/" + std::to_wstring(projectId)
+        + L"/versions.json", cfg.apiKey, &status);
+    if (status != 200 || body.empty()) {
+        writeLog("projectHasAnyVersion: request failed, project=" + std::to_string(projectId)
+            + ", status=" + std::to_string(status));
+        cache[projectId] = true;
+        return true;
+    }
+    try {
+        auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(body));
+        bool has = obj.HasKey(L"versions") && obj.GetNamedArray(L"versions").Size() > 0;
+        cache[projectId] = has;
+        return has;
+    }
+    catch (...) {
+        writeLog("projectHasAnyVersion: JSON parse failed, project=" + std::to_string(projectId));
+        cache[projectId] = true;
+        return true;
+    }
 }
 
 // 保存クエリ 1 件の結果を total_count に達するまでページングして取得する
@@ -4257,6 +4356,19 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     // ユーザ id → 姓のセッション内キャッシュ（一覧の最終更新者列。resolveLastName が使う）
     std::unordered_map<int, std::string> userLastNames;
 
+    // バージョン欄が有効なトラッカー id 集合（本スレッド専用でロック不要）
+    // nullopt = 未取得または enabled_standard_fields 非対応（Redmine 5.0 未満）。
+    // nullopt の間は全トラッカー有効（従来動作）として扱う
+    std::optional<std::unordered_set<int>> versionedTrackers;
+    bool versionedTrackersResolved = false;
+
+    // プロジェクト id → バージョン定義有無のセッション内キャッシュ（projectHasAnyVersion が使う）
+    std::unordered_map<int, bool> projectHasVersions;
+
+    // バージョン欄判定情報を最後に取得した時刻（GetTickCount64。0 = 未取得）
+    // プロセス内のみ保持し永続化しない。（起動時は必ず取得する）
+    ULONGLONG versionMetaFetchTick = 0;
+
     while (!g_shutdownRequested) {
         try {
             SYSTEMTIME utcNow;
@@ -4304,6 +4416,35 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
                     groupIds = ownGroups;
                     groupIdsResolved = true;
                     writeLog("group ids: " + std::to_string(groupIds.size()) + " (own groups fallback)");
+                }
+            }
+
+            // バージョン欄判定情報の鮮度管理
+            // 「今すぐ更新」または設定間隔（version_meta_refresh_hours）の超過で破棄して
+            // 再取得する。トラッカー・バージョン定義の変更を再起動なしで反映するため。
+            // versionedTrackers の中身は破棄しない。直後の再取得が失敗しても前回の集合で
+            // 判定を継続するためで、成功時に上書きされる
+            if (versionedTrackersResolved
+                && (manualTriggered
+                    || GetTickCount64() - versionMetaFetchTick
+                        >= static_cast<ULONGLONG>(cfg.versionMetaRefreshHours) * 3600000ULL)) {
+                versionedTrackersResolved = false;
+                projectHasVersions.clear();
+                writeLog(manualTriggered ? "version metadata cache cleared (manual poll)"
+                                         : "version metadata cache cleared (interval)");
+            }
+
+            // バージョン欄が有効なトラッカー集合を確定する（起動時と、上のキャッシュ破棄後）
+            // バージョンフィルタが「欄の無いチケット」を誤って除外しないための判定材料。
+            // 接続エラーは次回ポーリングで再試行する。（その間は前回の集合を使い続ける）
+            // 休止時間帯の判定より後にあるため休止中はネットワークに触れない
+            if (!versionedTrackersResolved) {
+                if (fetchVersionedTrackerIds(cfg, versionedTrackers)) {
+                    versionedTrackersResolved = true;
+                    versionMetaFetchTick = GetTickCount64();
+                    writeLog(versionedTrackers
+                        ? "versioned trackers: " + std::to_string(versionedTrackers->size())
+                        : "versioned trackers: not supported (treat all as versioned)");
                 }
             }
 
@@ -4368,9 +4509,21 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             writeLog("poll: " + std::to_string(issues.size()) + " issues ("
                 + std::to_string(elapsed) + "ms), next: " + nextPollTimeStr(pollsPerHour));
 
-            // 担当がグループかを付与する（一覧の 👥 マーカー用。表示専用の属性のため取得後に一括で付ける）
-            for (auto& is : issues)
+            // 表示・判定用の属性を取得後に一括で付与する
+            // assignedToGroup：一覧の 👥 マーカー用
+            // hasVersionField：バージョン欄の有無（バージョンフィルタの誤除外防止）。
+            //   バージョン設定済みなら欄は自明に在るため判定を省き、プロジェクト単位の
+            //   キャッシュで 2 回目以降のポーリングは HTTP なしで済む
+            for (auto& is : issues) {
+                if (g_shutdownRequested) break;
                 is.assignedToGroup = isGroupAssignee(groupIds, is.assignedToId);
+                if (is.hasFixedVersion) continue;  // hasVersionField は既定 true のまま
+                // trackerId 不明（0）は「欄あり」に倒す。（従来どおり除外対象。Issue のコメントと整合）
+                bool trackerHas = is.trackerId <= 0 || !versionedTrackers
+                    || versionedTrackers->count(is.trackerId) != 0;
+                is.hasVersionField = trackerHas
+                    && projectHasAnyVersion(cfg, is.projectId, projectHasVersions);
+            }
 
             // 一覧・tooltip は最終更新者の解決を待たずに先行公開する。初回起動や移行直後は
             // resolveUpdaters が全件分の HTTP を打つため、完了を待つと一覧が空のまま待たされる。

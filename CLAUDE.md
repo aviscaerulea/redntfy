@@ -55,6 +55,11 @@ build.ps1 は `Microsoft.VisualStudio.DevShell.dll` + `Enter-VsDevShell` で VC+
   admin 権限が無いと 403 になる。縮退時は他グループ宛の判定が漏れるが誤判定はしない。
   403 以外の失敗は次回ポーリングで再試行する。
 
+- 「バージョン未指定の除外」はバージョン欄が無いチケット（トラッカーで欄が無効、またはプロジェクトにバージョン未定義）を除外しない  
+  判定材料は `/trackers.json`（Redmine 5.0 未満は全トラッカー有効に縮退）と  
+  `/projects/:id/versions.json`（プロジェクト単位のキャッシュ）。  
+  起動時・「今すぐ更新」・`version_meta_refresh_hours`（デフォルト 24 時間）超過で再取得する。
+
 - schedule の 0（休止時間帯）は force poll・stale 判定より優先される  
   この順序を崩すと深夜に通知が鳴る。起動直後の 1 回だけは休止時間帯でも実行する。
   トレイメニューの「今すぐ更新」（`g_manualPoll`）だけは明示操作として休止時間帯・クールダウンを無視する。
