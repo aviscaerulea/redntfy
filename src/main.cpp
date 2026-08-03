@@ -4628,6 +4628,97 @@ static void showPollDoneToast()
     }
 }
 
+// shutdown と手動更新（g_manualPoll）だけを監視して待つ（100ms 刻み）
+// waitInterruptible と違い forcePoll では起きない。休止時間帯とクールダウン待ちで使う。
+// （forcePoll で即復帰すると NIC 変化の連発時に周回して待機の目的が破れるため）
+static void waitIgnoringForcePoll(ULONGLONG ms) {
+    for (ULONGLONG waited = 0; waited < ms && !g_shutdownRequested && !g_manualPoll.load();
+            waited += 100)
+        Sleep(100);
+}
+
+// ポーリングスレッドがセッション中に確定・キャッシュする判定材料
+// 本スレッド専用でロック不要。resolvePollMetadata が休止時間帯の判定後に毎周回更新する。
+struct PollSession {
+    std::vector<int> ownGroups;        // 自分の所属グループ（fetchMyUserId が設定）
+    std::vector<int> groupIds;         // グループ担当判定に使う集合（全グループ、権限不足時は所属グループ）
+    bool groupIdsResolved = false;
+
+    // ユーザ id → 姓・名のセッション内キャッシュ（一覧の最終更新者表示。resolveUserNames が使う）
+    std::unordered_map<int, UserNames> userNames;
+
+    // バージョン欄が有効なトラッカー id 集合
+    // nullopt = 未取得または enabled_standard_fields 非対応（Redmine 5.0 未満）。
+    // nullopt の間は全トラッカー有効（従来動作）として扱う
+    std::optional<std::unordered_set<int>> versionedTrackers;
+    bool versionedTrackersResolved = false;
+
+    // プロジェクト id → バージョン定義有無のセッション内キャッシュ（projectHasAnyVersion が使う）
+    std::unordered_map<int, bool> projectHasVersions;
+
+    // バージョン欄判定情報を最後に取得した時刻（GetTickCount64。0 = 未取得）
+    // プロセス内のみ保持し永続化しない。（起動時は必ず取得する）
+    ULONGLONG versionMetaFetchTick = 0;
+};
+
+// ポーリングの判定材料（user id・グループ集合・バージョン欄情報）を確定・更新する
+// 未確定分の取得を毎周回試み、失敗分は次回ポーリングで再試行する。HTTP を伴うため、
+// 呼び出し側は休止時間帯の判定より後に呼ぶこと。（休止中はネットワークに触れない）
+// manualTriggered はバージョン欄情報のキャッシュ破棄条件。（「今すぐ更新」で強制再取得）
+static void resolvePollMetadata(const Config& cfg, PollSession& s, bool manualTriggered) {
+    // 自分の user id を確定する。（失敗時 0 = 自分の操作の除外判定なし）
+    // 自動起動直後などネットワーク未接続で失敗した場合に備え、取得できるまで毎回試みる
+    if (g_myUserId == 0) {
+        g_myUserId = fetchMyUserId(cfg, s.ownGroups);
+        if (g_myUserId != 0) writeLog("my user id: " + std::to_string(g_myUserId.load()));
+    }
+
+    // グループ担当マーカーの判定集合を確定する（user id 取得後に 1 回）
+    // /groups.json は admin 権限が必要なため、403 なら自分の所属グループへ縮退する。
+    // （他グループ宛の判定は漏れるが誤判定はしない）接続エラーは次回ポーリングで再試行。
+    if (!s.groupIdsResolved && g_myUserId != 0) {
+        DWORD status = 0;
+        if (auto all = fetchAllGroupIds(cfg, &status)) {
+            s.groupIds = std::move(*all);
+            s.groupIdsResolved = true;
+            writeLog("group ids: " + std::to_string(s.groupIds.size()) + " (all groups)");
+        }
+        else if (status == 403) {
+            s.groupIds = s.ownGroups;
+            s.groupIdsResolved = true;
+            writeLog("group ids: " + std::to_string(s.groupIds.size()) + " (own groups fallback)");
+        }
+    }
+
+    // バージョン欄判定情報の鮮度管理
+    // 「今すぐ更新」または設定間隔（version_meta_refresh_hours）の超過で破棄して
+    // 再取得する。トラッカー・バージョン定義の変更を再起動なしで反映するため。
+    // versionedTrackers の中身は破棄しない。直後の再取得が失敗しても前回の集合で
+    // 判定を継続するためで、成功時に上書きされる
+    if (s.versionedTrackersResolved
+        && (manualTriggered
+            || GetTickCount64() - s.versionMetaFetchTick
+                >= static_cast<ULONGLONG>(cfg.versionMetaRefreshHours) * 3600000ULL)) {
+        s.versionedTrackersResolved = false;
+        s.projectHasVersions.clear();
+        writeLog(manualTriggered ? "version metadata cache cleared (manual poll)"
+                                 : "version metadata cache cleared (interval)");
+    }
+
+    // バージョン欄が有効なトラッカー集合を確定する（起動時と、上のキャッシュ破棄後）
+    // バージョンフィルタが「欄の無いチケット」を誤って除外しないための判定材料。
+    // 接続エラーは次回ポーリングで再試行する。（その間は前回の集合を使い続ける）
+    if (!s.versionedTrackersResolved) {
+        if (fetchVersionedTrackerIds(cfg, s.versionedTrackers)) {
+            s.versionedTrackersResolved = true;
+            s.versionMetaFetchTick = GetTickCount64();
+            writeLog(s.versionedTrackers
+                ? "versioned trackers: " + std::to_string(s.versionedTrackers->size())
+                : "versioned trackers: not supported (treat all as versioned)");
+        }
+    }
+}
+
 // ポーリングスレッド本体
 //
 // メインスレッドからポーリング処理（HTTP I/O）を分離し、UI（右クリックメニュー等）の
@@ -4647,26 +4738,8 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
 
     bool startupPoll = true;  // 起動直後の 1 回だけ schedule・クールダウンに関わらずポーリングする
 
-    // グループ担当判定用の id 集合（起動後に 1 回確定する。本スレッド専用でロック不要）
-    std::vector<int> ownGroups;        // 自分の所属グループ（fetchMyUserId が設定）
-    std::vector<int> groupIds;         // 判定に使う集合（全グループ、権限不足時は所属グループ）
-    bool groupIdsResolved = false;
-
-    // ユーザ id → 姓・名のセッション内キャッシュ（一覧の最終更新者表示。resolveUserNames が使う）
-    std::unordered_map<int, UserNames> userNames;
-
-    // バージョン欄が有効なトラッカー id 集合（本スレッド専用でロック不要）
-    // nullopt = 未取得または enabled_standard_fields 非対応（Redmine 5.0 未満）。
-    // nullopt の間は全トラッカー有効（従来動作）として扱う
-    std::optional<std::unordered_set<int>> versionedTrackers;
-    bool versionedTrackersResolved = false;
-
-    // プロジェクト id → バージョン定義有無のセッション内キャッシュ（projectHasAnyVersion が使う）
-    std::unordered_map<int, bool> projectHasVersions;
-
-    // バージョン欄判定情報を最後に取得した時刻（GetTickCount64。0 = 未取得）
-    // プロセス内のみ保持し永続化しない。（起動時は必ず取得する）
-    ULONGLONG versionMetaFetchTick = 0;
+    // セッション中に確定・キャッシュする判定材料（内訳は PollSession のコメントを参照）
+    PollSession session;
 
     while (!g_shutdownRequested) {
         try {
@@ -4684,68 +4757,12 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
 
             if (pollsPerHour == 0 && !startupPoll && !manualTriggered) {
                 g_forcePoll.store(false);  // 休止中に積まれたトリガーは破棄する（次の稼働正時に自然に取得される）
-                // waitInterruptible は forcePoll で即復帰するため使わない（NIC 変化の連発で
-                // 周回してしまい「休止中は何もしない」が破れる）。shutdown と手動更新のみ監視して待つ
-                DWORD sleepMs = calcSleepUntilNextPoll(0);
-                for (DWORD waited = 0; waited < sleepMs && !g_shutdownRequested
-                        && !g_manualPoll.load(); waited += 100)
-                    Sleep(100);
+                waitIgnoringForcePoll(calcSleepUntilNextPoll(0));
                 continue;
             }
 
-            // 自分の user id を確定する。（失敗時 0 = 自分の操作の除外判定なし）
-            // 自動起動直後などネットワーク未接続で失敗した場合に備え、取得できるまで毎回試みる。
-            // 休止時間帯の判定より後に置き、休止中はネットワークに一切触れない
-            if (g_myUserId == 0) {
-                g_myUserId = fetchMyUserId(cfg, ownGroups);
-                if (g_myUserId != 0) writeLog("my user id: " + std::to_string(g_myUserId.load()));
-            }
-
-            // グループ担当マーカーの判定集合を確定する（user id 取得後に 1 回）
-            // /groups.json は admin 権限が必要なため、403 なら自分の所属グループへ縮退する。
-            // （他グループ宛の判定は漏れるが誤判定はしない）接続エラーは次回ポーリングで再試行。
-            if (!groupIdsResolved && g_myUserId != 0) {
-                DWORD status = 0;
-                if (auto all = fetchAllGroupIds(cfg, &status)) {
-                    groupIds = std::move(*all);
-                    groupIdsResolved = true;
-                    writeLog("group ids: " + std::to_string(groupIds.size()) + " (all groups)");
-                }
-                else if (status == 403) {
-                    groupIds = ownGroups;
-                    groupIdsResolved = true;
-                    writeLog("group ids: " + std::to_string(groupIds.size()) + " (own groups fallback)");
-                }
-            }
-
-            // バージョン欄判定情報の鮮度管理
-            // 「今すぐ更新」または設定間隔（version_meta_refresh_hours）の超過で破棄して
-            // 再取得する。トラッカー・バージョン定義の変更を再起動なしで反映するため。
-            // versionedTrackers の中身は破棄しない。直後の再取得が失敗しても前回の集合で
-            // 判定を継続するためで、成功時に上書きされる
-            if (versionedTrackersResolved
-                && (manualTriggered
-                    || GetTickCount64() - versionMetaFetchTick
-                        >= static_cast<ULONGLONG>(cfg.versionMetaRefreshHours) * 3600000ULL)) {
-                versionedTrackersResolved = false;
-                projectHasVersions.clear();
-                writeLog(manualTriggered ? "version metadata cache cleared (manual poll)"
-                                         : "version metadata cache cleared (interval)");
-            }
-
-            // バージョン欄が有効なトラッカー集合を確定する（起動時と、上のキャッシュ破棄後）
-            // バージョンフィルタが「欄の無いチケット」を誤って除外しないための判定材料。
-            // 接続エラーは次回ポーリングで再試行する。（その間は前回の集合を使い続ける）
-            // 休止時間帯の判定より後にあるため休止中はネットワークに触れない
-            if (!versionedTrackersResolved) {
-                if (fetchVersionedTrackerIds(cfg, versionedTrackers)) {
-                    versionedTrackersResolved = true;
-                    versionMetaFetchTick = GetTickCount64();
-                    writeLog(versionedTrackers
-                        ? "versioned trackers: " + std::to_string(versionedTrackers->size())
-                        : "versioned trackers: not supported (treat all as versioned)");
-                }
-            }
+            // 判定材料の確定・更新（HTTP を伴う。休止時間帯の判定より後 = 休止中は触れない）
+            resolvePollMetadata(cfg, session, manualTriggered);
 
             // 即時ポーリング判定。（forcePoll フラグ or 1 時間以上未ポーリング）
             // 前回ポーリングからクールダウン以内の即時要求は、残り時間を待ってから取得し直す
@@ -4758,13 +4775,9 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             if (!manualTriggered && (forceTriggered || stale) && !startupPoll && lastTick > 0
                 && (tickNow - lastTick < FORCE_POLL_COOLDOWN_MS)) {
                 writeLog("force poll deferred (cooldown)");
-                // クールダウンの残り時間は forcePoll を無視して待つ。waitInterruptible は
-                // forcePoll で即復帰するため、連発トリガー時に busy loop になり使えない。
-                // 手動更新はクールダウンの対象外なので監視して即座に抜ける
-                ULONGLONG remain = FORCE_POLL_COOLDOWN_MS - (tickNow - lastTick);
-                for (ULONGLONG waited = 0; waited < remain && !g_shutdownRequested
-                        && !g_manualPoll.load(); waited += 100)
-                    Sleep(100);
+                // クールダウンの残り時間は forcePoll を無視して待つ。
+                // 手動更新はクールダウンの対象外なので waitIgnoringForcePoll が監視して即座に抜ける
+                waitIgnoringForcePoll(FORCE_POLL_COOLDOWN_MS - (tickNow - lastTick));
                 continue;
             }
             if (manualTriggered) writeLog("manual poll triggered");
@@ -4815,13 +4828,13 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             //   キャッシュで 2 回目以降のポーリングは HTTP なしで済む
             for (auto& is : issues) {
                 if (g_shutdownRequested) break;
-                is.assignedToGroup = isGroupAssignee(groupIds, is.assignedToId);
+                is.assignedToGroup = isGroupAssignee(session.groupIds, is.assignedToId);
                 if (is.hasFixedVersion) continue;  // hasVersionField は既定 true のまま
                 // trackerId 不明（0）は「欄あり」に倒す。（従来どおり除外対象。Issue のコメントと整合）
-                bool trackerHas = is.trackerId <= 0 || !versionedTrackers
-                    || versionedTrackers->count(is.trackerId) != 0;
+                bool trackerHas = is.trackerId <= 0 || !session.versionedTrackers
+                    || session.versionedTrackers->count(is.trackerId) != 0;
                 is.hasVersionField = trackerHas
-                    && projectHasAnyVersion(cfg, is.projectId, projectHasVersions);
+                    && projectHasAnyVersion(cfg, is.projectId, session.projectHasVersions);
             }
 
             // 一覧・tooltip は最終更新者の解決を待たずに先行公開する。初回起動や移行直後は
@@ -4834,11 +4847,11 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
 
             // 前回状態はここで 1 回だけ読み、最終更新者の解決と通知判定で共有する
             PollState prevState = loadState(exeDir);
-            resolveUpdaters(cfg, issues, prevState, userNames);
+            resolveUpdaters(cfg, issues, prevState, session.userNames);
             if (g_shutdownRequested) break;  // resolveUpdaters は HTTP を伴うため中断を確認する
 
             int notified = deliverPollResults(exeDir, cfg, issues, prevState);
-            refreshPins(exeDir, cfg, issues, groupIds, groupIdsResolved);
+            refreshPins(exeDir, cfg, issues, session.groupIds, session.groupIdsResolved);
 
             // 「今すぐ更新」の完了通知。更新を検知した回は通知 Toast が出ているため重ねない
             if (manualTriggered && notified == 0 && !g_shutdownRequested)
