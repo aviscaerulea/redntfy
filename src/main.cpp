@@ -4430,20 +4430,134 @@ static bool hasNewQueryEntry(const std::vector<int>& now, const std::vector<int>
     return false;
 }
 
-// ポーリング結果の処理（通知判定 → Toast → 状態保存）
+// 通知対象を選定する（I/O・共有状態の変更を持たない純粋ロジック。単体テスト対象）
 //
 // 前回状態（state.json）と突合して「新規流入」「updated_on の進行」「既知チケットの
 // 新クエリ流入」を検知する。クエリ流入は「更新」として通知する。ただし前回追跡して
 // いなかったクエリについては、そのクエリへの流入も、そのクエリだけに属するチケットの
 // 新規流入も検知しない。（設定追加直後の通知の嵐を防ぐ）
 // 自分が起票したチケットの流入は author.id で、自分の操作による更新と自分の更新が原因の
-// 流入は最終 journal の更新者 id で除外する。（g_myUserId == 0 のときは除外せず通知側に倒す）
-// この抑止は g_muteOwnChanges で一括 ON/OFF できる。OFF なら自分の起票・更新も通知する。
+// 流入は最終 journal の更新者 id で除外する。（myUserId == 0 のときは除外せず通知側に倒す）
+// この抑止は muteOwnChanges で一括 ON/OFF できる。OFF なら自分の起票・更新も通知する。
 // 担当者フィルタ ON なら、自分が担当でないチケットもあわせて除外する。
 // バージョンフィルタ ON なら、fixed_version 未指定かつ期日なしのチケットもあわせて除外する。
-// ベースライン未確立（初回起動・state.json 破損）の場合は通知せず状態保存のみ行う。
-// prev は呼び出し側が loadState で読んだ前回状態。（resolveUpdaters のキャッシュと共有するため外で読む）
 // issues の最終更新者は resolveUpdaters が確定済みであることを前提とする。
+// 戻り値の NotifyTarget::issue は issues の要素を指す。（issues より長く保持しない）
+// 終了要求による中断は nullopt を返す。（呼び出し側は state.json を書かずに抜ける）
+static std::optional<std::vector<NotifyTarget>> selectNotifyTargets(
+    const std::vector<Issue>& issues, const PollState& prev,
+    bool muteOwnChanges, int myUserId)
+{
+    std::vector<NotifyTarget> targets;
+    for (const auto& is : issues) {
+        if (g_shutdownRequested) return std::nullopt;
+        // 担当者フィルタで外れたチケットは通知しない
+        if (!passesAssigneeFilter(is)) continue;
+        // バージョン未指定は「将来の課題」なので通知しない（期日ありは通す）
+        if (!passesVersionFilter(is)) continue;
+        auto it = prev.issues.find(is.id);
+        if (it == prev.issues.end()) {
+            // 新規流入（自分の起票は通知しない。muteOwnChanges OFF なら通知に倒す）
+            if (muteOwnChanges && myUserId != 0 && is.authorId == myUserId) continue;
+            // 前回追跡していたクエリのいずれにも属さないチケットは、query_ids へ追加した
+            // 直後のクエリ固有の既存チケットなので黙って採用する。（既知チケットの流入抑止と
+            // 同じ方針。通知するとサマリ Toast・通知音・未読バッジが件数分跳ね上がる）
+            // v1 移行時は knownQueries が空で判定できないため、従来どおり通知側に倒す。
+            bool inKnown = prev.knownQueries.empty();
+            for (int q : is.queryIds) {
+                if (std::find(prev.knownQueries.begin(), prev.knownQueries.end(), q)
+                        != prev.knownQueries.end()) {
+                    inKnown = true;
+                    break;
+                }
+            }
+            if (!inKnown) continue;
+            // 自分の更新が原因の流入は通知しない。既存チケットは自分の操作（期日削除等）で
+            // 保存クエリの条件に入り直すことがある。起票者チェックだけでは弾けないため、
+            // 前回ポーリング以降に更新されたチケットは最終更新者でも判定する。
+            // それより古い更新の流入は時間経過（期日接近等）によるもので、最終更新者が
+            // 自分でも通知する。（既知チケットのクエリ流入の扱いと揃える）
+            // polled_on の無い旧形式 state.json では判定せず通知側に倒す。
+            bool recentUpdate = !prev.polledOn.empty() && is.updatedOn > prev.polledOn;
+            if (muteOwnChanges && recentUpdate && myUserId != 0 && is.updaterId == myUserId) continue;
+            // 表示名も同じ基準で選ぶ。直近の更新が原因の流入はその更新者、時間経過の流入は
+            // 起票者を出す。（古い最終更新者を「新規：○○」と出すと起票者と誤読される）
+            targets.push_back({&is, NotifyKind::New,
+                recentUpdate && !is.updaterName.empty() ? is.updaterName : is.authorName});
+            continue;
+        }
+        const StateEntry& pv = it->second;
+        bool updated = is.updatedOn > pv.updatedOn;
+        // 既知チケットの新クエリ流入（期限が近づいて期限クエリに入った等）。「更新」扱いで通知する
+        bool entered = pv.hasQueries
+            && hasNewQueryEntry(is.queryIds, pv.queryIds, prev.knownQueries);
+        if (!updated && !entered) continue;
+        // 自分の操作による更新は通知しない。（muteOwnChanges OFF なら通知に倒す）
+        // 最終更新者は resolveUpdaters が確定済み。
+        // updated_on が進んでいない純粋な流入では判定しない：時間経過による流入が典型で
+        // 「自分の操作」ではないため。（クエリ流入の Toast は更新者名も出さない）
+        if (muteOwnChanges && updated && myUserId != 0 && is.updaterId == myUserId) continue;
+        targets.push_back({&is, updated ? NotifyKind::Updated : NotifyKind::QueryEntered,
+                           updated ? is.updaterName : std::string()});
+    }
+    return targets;
+}
+
+// 選定済みの通知対象をユーザへ届ける（Toast・通知音・未読記録・内訳ログ）
+// targets は 1 件以上を前提とする。Toast の失敗はログのみ残して通知音・未読記録は続行する。
+// （音と未読バッジだけでも更新の発生は伝わるため）
+static void emitNotifications(const Config& cfg, const std::vector<NotifyTarget>& targets) {
+    try {
+        if (targets.size() == 1) {
+            // 1 件：チケット番号＋件名を出し、クリックでそのチケットを開く。
+            // 種別に更新者名を添える。（例「更新：山田太郎」。名前が取れない場合は種別のみ）
+            const NotifyTarget& nt = targets[0];
+            const Issue* t = nt.issue;
+            std::wstring kind = nt.kind == NotifyKind::New ? L"新規" : L"更新";
+            if (!nt.updaterName.empty()) kind += L"：" + toWide(nt.updaterName);
+            showToast(L"#" + std::to_wstring(t->id) + L" " + toWide(t->subject),
+                      kind, issueUrl(cfg, t->id));
+        }
+        else {
+            // 複数件：合計件数のみのサマリ 1 通とし、クリックで代表画面（queryUrl）を開く
+            showToast(L"チケットが " + std::to_wstring(targets.size()) + L" 件更新されました",
+                      L"",
+                      queryUrl(cfg));
+        }
+    }
+    catch (winrt::hresult_error const& e) {
+        writeLog("notify toast failed: " + winrt::to_string(e.message()));
+    }
+    catch (...) {
+        writeLog("notify toast failed: unknown exception");
+    }
+    // 通知音（ミーティング中ミュートの判定は発火時点の状態で行う）
+    if (g_soundEnabled.load() && !(g_muteInMeeting.load() && isMeetingActive()))
+        launchSound(cfg);
+    {
+        // 未読 id を記録する。（一覧の太字と tooltip の未読件数。行クリックで開いた分だけ取り除く）
+        std::lock_guard<std::mutex> lk(g_mtx);
+        for (const auto& t : targets) g_unreadIds.insert(t.issue->id);
+    }
+    int nNew = 0, nUpd = 0, nEnt = 0;
+    for (const auto& t : targets) {
+        if (t.kind == NotifyKind::New)          ++nNew;
+        else if (t.kind == NotifyKind::Updated) ++nUpd;
+        else                                    ++nEnt;
+    }
+    // 内訳を残すのは、クエリ流入だけで通知が出た回を後から切り分けるため
+    writeLog("notify: " + std::to_string(targets.size()) + " issue(s) (new="
+        + std::to_string(nNew) + " updated=" + std::to_string(nUpd)
+        + " entered=" + std::to_string(nEnt) + ")");
+}
+
+// ポーリング結果の処理（共有状態の公開 → 通知対象の選定 → 通知 → 状態保存）
+//
+// 選定基準は selectNotifyTargets、通知内容は emitNotifications のコメントを参照。
+// ベースライン未確立（初回起動・state.json 破損）の場合は通知せず状態保存のみ行う。
+// 終了要求で選定が中断された場合は state.json を書かずに抜ける。前回のまま残るため、
+// 未通知分は次回ポーリングで再検知される。（通知は失われない）
+// prev は呼び出し側が loadState で読んだ前回状態。（resolveUpdaters のキャッシュと共有するため外で読む）
 // 戻り値：通知対象と判定した件数。（0 は通知なし。「今すぐ更新」の完了通知の出し分けに使う）
 static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
                               const std::vector<Issue>& issues, const PollState& prev)
@@ -4478,113 +4592,17 @@ static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         }
     }
 
-    // 通知対象の抽出
-    std::vector<NotifyTarget> targets;
-    for (const auto& is : issues) {
-        // 終了要求時は state.json を書かずに抜ける。前回のまま残るため、未通知分は
-        // 次回ポーリングで再検知される。（通知は失われない）
-        if (g_shutdownRequested) return 0;
-        // 担当者フィルタで外れたチケットは通知しない
-        if (!passesAssigneeFilter(is)) continue;
-        // バージョン未指定は「将来の課題」なので通知しない（期日ありは通す）
-        if (!passesVersionFilter(is)) continue;
-        auto it = prev.issues.find(is.id);
-        if (it == prev.issues.end()) {
-            // 新規流入（自分の起票は通知しない。g_muteOwnChanges OFF なら通知に倒す）
-            if (g_muteOwnChanges.load() && g_myUserId != 0 && is.authorId == g_myUserId) continue;
-            // 前回追跡していたクエリのいずれにも属さないチケットは、query_ids へ追加した
-            // 直後のクエリ固有の既存チケットなので黙って採用する。（既知チケットの流入抑止と
-            // 同じ方針。通知するとサマリ Toast・通知音・未読バッジが件数分跳ね上がる）
-            // v1 移行時は knownQueries が空で判定できないため、従来どおり通知側に倒す。
-            bool inKnown = prev.knownQueries.empty();
-            for (int q : is.queryIds) {
-                if (std::find(prev.knownQueries.begin(), prev.knownQueries.end(), q)
-                        != prev.knownQueries.end()) {
-                    inKnown = true;
-                    break;
-                }
-            }
-            if (!inKnown) continue;
-            // 自分の更新が原因の流入は通知しない。既存チケットは自分の操作（期日削除等）で
-            // 保存クエリの条件に入り直すことがある。起票者チェックだけでは弾けないため、
-            // 前回ポーリング以降に更新されたチケットは最終更新者でも判定する。
-            // それより古い更新の流入は時間経過（期日接近等）によるもので、最終更新者が
-            // 自分でも通知する。（既知チケットのクエリ流入の扱いと揃える）
-            // polled_on の無い旧形式 state.json では判定せず通知側に倒す。
-            bool recentUpdate = !prev.polledOn.empty() && is.updatedOn > prev.polledOn;
-            if (g_muteOwnChanges.load() && recentUpdate && g_myUserId != 0 && is.updaterId == g_myUserId) continue;
-            // 表示名も同じ基準で選ぶ。直近の更新が原因の流入はその更新者、時間経過の流入は
-            // 起票者を出す。（古い最終更新者を「新規：○○」と出すと起票者と誤読される）
-            targets.push_back({&is, NotifyKind::New,
-                recentUpdate && !is.updaterName.empty() ? is.updaterName : is.authorName});
-            continue;
-        }
-        const StateEntry& pv = it->second;
-        bool updated = is.updatedOn > pv.updatedOn;
-        // 既知チケットの新クエリ流入（期限が近づいて期限クエリに入った等）。「更新」扱いで通知する
-        bool entered = pv.hasQueries
-            && hasNewQueryEntry(is.queryIds, pv.queryIds, prev.knownQueries);
-        if (!updated && !entered) continue;
-        // 自分の操作による更新は通知しない。（g_muteOwnChanges OFF なら通知に倒す）
-        // 最終更新者は resolveUpdaters が確定済み。
-        // updated_on が進んでいない純粋な流入では判定しない：時間経過による流入が典型で
-        // 「自分の操作」ではないため。（クエリ流入の Toast は更新者名も出さない）
-        if (g_muteOwnChanges.load() && updated && g_myUserId != 0 && is.updaterId == g_myUserId) continue;
-        targets.push_back({&is, updated ? NotifyKind::Updated : NotifyKind::QueryEntered,
-                           updated ? is.updaterName : std::string()});
-    }
+    auto targets = selectNotifyTargets(issues, prev, g_muteOwnChanges.load(), g_myUserId.load());
+    if (!targets) return 0;  // 終了要求による中断
 
-    if (!targets.empty()) {
-        try {
-            if (targets.size() == 1) {
-                // 1 件：チケット番号＋件名を出し、クリックでそのチケットを開く。
-                // 種別に更新者名を添える。（例「更新：山田太郎」。名前が取れない場合は種別のみ）
-                const NotifyTarget& nt = targets[0];
-                const Issue* t = nt.issue;
-                std::wstring kind = nt.kind == NotifyKind::New ? L"新規" : L"更新";
-                if (!nt.updaterName.empty()) kind += L"：" + toWide(nt.updaterName);
-                showToast(L"#" + std::to_wstring(t->id) + L" " + toWide(t->subject),
-                          kind, issueUrl(cfg, t->id));
-            }
-            else {
-                // 複数件：合計件数のみのサマリ 1 通とし、クリックで代表画面（queryUrl）を開く
-                showToast(L"チケットが " + std::to_wstring(targets.size()) + L" 件更新されました",
-                          L"",
-                          queryUrl(cfg));
-            }
-        }
-        catch (winrt::hresult_error const& e) {
-            writeLog("notify toast failed: " + winrt::to_string(e.message()));
-        }
-        catch (...) {
-            writeLog("notify toast failed: unknown exception");
-        }
-        // 通知音（ミーティング中ミュートの判定は発火時点の状態で行う）
-        if (g_soundEnabled.load() && !(g_muteInMeeting.load() && isMeetingActive()))
-            launchSound(cfg);
-        {
-            // 未読 id を記録する。（一覧の太字と tooltip の未読件数。行クリックで開いた分だけ取り除く）
-            std::lock_guard<std::mutex> lk(g_mtx);
-            for (const auto& t : targets) g_unreadIds.insert(t.issue->id);
-        }
-        int nNew = 0, nUpd = 0, nEnt = 0;
-        for (const auto& t : targets) {
-            if (t.kind == NotifyKind::New)          ++nNew;
-            else if (t.kind == NotifyKind::Updated) ++nUpd;
-            else                                    ++nEnt;
-        }
-        // 内訳を残すのは、クエリ流入だけで通知が出た回を後から切り分けるため
-        writeLog("notify: " + std::to_string(targets.size()) + " issue(s) (new="
-            + std::to_string(nNew) + " updated=" + std::to_string(nUpd)
-            + " entered=" + std::to_string(nEnt) + ")");
-    }
+    if (!targets->empty()) emitNotifications(cfg, *targets);
 
     // 保存に失敗すると次回も同じ更新を再検知して通知が重複するため、Toast で知らせる
     if (!saveState(exeDir, cfg, issues))
         showErrorToast(L"状態保存エラー", L"state.json を書き込めません。通知が重複する可能性があります");
     if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
 
-    return static_cast<int>(targets.size());
+    return static_cast<int>(targets->size());
 }
 
 // 「今すぐ更新」の完了 Toast

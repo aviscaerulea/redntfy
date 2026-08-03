@@ -434,6 +434,107 @@ static void testPassesVersionFilter() {
     g_excludeNoVersion.store(false);
 }
 
+// ==================== selectNotifyTargets ====================
+
+// 通知対象選定の検証用に前回状態を組み立てる（baseline 確立済み・クエリ 1 追跡）
+static PollState makePrevState() {
+    PollState prev;
+    prev.baseline     = true;
+    prev.knownQueries = {1};
+    prev.polledOn     = "2026-08-01T00:00:00Z";
+    return prev;
+}
+
+// 検証用チケットを組み立てる（クエリ 1 所属・prev.polledOn より新しい更新）
+static Issue makeIssue(int id, const std::string& updatedOn = "2026-08-02T00:00:00Z") {
+    Issue is;
+    is.id        = id;
+    is.updatedOn = updatedOn;
+    is.queryIds  = {1};
+    return is;
+}
+
+static void testSelectNotifyTargets() {
+    const int ME = 5;
+
+    // 新規流入は New として通知し、直近更新の更新者名を添える
+    {
+        auto prev = makePrevState();
+        auto is   = makeIssue(101);
+        is.updaterId   = 9;
+        is.updaterName = "山田太郎";
+        auto r = selectNotifyTargets({is}, prev, true, ME);
+        CHECK(r && r->size() == 1);
+        CHECK((*r)[0].kind == NotifyKind::New);
+        CHECK((*r)[0].updaterName == "山田太郎");
+    }
+    // 時間経過による流入（prev.polledOn より古い更新）は起票者名を出す
+    {
+        auto prev = makePrevState();
+        auto is   = makeIssue(102, "2026-07-01T00:00:00Z");
+        is.authorName  = "起票者";
+        is.updaterName = "更新者";
+        auto r = selectNotifyTargets({is}, prev, true, ME);
+        CHECK(r && r->size() == 1 && (*r)[0].updaterName == "起票者");
+    }
+    // 自分の起票・自分の直近更新による流入は抑止し、抑止 OFF なら通知する
+    {
+        auto prev = makePrevState();
+        auto mine = makeIssue(103);
+        mine.authorId = ME;
+        auto updatedByMe = makeIssue(104);
+        updatedByMe.updaterId = ME;
+        auto r = selectNotifyTargets({mine, updatedByMe}, prev, true, ME);
+        CHECK(r && r->empty());
+        r = selectNotifyTargets({mine, updatedByMe}, prev, false, ME);
+        CHECK(r && r->size() == 2);
+    }
+    // 前回追跡していないクエリだけに属する新規は黙って採用する（通知しない）
+    {
+        auto prev = makePrevState();
+        auto is   = makeIssue(105);
+        is.queryIds = {2};
+        auto r = selectNotifyTargets({is}, prev, true, ME);
+        CHECK(r && r->empty());
+    }
+    // 既知チケット：updated_on の進行は Updated、変化なしは通知なし
+    {
+        auto prev = makePrevState();
+        prev.issues[106] = {"2026-08-01T12:00:00Z", {1}, true};
+        auto moved  = makeIssue(106, "2026-08-02T00:00:00Z");
+        moved.updaterName = "更新者";
+        auto stable = makeIssue(106, "2026-08-01T12:00:00Z");
+        auto r = selectNotifyTargets({moved}, prev, true, ME);
+        CHECK(r && r->size() == 1);
+        CHECK((*r)[0].kind == NotifyKind::Updated);
+        CHECK((*r)[0].updaterName == "更新者");
+        r = selectNotifyTargets({stable}, prev, true, ME);
+        CHECK(r && r->empty());
+    }
+    // 既知チケットの新クエリ流入は QueryEntered（更新者名なし）。未追跡クエリへの流入は対象外
+    {
+        auto prev = makePrevState();
+        prev.knownQueries = {1, 2};
+        prev.issues[107]  = {"2026-08-01T12:00:00Z", {1}, true};
+        auto entered = makeIssue(107, "2026-08-01T12:00:00Z");
+        entered.queryIds = {1, 2};
+        auto r = selectNotifyTargets({entered}, prev, true, ME);
+        CHECK(r && r->size() == 1);
+        CHECK((*r)[0].kind == NotifyKind::QueryEntered);
+        CHECK((*r)[0].updaterName.empty());
+        entered.queryIds = {1, 3};  // クエリ 3 は前回未追跡
+        r = selectNotifyTargets({entered}, prev, true, ME);
+        CHECK(r && r->empty());
+    }
+    // v1 移行（knownQueries 空）：新規は通知側に倒す
+    {
+        auto prev = makePrevState();
+        prev.knownQueries.clear();
+        auto r = selectNotifyTargets({makeIssue(108)}, prev, true, ME);
+        CHECK(r && r->size() == 1 && (*r)[0].kind == NotifyKind::New);
+    }
+}
+
 // テストの列挙実行と集計出力（失敗ありなら終了コード 1）
 int main() {
     // 失敗診断は日本語（UTF-8）を含むため、コンソールの出力コードページを合わせる
@@ -455,6 +556,7 @@ int main() {
     testTrackedQueryIds();
     testQueryUrl();
     testPassesVersionFilter();
+    testSelectNotifyTargets();
     printf("checks: %d, failed: %d\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }
