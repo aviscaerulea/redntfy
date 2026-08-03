@@ -3549,17 +3549,32 @@ static bool isNewerVersion(const std::wstring& a, const std::wstring& b) {
     return aPat > bPat;
 }
 
+// ワーカースレッド用 WinRT アパートメントの RAII ガード
+// init_apartment は hresult_error を投げ得る。スレッドの未捕捉例外は std::terminate で
+// プロセス全体を落とすため、例外を吸収して成否を ok に持つ。呼び出し側は ok が false なら
+// ログを残してスレッドを終える。デストラクタは初期化成功時のみ uninit_apartment を呼ぶので、
+// 早期 return でも解放漏れ・過剰解放が起きない。
+struct WinRtApartment {
+    bool ok = false;
+    WinRtApartment() {
+        try {
+            winrt::init_apartment();
+            ok = true;
+        }
+        catch (...) {}
+    }
+    ~WinRtApartment() {
+        if (ok) winrt::uninit_apartment();
+    }
+};
+
 // GitHub の最新リリースを確認し、新版があれば Toast 通知とグローバル状態を更新する
 // 起動時のスレッドで 1 回だけ実行する。スレッドは detach せず wmain が終了時に join する。
 // （detach だとプロセス終了時の静的破棄と実行中の本関数が競合し、破棄済みの
 // g_mtx・g_latestVersion・g_logDir 等に触れる未定義動作になり得るため）
 static void checkForUpdates() {
-    // WinRT 初期化も hresult_error を投げ得るため捕捉する。スレッドの未捕捉例外は
-    // std::terminate でプロセス全体を落とすため、失敗はログのみ残してスレッドを終える
-    try {
-        winrt::init_apartment();
-    }
-    catch (...) {
+    WinRtApartment apartment;
+    if (!apartment.ok) {
         writeLog("update check: WinRT init failed");
         return;
     }
@@ -3617,7 +3632,6 @@ static void checkForUpdates() {
     catch (...) {
         writeLog("update check: unexpected exception");
     }
-    winrt::uninit_apartment();
 }
 
 // 更新通知メニュー項目のサイズを計算する
@@ -4606,12 +4620,9 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     // WinRT アパートメント初期化
     // 本スレッドは JSON パースと Toast 表示（deliverPollResults / showErrorToast）を持つため、
     // WinRT 呼び出しに先立ってアパートメントを初期化する。
-    // 初期化失敗の hresult_error を捕捉しないと未捕捉例外の std::terminate でプロセス全体が
-    // 落ちるため、失敗はログのみ残して本スレッドだけ終える。（ポーリングなしで常駐は継続）
-    try {
-        winrt::init_apartment();
-    }
-    catch (...) {
+    // 失敗はログのみ残して本スレッドだけ終える。（ポーリングなしで常駐は継続）
+    WinRtApartment apartment;
+    if (!apartment.ok) {
         writeLog("pollThreadFunc: WinRT init failed - polling unavailable");
         return;
     }
@@ -4837,8 +4848,6 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             writeLog("pollThreadFunc: sound thread did not finish within 5s on shutdown");
         }
     }
-
-    winrt::uninit_apartment();
 }
 
 // エントリポイント
