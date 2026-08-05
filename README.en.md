@@ -2,8 +2,8 @@
 
 [![日本語](https://img.shields.io/badge/lang-日本語-red)](README.md)
 [![English](https://img.shields.io/badge/lang-English-blue)](README.en.md)
-
 [![Release](https://img.shields.io/github/v/release/aviscaerulea/redntfy)](https://github.com/aviscaerulea/redntfy/releases/latest)
+[![License](https://img.shields.io/github/license/aviscaerulea/redntfy)](LICENSE)
 [![Build](https://github.com/aviscaerulea/redntfy/actions/workflows/release.yml/badge.svg)](https://github.com/aviscaerulea/redntfy/actions/workflows/release.yml)
 
 A lightweight resident app that notifies you of Redmine ticket updates via Windows toast notifications and lets you browse your open tickets from the system tray.
