@@ -828,13 +828,16 @@ static std::string redmineGet(const std::wstring& url, const std::wstring& apiKe
 
 // ==================== 状態永続化 ====================
 
-// JSON 文字列をアトミックにファイルへ書き出す（"<path>.tmp" 経由で MoveFileEx 置換）
+// JSON 文字列をアトミックにファイルへ書き出す（一時ファイル経由で MoveFileEx 置換）
 // 電源断・クラッシュで本体ファイルが壊れる可能性を避ける。
+// 一時ファイル名にはスレッド id を含める。pins.json はメインスレッド（togglePin）と
+// ポーリングスレッド（refreshPins）から並行して保存され得るため、固定名 ".tmp" だと
+// 片方の書き込み途中をもう片方が切り詰め、壊れた JSON が本体へ公開される窓がある。
 // logTag はエラー出力用の識別子（"state" / "pins" 等）。成功時 true、失敗時 false。
 static bool atomicWriteJson(const std::wstring& path, const std::string& json,
     const char* logTag)
 {
-    auto tmpPath = path + L".tmp";
+    auto tmpPath = path + L".tmp" + std::to_wstring(GetCurrentThreadId());
     HANDLE hFile = CreateFileW(tmpPath.c_str(), GENERIC_WRITE, 0, nullptr,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) {
@@ -5108,6 +5111,7 @@ int wmain() {
         WTSUnRegisterSessionNotification(g_hWnd);
         removeTrayIcon(g_hWnd);
         DestroyWindow(g_hWnd);
+        g_hWnd = nullptr;  // 破棄済みハンドルの再利用を防ぐ（catch の後始末ガードが誤発火しないため）
 
         // 更新チェックスレッドの完了を待つ（未起動・起動失敗時は joinable が false）
         // HTTP がブロック中だと最大タイムアウト（約 45 秒）まで待ち得るため、
@@ -5119,6 +5123,9 @@ int wmain() {
         writeLog("shutdown");
     }
     catch (...) {
+        // 原因ログを最初に残す。後続の join（最大 45 秒）や waitSoundThreadOrExit の
+        // ExitProcess で、終了コード 2 の理由がログに残らないまま終わるのを防ぐ
+        writeLog("unexpected initialization error");
         // joinable なスレッドを残したまま return すると静的破棄と競合するため、
         // 停止要求を立ててから join して畳む
         g_shutdownRequested = true;
@@ -5130,9 +5137,9 @@ int wmain() {
             WTSUnRegisterSessionNotification(g_hWnd);
             removeTrayIcon(g_hWnd);
             DestroyWindow(g_hWnd);
+            g_hWnd = nullptr;
         }
         waitSoundThreadOrExit(2);
-        writeLog("unexpected initialization error");
         return 2;
     }
 

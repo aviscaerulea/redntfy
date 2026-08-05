@@ -463,7 +463,10 @@ static void testSelectNotifyTargets() {
         auto is   = makeIssue(101);
         is.updaterId   = 9;
         is.updaterName = "山田太郎";
-        auto r = selectNotifyTargets({is}, prev, true, ME);
+        // NotifyTarget::issue は渡した vector 内を指すため、一時 vector を渡すと
+        // 戻り値のポインタが即座にダングリングになる。必ず名前付きローカルで渡す（以下同様）
+        std::vector<Issue> issues{is};
+        auto r = selectNotifyTargets(issues, prev, true, ME);
         CHECK(r && r->size() == 1);
         CHECK((*r)[0].kind == NotifyKind::New);
         CHECK((*r)[0].updaterName == "山田太郎");
@@ -474,7 +477,8 @@ static void testSelectNotifyTargets() {
         auto is   = makeIssue(102, "2026-07-01T00:00:00Z");
         is.authorName  = "起票者";
         is.updaterName = "更新者";
-        auto r = selectNotifyTargets({is}, prev, true, ME);
+        std::vector<Issue> issues{is};
+        auto r = selectNotifyTargets(issues, prev, true, ME);
         CHECK(r && r->size() == 1 && (*r)[0].updaterName == "起票者");
     }
     // 自分の起票・自分の直近更新による流入は抑止し、抑止 OFF なら通知する
@@ -484,9 +488,10 @@ static void testSelectNotifyTargets() {
         mine.authorId = ME;
         auto updatedByMe = makeIssue(104);
         updatedByMe.updaterId = ME;
-        auto r = selectNotifyTargets({mine, updatedByMe}, prev, true, ME);
+        std::vector<Issue> issues{mine, updatedByMe};
+        auto r = selectNotifyTargets(issues, prev, true, ME);
         CHECK(r && r->empty());
-        r = selectNotifyTargets({mine, updatedByMe}, prev, false, ME);
+        r = selectNotifyTargets(issues, prev, false, ME);
         CHECK(r && r->size() == 2);
     }
     // 前回追跡していないクエリだけに属する新規は黙って採用する（通知しない）
@@ -494,7 +499,8 @@ static void testSelectNotifyTargets() {
         auto prev = makePrevState();
         auto is   = makeIssue(105);
         is.queryIds = {2};
-        auto r = selectNotifyTargets({is}, prev, true, ME);
+        std::vector<Issue> issues{is};
+        auto r = selectNotifyTargets(issues, prev, true, ME);
         CHECK(r && r->empty());
     }
     // 既知チケット：updated_on の進行は Updated、変化なしは通知なし
@@ -504,11 +510,13 @@ static void testSelectNotifyTargets() {
         auto moved  = makeIssue(106, "2026-08-02T00:00:00Z");
         moved.updaterName = "更新者";
         auto stable = makeIssue(106, "2026-08-01T12:00:00Z");
-        auto r = selectNotifyTargets({moved}, prev, true, ME);
+        std::vector<Issue> movedIssues{moved};
+        auto r = selectNotifyTargets(movedIssues, prev, true, ME);
         CHECK(r && r->size() == 1);
         CHECK((*r)[0].kind == NotifyKind::Updated);
         CHECK((*r)[0].updaterName == "更新者");
-        r = selectNotifyTargets({stable}, prev, true, ME);
+        std::vector<Issue> stableIssues{stable};
+        r = selectNotifyTargets(stableIssues, prev, true, ME);
         CHECK(r && r->empty());
     }
     // 既知チケットの新クエリ流入は QueryEntered（更新者名なし）。未追跡クエリへの流入は対象外
@@ -518,19 +526,22 @@ static void testSelectNotifyTargets() {
         prev.issues[107]  = {"2026-08-01T12:00:00Z", {1}, true};
         auto entered = makeIssue(107, "2026-08-01T12:00:00Z");
         entered.queryIds = {1, 2};
-        auto r = selectNotifyTargets({entered}, prev, true, ME);
+        std::vector<Issue> issues{entered};
+        auto r = selectNotifyTargets(issues, prev, true, ME);
         CHECK(r && r->size() == 1);
         CHECK((*r)[0].kind == NotifyKind::QueryEntered);
         CHECK((*r)[0].updaterName.empty());
         entered.queryIds = {1, 3};  // クエリ 3 は前回未追跡
-        r = selectNotifyTargets({entered}, prev, true, ME);
+        issues = {entered};
+        r = selectNotifyTargets(issues, prev, true, ME);
         CHECK(r && r->empty());
     }
     // v1 移行（knownQueries 空）：新規は通知側に倒す
     {
         auto prev = makePrevState();
         prev.knownQueries.clear();
-        auto r = selectNotifyTargets({makeIssue(108)}, prev, true, ME);
+        std::vector<Issue> issues{makeIssue(108)};
+        auto r = selectNotifyTargets(issues, prev, true, ME);
         CHECK(r && r->size() == 1 && (*r)[0].kind == NotifyKind::New);
     }
 }
