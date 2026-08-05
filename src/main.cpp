@@ -425,10 +425,10 @@ static std::wstring        g_latestVersion;   // g_mtx で保護
 
 // 通知音再生スレッドのハンドル
 //
-// アクセスは pollThreadFunc 1 スレッドに限定する。launchSound（呼び出し元は pollThreadFunc）と、
-// pollThreadFunc 末尾のシャットダウン処理がすべての書き換え箇所であり、
-// 並行アクセスがないためミューテックス保護は不要。新たな呼び出し箇所を追加する場合は
-// 必ず pollThreadFunc コンテキスト内であることを確認すること。
+// アクセスは launchSound（呼び出し元は pollThreadFunc）と、wmain のシャットダウン処理
+// （pollThread.join() の後）に限定する。ポーリングスレッド終了後にのみメインスレッドが
+// 触るため並行アクセスがなく、ミューテックス保護は不要。新たな呼び出し箇所を追加する
+// 場合はこの排他条件が保たれることを確認すること。
 static HANDLE g_soundThread = nullptr;
 
 // exe ディレクトリパス（wmain 起動時に確定し、WndProc スレッドからも参照する）
@@ -1634,6 +1634,11 @@ static std::wstring issuesFilterQuery(int queryId) {
 // ページ取得の合間にチケットが更新されると順位が動き、オフセット走査で同一チケットの
 // 重複や取りこぼしが起きる。取りこぼしは次回ポーリングで「新規」誤通知になるため、
 // ページング中に順位が変わらない安定キー id で走査する。（表示順には使わない）
+// ただし順位の安定は「走査済みページからのチケット離脱による前詰め」を防げない。
+// 前詰めが起きると offset 境界の 1 件が飛び、total_count も同数減るため
+// 末尾の offset < total チェックでは構造的に検出できない。そこで全ページで
+// total_count の不変を検証し、変化したら取得を破棄して次回リトライに委ねる。
+// （空振りのコストは誤「新規」通知よりはるかに軽い）
 // 失敗ログにクエリ id を含めるのは、複数クエリ運用でどのクエリが壊れているかを
 // ログだけで切り分けられるようにするため。
 // outAuthError は省略可（nullptr）。HTTP 401 検出時に true を書き込む。呼び出し側が
@@ -1650,7 +1655,7 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
 
     const std::string logTag = "fetchQueryIssues(" + std::to_string(queryId) + ")";
     int offset = 0;
-    int total  = 0;
+    int total  = -1;  // 初回ページの total_count で確定する（-1 は未確定）
     do {
         std::wstring url = cfg.redmineUrl + L"/issues.json?" + issuesFilterQuery(queryId)
             + L"&sort=id&limit=100&offset=" + std::to_wstring(offset);
@@ -1666,7 +1671,18 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
                 writeLog(logTag + ": API error response");
                 return false;
             }
-            total = static_cast<int>(obj.GetNamedNumber(L"total_count", 0));
+            // total_count がページ間で変化した＝走査中に集合が増減した。前詰めによる
+            // 取りこぼしの可能性があるため、部分結果を破棄して失敗扱いにする
+            const int pageTotal = static_cast<int>(obj.GetNamedNumber(L"total_count", 0));
+            if (total < 0) {
+                total = pageTotal;
+            }
+            else if (pageTotal != total) {
+                writeLog(logTag + ": total_count changed during paging ("
+                    + std::to_string(total) + " -> " + std::to_string(pageTotal)
+                    + "), discarded");
+                return false;
+            }
             auto arr = obj.GetNamedArray(L"issues");
             if (arr.Size() == 0) break;  // total_count 不整合による無限ループ防止
             for (auto item : arr) {
@@ -2503,7 +2519,8 @@ static bool playWavToWasapi(const Config& cfg) {
             UINT32 frames = min(avail, totalFrames - sentFrames);
             if (frames == 0) {
                 // 全フレーム送信済み。残りバッファが再生されるまで待機（最大約 1 秒）
-                for (int i = 0; i < 100; i++) {
+                // シャットダウン要求時は排出を待たず抜け、終了時の 5 秒待ちを圧迫しない
+                for (int i = 0; i < 100 && !g_shutdownRequested; i++) {
                     UINT32 rem = 0;
                     client->GetCurrentPadding(&rem);
                     if (rem == 0) break;
@@ -4298,15 +4315,24 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
 // 非表示トップレベルウィンドウを作成してトレイメッセージ受信に使用する
 // HWND_MESSAGE ではなく nullptr 親（トップレベル）にすることで WM_POWERBROADCAST を受信できる
+// 失敗時は nullptr を返す（GetLastError 込みでログを残す）。トレイ UI はこのアプリの
+// 唯一の操作面かつ唯一の終了経路のため、呼び出し側は失敗時に常駐へ進まず終了すること。
+// （ウィンドウ無しでメッセージループに入ると、終了手段のない不可視常駐になる）
 static HWND createTrayWindow() {
     WNDCLASSEXW wc = {};
     wc.cbSize        = sizeof(wc);
     wc.lpfnWndProc   = trayWndProc;
     wc.hInstance     = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"redntfy_tray";
-    RegisterClassExW(&wc);
-    return CreateWindowExW(0, L"redntfy_tray", nullptr, 0,
+    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        writeLog("RegisterClassExW failed: " + std::to_string(GetLastError()));
+        return nullptr;
+    }
+    HWND hWnd = CreateWindowExW(0, L"redntfy_tray", nullptr, 0,
         0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hWnd)
+        writeLog("CreateWindowExW failed: " + std::to_string(GetLastError()));
+    return hWnd;
 }
 
 // ==================== エントリポイント ====================
@@ -4631,10 +4657,18 @@ static void showPollDoneToast()
 // shutdown と手動更新（g_manualPoll）だけを監視して待つ（100ms 刻み）
 // waitInterruptible と違い forcePoll では起きない。休止時間帯とクールダウン待ちで使う。
 // （forcePoll で即復帰すると NIC 変化の連発時に周回して待機の目的が破れるため）
+// waitInterruptible と同じ GetTickCount64 の期限方式とする。Sleep の積算方式は
+// サスペンド中に実時間が進まず、復帰後に残り全量を待ち直して休止時間帯明けの
+// ポーリングが最大 1 時間遅れるため使わない。（GetTickCount64 はサスペンド時間を含む）
 static void waitIgnoringForcePoll(ULONGLONG ms) {
-    for (ULONGLONG waited = 0; waited < ms && !g_shutdownRequested && !g_manualPoll.load();
-            waited += 100)
-        Sleep(100);
+    ULONGLONG end = GetTickCount64() + ms;
+    while (!g_shutdownRequested && !g_manualPoll.load()) {
+        ULONGLONG now = GetTickCount64();
+        if (end <= now) break;
+        ULONGLONG remain = end - now;
+        DWORD chunk = static_cast<DWORD>((std::min)(remain, static_cast<ULONGLONG>(100)));
+        Sleep(chunk);
+    }
 }
 
 // ポーリングスレッドがセッション中に確定・キャッシュする判定材料
@@ -4808,7 +4842,9 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
                     writeLog(authError ? "HTTP 401 - entering disabled mode (api_key)"
                                        : "HTTP 404 - entering disabled mode (query_ids)");
                     g_disabledReason.store(static_cast<int>(reason));
-                    PostMessage(g_hWnd, WM_ENTER_DISABLED, static_cast<WPARAM>(reason), 0);
+                    // 他の投函箇所と同様に null を検査する。（PostMessage(nullptr) は
+                    // 呼び出しスレッド自身のキューへ投函され、通知が黙って消えるため）
+                    if (g_hWnd) PostMessage(g_hWnd, WM_ENTER_DISABLED, static_cast<WPARAM>(reason), 0);
                     break;
                 }
                 // 手動更新の失敗はクールダウンを無視して必ず知らせる。無音のままだと
@@ -4866,19 +4902,9 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
         }
     }
 
-    // シャットダウン前に通知音スレッドの完了を待機（ダッキング復元を保証）
-    // g_shutdownRequested == true なので playWavToWasapi はすみやかに停止するはず
-    if (g_soundThread) {
-        DWORD r = WaitForSingleObject(g_soundThread, 5000);
-        if (r != WAIT_TIMEOUT) {
-            CloseHandle(g_soundThread);
-            g_soundThread = nullptr;
-        }
-        else {
-            // タイムアウト時はハンドルを閉じない（走行中スレッドが COM/WASAPI を使用中のため）
-            writeLog("pollThreadFunc: sound thread did not finish within 5s on shutdown");
-        }
-    }
+    // 通知音スレッドの終了待ちはここでは行わない。wmain のシャットダウン処理が
+    // pollThread.join() の後に一元的に待つ。（401/404 の break で本スレッドが先に
+    // 終了する経路でも、実際のプロセス終了時に必ず待たれることを保証するため）
 }
 
 // エントリポイント
@@ -4932,6 +4958,12 @@ int wmain() {
         ensureShortcut();
         WM_TASKBAR_CREATED = RegisterWindowMessageW(L"TaskbarCreated");
         g_hWnd = createTrayWindow();
+        if (!g_hWnd) {
+            // 他の初期化失敗は warning で続行するが、ここだけは fail-fast とする。
+            // トレイウィンドウ無しの常駐は操作面も終了経路も持たず、仕様上意味がないため
+            writeLog("fatal: tray window creation failed - exiting");
+            return 1;
+        }
         WTSRegisterSessionNotification(g_hWnd, NOTIFY_FOR_THIS_SESSION);
 
         // NIC 変化（Wi-Fi 接続/切断、LAN 抜き差し等）の監視を登録
@@ -5050,6 +5082,22 @@ int wmain() {
         // HTTP がブロック中だと最大タイムアウト（約 45 秒）まで待ち得るため、
         // トレイアイコン削除より後に置き、ユーザから見た終了は即座に完了させる
         if (updateThread.joinable()) updateThread.join();
+
+        // 通知音スレッドの完了を待つ（ダッキング復元を保証）。pollThread.join() の後の
+        // ため g_soundThread への並行アクセスはない。タイムアウト時は静的オブジェクト
+        // （g_wavCache・g_logDir）の破棄と走行中スレッドが競合して use-after-free に
+        // なるのを防ぐため、CRT の静的破棄を走らせず ExitProcess で即終了する
+        if (g_soundThread) {
+            DWORD r = WaitForSingleObject(g_soundThread, 5000);
+            if (r != WAIT_TIMEOUT) {
+                CloseHandle(g_soundThread);
+                g_soundThread = nullptr;
+            }
+            else {
+                writeLog("shutdown: sound thread did not finish within 5s, exiting without static destruction");
+                ExitProcess(0);
+            }
+        }
 
         writeLog("shutdown");
     }
