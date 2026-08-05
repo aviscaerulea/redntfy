@@ -4916,6 +4916,24 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
     // 終了する経路でも、実際のプロセス終了時に必ず待たれることを保証するため）
 }
 
+// 通知音スレッドの完了を待つ（ダッキング復元を保証）
+// pollThread の join 後に呼ぶこと。（g_soundThread への並行アクセスを避ける排他条件）
+// タイムアウト時は静的オブジェクト（g_wavCache・g_logDir）の破棄と走行中スレッドが
+// 競合して use-after-free になるのを防ぐため、CRT の静的破棄を走らせず
+// ExitProcess(exitCode) で即終了する。正常終了と catch の異常終了の両経路から呼ぶ。
+static void waitSoundThreadOrExit(UINT exitCode) {
+    if (!g_soundThread) return;
+    DWORD r = WaitForSingleObject(g_soundThread, 5000);
+    if (r != WAIT_TIMEOUT) {
+        CloseHandle(g_soundThread);
+        g_soundThread = nullptr;
+    }
+    else {
+        writeLog("shutdown: sound thread did not finish within 5s, exiting without static destruction");
+        ExitProcess(exitCode);
+    }
+}
+
 // エントリポイント
 // ログ初期化 → 多重起動制御（Job Object、新プロセス優先）→ WinRT・トレイ・NIC 監視の初期化
 // → 設定読込と必須キーの静的検証 → ポーリングスレッド起動 → メッセージループ → 終了処理の順。
@@ -5096,21 +5114,7 @@ int wmain() {
         // トレイアイコン削除より後に置き、ユーザから見た終了は即座に完了させる
         if (updateThread.joinable()) updateThread.join();
 
-        // 通知音スレッドの完了を待つ（ダッキング復元を保証）。pollThread.join() の後の
-        // ため g_soundThread への並行アクセスはない。タイムアウト時は静的オブジェクト
-        // （g_wavCache・g_logDir）の破棄と走行中スレッドが競合して use-after-free に
-        // なるのを防ぐため、CRT の静的破棄を走らせず ExitProcess で即終了する
-        if (g_soundThread) {
-            DWORD r = WaitForSingleObject(g_soundThread, 5000);
-            if (r != WAIT_TIMEOUT) {
-                CloseHandle(g_soundThread);
-                g_soundThread = nullptr;
-            }
-            else {
-                writeLog("shutdown: sound thread did not finish within 5s, exiting without static destruction");
-                ExitProcess(0);
-            }
-        }
+        waitSoundThreadOrExit(0);
 
         writeLog("shutdown");
     }
@@ -5120,6 +5124,14 @@ int wmain() {
         g_shutdownRequested = true;
         if (pollThread.joinable()) pollThread.join();
         if (updateThread.joinable()) updateThread.join();
+        // 正常終了パスと同様にトレイ登録を後始末する。（怠るとプロセス消滅後も
+        // ゴーストアイコンが残る）通知音スレッドも待ち、静的破棄との競合を防ぐ
+        if (g_hWnd) {
+            WTSUnRegisterSessionNotification(g_hWnd);
+            removeTrayIcon(g_hWnd);
+            DestroyWindow(g_hWnd);
+        }
+        waitSoundThreadOrExit(2);
         writeLog("unexpected initialization error");
         return 2;
     }
