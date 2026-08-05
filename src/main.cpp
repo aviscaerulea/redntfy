@@ -3074,8 +3074,17 @@ static std::vector<ListRow> buildListRows(int& visible) {
     if (rows.size() > limit) {
         std::vector<ListRow> kept;
         kept.reserve(rows.size());
+        // 上限の予算は非ピン行だけで数える。kept.size() で判定するとピン行が枠を消費し、
+        // 非ピン行が list_limit より少なくなる。（「最大 list_limit ＋ピン件数」の約束が破れる）
+        size_t nonPinned = 0;
         for (auto& r : rows) {
-            if (kept.size() < limit || r.pinned) kept.push_back(std::move(r));
+            if (r.pinned) {
+                kept.push_back(std::move(r));
+            }
+            else if (nonPinned < limit) {
+                kept.push_back(std::move(r));
+                ++nonPinned;
+            }
         }
         rows = std::move(kept);
     }
@@ -4952,6 +4961,12 @@ int wmain() {
         writeLog("warning: failed to create job object");
     }
 
+    // スレッド変数は try の外に置く。try 内ローカルにすると、スレッド生成後の例外で
+    // catch へ入る前に joinable なまま破棄され std::terminate になり、
+    // catch のログも終了コード 2 も残らない。（[thread.thread.destr]）
+    std::thread updateThread;
+    std::thread pollThread;
+
     try {
         winrt::init_apartment();
         SetCurrentProcessExplicitAppUserModelID(APP_AUMID);
@@ -5025,7 +5040,6 @@ int wmain() {
         // 更新チェックスレッド起動（起動時に 1 回のみ実行）
         // detach しない。プロセス終了時の静的破棄と競合しないよう、シャットダウン時に join する。
         // （HTTP タイムアウトは最大 30 秒のため、起動直後に即終了した場合のみ join が待つ）
-        std::thread updateThread;
         if (cfg.updateCheckEnabled) {
             try {
                 updateThread = std::thread(checkForUpdates);
@@ -5045,7 +5059,6 @@ int wmain() {
         // 何度試行しても結果が変わらず、案内はトレイ tooltip と Toast が担う）
         // メインスレッドはメッセージループに専念させるため、Redmine API ポーリング（HTTP I/O）を別スレッドへ分離する。
         // これによりネットワーク状態にかかわらずトレイアイコン右クリック等の UI が常時応答する。
-        std::thread pollThread;
         if (initReason == DisabledReason::None) {
             pollThread = std::thread(pollThreadFunc, exeDir, cfg);
         }
@@ -5102,6 +5115,11 @@ int wmain() {
         writeLog("shutdown");
     }
     catch (...) {
+        // joinable なスレッドを残したまま return すると静的破棄と競合するため、
+        // 停止要求を立ててから join して畳む
+        g_shutdownRequested = true;
+        if (pollThread.joinable()) pollThread.join();
+        if (updateThread.joinable()) updateThread.join();
         writeLog("unexpected initialization error");
         return 2;
     }
