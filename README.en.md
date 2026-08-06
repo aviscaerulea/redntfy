@@ -14,7 +14,8 @@ A lightweight resident app that notifies you of Redmine ticket updates via Windo
 - Notification targets are freely adjustable via Redmine saved queries (query_ids)
 - Displays an open-ticket list from the tray, formatted with icons for due dates, assignees, and projects
 - The order and items of each list row are fully customizable via placeholders in the configuration
-- Pins keep important tickets at the top of the list (they stay even after being closed)
+- Pins keep important tickets in the list (they stay even after being closed)
+- Tickets you do not need to watch can be hidden, excluding them from notifications and the pending count
 - Instant refresh, filters, and sort orders are available from the tray menu
 - Notification sounds are loudness-normalized, and auto-muted while a microphone or camera is in use (e.g. during meetings)
 - Checks GitHub Releases for a newer version at startup
