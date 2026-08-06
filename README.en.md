@@ -68,14 +68,15 @@ If you want to tune the tracking scope yourself, create custom queries in Redmin
 Everyday operations:
 
 - Left-click the tray icon to show the open-ticket list
-- Left-click a row to open the ticket in the browser and mark it as read; right-click to toggle a pin
+- Left-click a row to open the ticket in the browser and mark it as read; right-click to cycle pin → hidden → normal
+- Hidden tickets are shown in gray and excluded from notifications and the pending count ("Exclude hidden tickets" in the menu removes them from the list entirely)
 - Right-click the tray icon to access the menu for instant refresh, filters, and sort orders
 
 ## Configuration
 
 Runtime settings live in `redntfy.toml` next to `redntfy.exe`.
 Placing `redntfy.local.toml` overrides values on a per-key basis, which is useful for separating connection settings or per-environment differences.
-Detected state is saved to `state.json` and pins to `pins.json`; both persist across restarts.
+Detected state is saved to `state.json`, pins to `pins.json`, and hidden tickets to `hidden.json`; all persist across restarts.
 
 The main configuration keys are listed below. See the comments in `redntfy.toml` for details.
 

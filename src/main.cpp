@@ -11,8 +11,11 @@
  * 自分が起票したチケットの流入（author.id で判定）は通知しない。
  * 自分の操作による更新と、前回ポーリング以降の自分の更新が原因の流入（最終 journal の user.id で判定）も通知しない。
  * 検知済み状態は「チケット id → updated_on ＋所属クエリ集合」を state.json（v2）に永続化して重複通知を防ぐ。
- * トレイ左クリックで未処理チケットの一覧を表示し、行の右クリックで最大 5 件をピン留めできる。
+ * トレイ左クリックで未処理チケットの一覧を表示し、行の右クリックで
+ * 通常 → ピン留め → 非表示 → 通常 の順に状態を切り替えられる。（ピンの件数に上限はない）
  * ピンは pins.json に永続化し、保存クエリの集合から外れたチケットも一覧に表示し続ける。
+ * 非表示チケットは hidden.json に永続化し、グレー表示・通知と件数から除外・
+ * 「非表示チケットを除外」トグル ON で一覧からも出さない。
  *
  * 終了コード：
  *   0  - 正常終了（トレイメニューの「終了」による）
@@ -125,6 +128,7 @@ static constexpr UINT IDM_SORT_BY_DUE         = 40013; // 一覧を期日昇順�
 static constexpr UINT IDM_EXCLUDE_NO_VERSION  = 40014; // バージョン未指定を一覧・tooltip・通知から除外するトグル（期日ありは例外的に残す）
 static constexpr UINT IDM_MUTE_OWN_CHANGES    = 40015; // 自分の操作による起票・更新を通知抑止するトグル（一覧・tooltip は変更しない）
 static constexpr UINT IDM_OPEN_GUIDE          = 40016; // セットアップガイド（GitHub Pages）を開く
+static constexpr UINT IDM_EXCLUDE_HIDDEN      = 40017; // 非表示チケットを一覧から除外するトグル（OFF はグレーで表示）
 
 static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/redntfy";
 // セットアップガイド（GitHub Pages。docs/ 配下の内容が公開される）
@@ -169,8 +173,8 @@ static constexpr wchar_t STATE_FILENAME[] = L"state.json";
 // ピン留めの永続化ファイル名（exe 同フォルダに保存）
 static constexpr wchar_t PINS_FILENAME[] = L"pins.json";
 
-// ピン留めの上限件数（仕様値。一覧は list_limit + 本値が表示最大）
-static constexpr size_t PIN_LIMIT = 5;
+// 非表示チケットの永続化ファイル名（exe 同フォルダに保存。チケット id の JSON 配列のみ）
+static constexpr wchar_t HIDDEN_FILENAME[] = L"hidden.json";
 
 // シャットダウンフラグ（メインスレッド・WndProc・ポーリングスレッドから参照）
 static std::atomic<bool> g_shutdownRequested{false};
@@ -197,6 +201,12 @@ static std::atomic<bool> g_sortByDue{false};
 // 追跡集合そのものを絞ると、OFF に戻したとき state.json に無い id が「新規」と誤検知される。
 // 対価として、ON 中に抑止した更新は state.json に記録済みのため OFF に戻しても再通知されない。
 static std::atomic<bool> g_excludeNoVersion{false};
+
+// 非表示チケットを一覧から除外するトグル（レジストリ永続化。既定 OFF ＝グレーで表示）
+// ON で g_hiddenIds のチケットを一覧に出さない。OFF では非活性色（グレー）で参考表示する。
+// 未処理件数・未読件数・通知は本トグルと無関係に常に非表示チケットを除外する。
+// （「見なくて良いもの」の意思表示は id 単位の g_hiddenIds 側が持ち、本トグルは見え方だけを変える）
+static std::atomic<bool> g_excludeHidden{false};
 
 // 自分の操作による起票・更新を通知抑止するトグル（レジストリ永続化。既定 ON）
 // deliverPollResults の 3 か所の判定（新規流入の起票者、新規流入の直近更新者、既存更新の更新者）を
@@ -370,7 +380,7 @@ static WavCache g_wavCache;
 // ポーリングスレッド → WndProc スレッド: チケット一覧の受け渡し（g_mtx で保護）
 static std::mutex              g_mtx;
 static std::vector<Issue>      g_issues;   // updated_on 降順ソート済み
-static std::vector<PinEntry>   g_pins;     // ピン留め（g_mtx で保護、最大 PIN_LIMIT 件）
+static std::vector<PinEntry>   g_pins;     // ピン留め（g_mtx で保護。上限なし）
 
 // 起動設定（wmain で loadConfig 直後・スレッド起動前に 1 回だけ設定し、以降は不変。
 // ホットリロードしないため、スレッド起動後は全スレッドからロック無しで読み取ってよい）
@@ -386,6 +396,14 @@ static Config                  g_currentConfig;
 // 刈り取りはしないので、再び一覧に出た時点で未読として現れる。
 // 永続化しない。
 static std::unordered_set<int> g_unreadIds;
+
+// 非表示チケットの id 集合（g_mtx で保護。hidden.json で永続化）
+// 一覧の右クリックループ（通常 → ピン留め → 非表示 → 通常）で出入りする。
+// 含まれる id は通知（Toast・音・未読）の対象外で、未処理件数にも数えない。
+// ピン留めとは排他。（ループ遷移でピン → 非表示になるときピンは解除される）
+// クエリの取得集合から外れた id はポーリング成功時に自動削除する。（pruneHidden。
+// 後日クエリへ戻ったチケットは通常状態で再出現し、必要なら改めて非表示にする）
+static std::unordered_set<int> g_hiddenIds;
 
 // 自分の Redmine user id（起動時に /users/current.json で確定。0 = 取得失敗＝自分除外判定なし）
 // ポーリングスレッドが書き込み、担当者フィルタのため WndProc スレッドも読むので atomic とする。
@@ -830,7 +848,7 @@ static std::string redmineGet(const std::wstring& url, const std::wstring& apiKe
 
 // JSON 文字列をアトミックにファイルへ書き出す（一時ファイル経由で MoveFileEx 置換）
 // 電源断・クラッシュで本体ファイルが壊れる可能性を避ける。
-// 一時ファイル名にはスレッド id を含める。pins.json はメインスレッド（togglePin）と
+// 一時ファイル名にはスレッド id を含める。pins.json はメインスレッド（cycleIssueState）と
 // ポーリングスレッド（refreshPins）から並行して保存され得るため、固定名 ".tmp" だと
 // 片方の書き込み途中をもう片方が切り詰め、壊れた JSON が本体へ公開される窓がある。
 // logTag はエラー出力用の識別子（"state" / "pins" 等）。成功時 true、失敗時 false。
@@ -1073,7 +1091,7 @@ static std::string normalizeSpaces(std::string s) {
 }
 
 // ピン留めの読み込み
-// 起動時に 1 回呼び出し、PIN_LIMIT 件を上限に g_pins へ復元する。
+// 起動時に 1 回呼び出し、g_pins へ復元する。（件数の上限はない）
 // ファイル不在・パースエラー時は何もしない。（ピンなしで開始する）
 static void loadPins(const std::wstring& dir) {
     using namespace winrt::Windows::Data::Json;
@@ -1084,7 +1102,6 @@ static void loadPins(const std::wstring& dir) {
         std::lock_guard<std::mutex> lk(g_mtx);
         g_pins.clear();
         for (auto item : arr) {
-            if (g_pins.size() >= PIN_LIMIT) break;
             auto o = item.GetObject();
             PinEntry p;
             p.id        = static_cast<int>(o.GetNamedNumber(L"id", 0));
@@ -1106,6 +1123,46 @@ static void loadPins(const std::wstring& dir) {
     }
     catch (...) {
         writeLog("pins: load failed (exception)");
+    }
+}
+
+// 非表示チケットの保存
+// 右クリックの状態遷移とポーリング時の自動削除（pruneHidden）のたびに g_hiddenIds を
+// id の JSON 配列で上書き保存する。g_mtx ロック外で呼ぶこと。
+static void saveHidden(const std::wstring& dir) {
+    using namespace winrt::Windows::Data::Json;
+    try {
+        JsonArray arr;
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            for (int id : g_hiddenIds) arr.Append(JsonValue::CreateNumberValue(id));
+        }
+        atomicWriteJson(dir + L"\\" + HIDDEN_FILENAME, winrt::to_string(arr.Stringify()), "hidden");
+    }
+    catch (...) {
+        writeLog("hidden: save failed (exception)");
+    }
+}
+
+// 非表示チケットの読み込み
+// 起動時に 1 回呼び出し、g_hiddenIds へ復元する。id が正の数値だけを採用する。
+// ファイル不在・パースエラー時は何もしない。（非表示なしで開始する）
+static void loadHidden(const std::wstring& dir) {
+    using namespace winrt::Windows::Data::Json;
+    auto buf = readJsonFile(dir + L"\\" + HIDDEN_FILENAME, "hidden");
+    if (!buf) return;
+    try {
+        auto arr = JsonArray::Parse(winrt::to_hstring(*buf));
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_hiddenIds.clear();
+        for (auto item : arr) {
+            int id = static_cast<int>(item.GetNumber());
+            if (id > 0) g_hiddenIds.insert(id);
+        }
+        writeLog("hidden: loaded " + std::to_string(g_hiddenIds.size()) + " entries");
+    }
+    catch (...) {
+        writeLog("hidden: load failed (exception)");
     }
 }
 
@@ -1997,6 +2054,7 @@ static constexpr const wchar_t* REG_ASSIGNED_TO_ME    = L"AssignedToMeOnly";
 static constexpr const wchar_t* REG_SORT_BY_DUE       = L"SortByDue";
 static constexpr const wchar_t* REG_EXCLUDE_NO_VERSION = L"ExcludeNoVersion";
 static constexpr const wchar_t* REG_MUTE_OWN_CHANGES  = L"MuteOwnChanges";
+static constexpr const wchar_t* REG_EXCLUDE_HIDDEN    = L"ExcludeHidden";
 static constexpr const wchar_t* REG_NOTIFIED_VERSION  = L"NotifiedUpdateVersion";
 
 // Windows スタートアップ登録用レジストリ（HKCU Run キー）
@@ -2987,6 +3045,7 @@ struct ListRow {
     bool        assignedToGroup = false;
     bool        isBugTracker    = false;
     bool        pinned          = false;
+    bool        hidden          = false;  // 非表示チケット（グレー描画。件数・未読に数えない）
     bool        closed          = false;
     bool        unread          = false;
 };
@@ -2998,20 +3057,28 @@ struct ListRow {
 //   2. 1 に含まれないピンを追加する（保存クエリの集合外ピンはキャッシュ内容で表示）
 //   3. 全体を並べ替える（既定は updated_on 降順。「期日順に並べる」ON なら期日昇順で
 //      期日なしは末尾。ピンも同じ規則で本来の位置に置く）
-//   4. 先頭 list_limit 件へ絞る（ピン留めは上限適用外で常に残す）
+//   4. 先頭 list_limit 件へ絞る（ピン留めと非表示チケットは上限適用外で常に残す）
+// 非表示チケット（g_hiddenIds）は「非表示チケットを除外」トグル ON なら行に出さず、
+// OFF なら hidden フラグ付きで通す。（グレー参考表示。フィルタは通常行と同じく適用するが、
+// list_limit の予算には数えない。枠を消費させると更新の多い非表示チケットが上位に浮上して
+// 未読の通常行を窓外へ押し出し、バッジ・未読件数から消してしまうため）
 // visible には表示フィルタを通った未処理件数（絞り込み前）を返す。ピン留めは数えない。
 // （明示の意思表示であって未処理件数ではないため、フィルタで外れたピンを件数に足し戻さない）
+// 非表示チケットもトグルにかかわらず数えない。（「見なくて良い」の意思表示のため）
 // tooltip の未読件数も本関数の結果から数える。表示と同じ選定を通すことで「未読 N 件」と
 // 画面上の太字行数を一致させる。（一覧に出ない未読は数に出さず、バッジも点けない）
+// 非表示チケットの unread は常に false にする。（太字にも未読件数にも出さない）
 static std::vector<ListRow> buildListRows(int& visible) {
     std::vector<Issue>      issues;
     std::vector<PinEntry>   pins;
     std::unordered_set<int> unread;
+    std::unordered_set<int> hiddenIds;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
-        issues = g_issues;
-        pins   = g_pins;
-        unread = g_unreadIds;
+        issues    = g_issues;
+        pins      = g_pins;
+        unread    = g_unreadIds;
+        hiddenIds = g_hiddenIds;
     }
 
     auto isPinned = [&pins](int id) {
@@ -3025,6 +3092,10 @@ static std::vector<ListRow> buildListRows(int& visible) {
     std::unordered_set<int> shown;
     visible = 0;
     for (const auto& is : issues) {
+        // 非表示チケットはトグル ON なら行ごと出さず、OFF ならグレー参考表示で通す。
+        // どちらでも未処理件数（visible）には数えない。（ピンと違いフィルタは免除しない）
+        bool hidden = hiddenIds.count(is.id) != 0;
+        if (hidden && g_excludeHidden.load()) continue;
         // 表示フィルタで外れた行は出さない。ただしピン留め済みは明示の意思表示として常に残す
         // （クローズ済・集合外でも表示する既存のピン仕様と揃える）
         bool pinned = isPinned(is.id);
@@ -3032,7 +3103,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
         if (excluded) {
             if (!pinned) continue;
         }
-        else {
+        else if (!hidden) {
             ++visible;
         }
         rows.push_back({.id = is.id, .subject = is.subject, .projectName = is.projectName,
@@ -3040,8 +3111,8 @@ static std::vector<ListRow> buildListRows(int& visible) {
                         .dueDate = is.dueDate,
                         .updatedOn = is.updatedOn, .assignedToGroup = is.assignedToGroup,
                         .isBugTracker = is.isBugTracker,
-                        .pinned = pinned, .closed = is.closed,
-                        .unread = unread.count(is.id) != 0});
+                        .pinned = pinned, .hidden = hidden, .closed = is.closed,
+                        .unread = !hidden && unread.count(is.id) != 0});
         shown.insert(is.id);
     }
     for (const auto& p : pins) {
@@ -3077,16 +3148,17 @@ static std::vector<ListRow> buildListRows(int& visible) {
     if (rows.size() > limit) {
         std::vector<ListRow> kept;
         kept.reserve(rows.size());
-        // 上限の予算は非ピン行だけで数える。kept.size() で判定するとピン行が枠を消費し、
-        // 非ピン行が list_limit より少なくなる。（「最大 list_limit ＋ピン件数」の約束が破れる）
-        size_t nonPinned = 0;
+        // 上限の予算は通常行（非ピン・非 hidden）だけで数える。kept.size() で判定すると
+        // ピン行・非表示行が枠を消費し、通常行が list_limit より少なくなる。
+        // （「最大 list_limit ＋ピン件数＋非表示件数」の約束が破れる）
+        size_t normal = 0;
         for (auto& r : rows) {
-            if (r.pinned) {
+            if (r.pinned || r.hidden) {
                 kept.push_back(std::move(r));
             }
-            else if (nonPinned < limit) {
+            else if (normal < limit) {
                 kept.push_back(std::move(r));
-                ++nonPinned;
+                ++normal;
             }
         }
         rows = std::move(kept);
@@ -3205,7 +3277,8 @@ struct IssueItem {
     // label 内で文字色とウェイトを変える範囲（空 = 分割描画しない）。buildIssueLabel が組み立てる
     std::vector<ColorRange> ranges;
     bool         unread     = false; // 未読（まだ一覧から開いていない）＝太字で描く
-    bool         pinned = false; // ピン留め中（マーカー列の描画条件。右クリックトグル時にもその場で更新する）
+    bool         pinned = false; // ピン留め中（マーカー列の描画条件。右クリック遷移時にもその場で更新する）
+    bool         hidden = false; // 非表示（グレー描画の条件。右クリック遷移時にもその場で更新する）
     bool         closed = false; // クローズ済（打ち消し線の描画条件）
 };
 static std::vector<IssueItem> g_issueItems;
@@ -3488,9 +3561,9 @@ static TrayPopupPos computeTrayPopupPos(const POINT& cursor) {
 // 左クリック時のチケット一覧ポップアップ表示
 //
 // 表示行の選定・並べ替え・絞り込みは buildListRows に委ねる。（tooltip の未読件数と同じ根拠）
-// 行の左クリックでチケットを開いてその 1 件だけ既読にする。
-// 右クリックはピン留めのトグルで、既読にはしない。
-// フッタの「未処理 N 件」はフィルタを通った件数で、フィルタで外れたピンは数えない。
+// 行の左クリックでチケットを開いてその 1 件だけ既読にする。（非表示のグレー行も同様に開ける）
+// 右クリックは状態の遷移（通常 → ピン留め → 非表示 → 通常）で、既読にはしない。
+// フッタの「未処理 N 件」はフィルタを通った件数で、フィルタで外れたピンと非表示チケットは数えない。
 static void showIssuePopup(HWND hWnd) {
     const Config& cfg = g_currentConfig;
     int visible = 0;
@@ -3509,6 +3582,7 @@ static void showIssuePopup(HWND hWnd) {
         it.ranges = std::move(lbl.ranges);
         it.unread = row.unread;
         it.pinned = row.pinned;
+        it.hidden = row.hidden;
         it.closed = row.closed;
         return it;
     };
@@ -3539,7 +3613,7 @@ static void showIssuePopup(HWND hWnd) {
         }
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
         std::wstring footer = L"未処理 " + std::to_wstring(visible)
-            + L" 件（クリックでウェブ表示 ／ 右クリックでピン留め）";
+            + L" 件（クリックでウェブ表示 ／ 右クリックでピン留め・非表示）";
         AppendMenuW(hMenu, MF_STRING, IDM_OPEN_QUERY, footer.c_str());
     }
 
@@ -3548,7 +3622,7 @@ static void showIssuePopup(HWND hWnd) {
     auto pos = computeTrayPopupPos(pt);
     forceForeground(hWnd);
     // TPM_LEFTBUTTON のみ指定する（TPM_RIGHTBUTTON を加えると右クリックも WM_COMMAND
-    // を発火してしまい、ピン留めトグル用の WM_MENURBUTTONUP が届かなくなる）
+    // を発火してしまい、状態遷移用の WM_MENURBUTTONUP が届かなくなる）
     TrackPopupMenu(hMenu, TPM_LEFTBUTTON | pos.alignFlags, pos.x, pos.y, 0, hWnd, nullptr);
     DestroyMenu(hMenu);
 }
@@ -3766,6 +3840,10 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_STRING | (g_excludeNoVersion ? MF_CHECKED : MF_UNCHECKED),
         IDM_EXCLUDE_NO_VERSION, L"バージョン未指定のチケットを除外");
 
+    // 非表示チケットの除外（レジストリ永続化。OFF はグレーで参考表示）
+    AppendMenuW(hMenu, MF_STRING | (g_excludeHidden ? MF_CHECKED : MF_UNCHECKED),
+        IDM_EXCLUDE_HIDDEN, L"非表示チケットを除外");
+
     // 自分の操作による起票・更新の通知抑止（レジストリ永続化。既定 ON）
     AppendMenuW(hMenu, MF_STRING | (g_muteOwnChanges ? MF_CHECKED : MF_UNCHECKED),
         IDM_MUTE_OWN_CHANGES, L"自分の操作による更新を通知しない");
@@ -3882,6 +3960,15 @@ static void handleTrayCommand(UINT id) {
         g_excludeNoVersion.store(!g_excludeNoVersion.load());
         writeRegDword(REG_EXCLUDE_NO_VERSION, g_excludeNoVersion.load() ? 1u : 0u);
         // 担当者フィルタと同じ扱い。未読は消さず、tooltip・バッジは即時更新、再ポーリングは不要
+        if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
+        return;
+    }
+    if (id == IDM_EXCLUDE_HIDDEN) {
+        g_excludeHidden.store(!g_excludeHidden.load());
+        writeRegDword(REG_EXCLUDE_HIDDEN, g_excludeHidden.load() ? 1u : 0u);
+        // 件数・未読・通知はトグルと無関係に常に非表示チケットを除外しているため変化しない。
+        // （非表示行は list_limit の予算外で、切り替えても通常行の窓は動かない）
+        // 一覧は次に開いた時点で組み直されるが、経路は他のフィルタ系トグルと揃えておく
         if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
         return;
     }
@@ -4038,6 +4125,9 @@ static BOOL measureIssueMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
 // ODS_SELECTED に応じた背景色・テキスト色を切り替え、closed フラグが立つ項目には
 // DrawTextW 後に 2 px の取消線を手動で重ね描画する。
 // IssueLabel::ranges に色付け範囲がある行は、範囲ごとに文字色を変えて分割描画する。
+// hidden フラグが立つ項目は非活性の慣例に合わせて全体を COLOR_GRAYTEXT 一色で描く。
+// （期日超過などの範囲色より優先する）選択時はハイライト背景に GRAYTEXT が沈んで
+// 読めないため、GRAYTEXT と HIGHLIGHTTEXT の中間色へ明度を上げる。（非活性感は保つ）
 static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
     if (dis->CtlType != ODT_MENU) return FALSE;
     UINT eidx = static_cast<UINT>(dis->itemData);
@@ -4052,7 +4142,21 @@ static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
     RECT textRect  = dis->rcItem;
     textRect.left += 4;  // 左パディング（measureIssueMenuItem の確保幅と揃える）
     SetBkMode(dis->hDC, TRANSPARENT);
-    COLORREF textColor = GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT);
+    COLORREF textColor;
+    if (item.hidden) {
+        textColor = GetSysColor(COLOR_GRAYTEXT);
+        if (selected) {
+            // ハイライト背景上でも読めるよう HIGHLIGHTTEXT と 1:1 で混色する。
+            // 固定色でなくシステム色から作ることでテーマ（ダーク・ハイコントラスト）に追随する
+            COLORREF hi = GetSysColor(COLOR_HIGHLIGHTTEXT);
+            textColor = RGB((GetRValue(textColor) + GetRValue(hi)) / 2,
+                            (GetGValue(textColor) + GetGValue(hi)) / 2,
+                            (GetBValue(textColor) + GetBValue(hi)) / 2);
+        }
+    }
+    else {
+        textColor = GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT);
+    }
     SetTextColor(dis->hDC, textColor);
     HFONT oldFont = static_cast<HFONT>(SelectObject(dis->hDC, g_hMenuFont));
     // ピンマーカー列（measureIssueMenuItem と同じ幅を全行に確保し、ピン留め行のみ 📌 を描く）
@@ -4076,7 +4180,7 @@ static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
     HFONT baseFont = nullptr, emphFont = nullptr;
     issueLabelFonts(item.unread, baseFont, emphFont);
     int labelWidth = walkIssueLabel(dis->hDC, item, &textRect, textColor,
-                                   baseFont, emphFont, selected);
+                                   baseFont, emphFont, selected || item.hidden);
     SetTextColor(dis->hDC, textColor);  // 打ち消し線が textColor を使うため戻す
     if (item.closed) {
         constexpr int STRIKE_THICKNESS = 2;
@@ -4100,38 +4204,39 @@ static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
     return TRUE;
 }
 
-// チケット項目のピン留めをトグルする（左クリックポップアップ上の右クリック）
-// g_pins と item.pinned をトグルし、自スレッド所有のメニューウィンドウを再描画する。
-// （マーカーの描画自体は WM_DRAWITEM が pinned を参照して行う）
-// ピンが上限（PIN_LIMIT）に達している場合の追加は行わず、Toast で上限をユーザに知らせる。
-static void togglePin(UINT itemIdx, HMENU hm) {
+// チケット項目の状態を通常 → ピン留め → 非表示 → 通常の順に遷移させる
+// （左クリックポップアップ上の右クリック）
+// g_pins・g_hiddenIds と item.pinned/hidden を更新し、自スレッド所有のメニューウィンドウを
+// 再描画する。（マーカー・グレーの描画自体は WM_DRAWITEM が pinned/hidden を参照して行う）
+// 状態は排他で、ピン留め → 非表示の遷移でピンは解除される。ピンの件数に上限はない。
+// 非表示は通知対象外のため、非表示への遷移時は未読からも取り除く。（太字と件数の残留を防ぐ）
+static void cycleIssueState(UINT itemIdx, HMENU hm) {
     UINT id = GetMenuItemID(hm, static_cast<int>(itemIdx));
     if (id < IDM_ISSUE_BASE || id >= IDM_ISSUE_MAX) return;
     UINT eidx = id - IDM_ISSUE_BASE;
     if (eidx >= g_issueItems.size()) return;
 
     auto& item = g_issueItems[eidx];
-    bool nowPinned;
+    bool nowPinned, nowHidden;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         auto it = std::find_if(g_pins.begin(), g_pins.end(),
             [&](const PinEntry& p) { return p.id == item.id; });
         if (it != g_pins.end()) {
+            // ピン留め → 非表示
             g_pins.erase(it);
+            g_hiddenIds.insert(item.id);
+            g_unreadIds.erase(item.id);
             nowPinned = false;
+            nowHidden = true;
+        }
+        else if (g_hiddenIds.erase(item.id) != 0) {
+            // 非表示 → 通常
+            nowPinned = false;
+            nowHidden = false;
         }
         else {
-            if (g_pins.size() >= PIN_LIMIT) {
-                writeLog("pin: limit reached (" + std::to_string(PIN_LIMIT)
-                    + "), ignored #" + std::to_string(item.id));
-                // 右クリックが無反応に見えないよう、上限到達をユーザに知らせる
-                try {
-                    showToast(L"ピン留めは最大 " + std::to_wstring(PIN_LIMIT) + L" 件です",
-                              L"既存のピンを右クリックで解除してから追加してください", L"");
-                }
-                catch (...) {}
-                return;
-            }
+            // 通常 → ピン留め
             // 件名・プロジェクト名・更新日時・期限日は g_issues から引く。
             // （一覧行のラベルは省略済みで復元できないため）
             PinEntry p;
@@ -4153,10 +4258,13 @@ static void togglePin(UINT itemIdx, HMENU hm) {
             }
             g_pins.push_back(std::move(p));
             nowPinned = true;
+            nowHidden = false;
         }
     }
-    // 描画は WM_DRAWITEM が pinned を参照するため、フラグ更新と再描画だけでマーカーが切り替わる
+    // 描画は WM_DRAWITEM が pinned/hidden を参照するため、フラグ更新と再描画だけで見た目が切り替わる
     item.pinned = nowPinned;
+    item.hidden = nowHidden;
+    if (nowHidden) item.unread = false;  // 非表示行は太字にしない（buildListRows と同じ扱い）
 
     // 自スレッド所有のポップアップメニューウィンドウ（クラス名 "#32768"）を全て再描画する
     // FindWindowW はグローバル検索でタイミング依存・他プロセスの誤ヒットがあるため EnumThreadWindows を用いる
@@ -4172,8 +4280,14 @@ static void togglePin(UINT itemIdx, HMENU hm) {
         }
         return TRUE;
     }, 0);
+    // 遷移で必ずどちらかの集合が変わるが、片側だけの変化を追う分岐より両方の保存の方が単純で、
+    // 書き出しはどちらも小さい。（tmp 経由の atomicWriteJson で破損もしない）
     savePins(g_exeDir);
-    writeLog(std::string("pin: ") + (nowPinned ? "added #" : "removed #") + std::to_string(item.id));
+    saveHidden(g_exeDir);
+    // 非表示への遷移で未読が消えることがあるため、tooltip とバッジを追随させる
+    if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
+    writeLog("issue state: #" + std::to_string(item.id)
+        + (nowPinned ? " pinned" : nowHidden ? " hidden" : " normal"));
 }
 
 // redntfy.local.toml のテンプレートを生成する（既存ファイルは絶対に上書きしない）
@@ -4265,7 +4379,7 @@ static void enterDisabledMode(HWND hWnd, DisabledReason reason,
 
 // トレイ用ウィンドウプロシージャ
 // トレイアイコン操作（左クリック一覧・右クリックメニュー）、tooltip 更新、無効モード遷移、
-// メニューのオーナードロー（新版通知・チケット行）、ポップアップ右クリックのピン留めトグル、
+// メニューのオーナードロー（新版通知・チケット行）、ポップアップ右クリックの状態遷移、
 // スリープ復帰・ロック解除の即時ポーリング、エクスプローラ再起動時のアイコン再登録を振り分ける。
 static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAYICON) {
@@ -4300,10 +4414,10 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             return drawVersionMenuItem(dis) ? TRUE : DefWindowProcW(hWnd, msg, wParam, lParam);
         if (drawIssueMenuItem(dis)) return TRUE;
     }
-    // 左クリックポップアップ上の右クリック: ピン留めをトグルする
+    // 左クリックポップアップ上の右クリック：状態を遷移させる（通常 → ピン留め → 非表示 → 通常）
     // WM_MENURBUTTONUP は TPM_RIGHTBUTTON 指定なしでも右クリックで届く。（選択は発生しない）
     if (msg == WM_MENURBUTTONUP) {
-        togglePin(static_cast<UINT>(wParam), reinterpret_cast<HMENU>(lParam));
+        cycleIssueState(static_cast<UINT>(wParam), reinterpret_cast<HMENU>(lParam));
         return 0;
     }
     if (msg == WM_DESTROY) {
@@ -4364,7 +4478,7 @@ static VOID WINAPI onNetworkChange(PVOID, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION
 // ピン留めの鮮度維持
 //
 // 取得集合に居るピンは集合側の内容で更新し、集合から外れたピン（クローズ・担当変更等）は
-// 個別取得で最新化する（最大 PIN_LIMIT 回/ポーリング）。個別取得の失敗時（削除済み・
+// 個別取得で最新化する（集合外ピンの件数分の HTTP/ポーリング）。個別取得の失敗時（削除済み・
 // 接続エラー）は前回キャッシュの内容のまま表示を継続する。
 static void refreshPins(const std::wstring& exeDir, const Config& cfg,
                         const std::vector<Issue>& issues, const std::vector<int>& groupIds,
@@ -4443,6 +4557,32 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
     savePins(exeDir);
 }
 
+// 非表示チケットの自動削除
+// ポーリング成功時に呼び、取得集合に無い id を g_hiddenIds から取り除いて保存する。
+// クローズ・担当変更等でクエリから外れたチケットの非表示設定を残さないための掃除。
+// 同じチケットが後日クエリへ戻ったときは通常状態で再出現する。（改めて非表示にすれば良い）
+// fetchIssues は 1 クエリでも失敗すると全体を失敗にするため、成功時の issues は完全な集合で
+// 誤削除は起きない。（本関数は成功パスからのみ呼ぶこと）
+static void pruneHidden(const std::wstring& exeDir, const std::vector<Issue>& issues) {
+    bool changed = false;
+    {
+        std::unordered_set<int> current;
+        for (const auto& is : issues) current.insert(is.id);
+        std::lock_guard<std::mutex> lk(g_mtx);
+        for (auto it = g_hiddenIds.begin(); it != g_hiddenIds.end();) {
+            if (current.count(*it) == 0) {
+                writeLog("hidden: pruned #" + std::to_string(*it) + " (left query set)");
+                it = g_hiddenIds.erase(it);
+                changed = true;
+            }
+            else {
+                ++it;
+            }
+        }
+    }
+    if (changed) saveHidden(exeDir);
+}
+
 // 通知理由（1 件時の Toast 文言切替とログ内訳に使う）
 enum class NotifyKind { New, Updated, QueryEntered };
 
@@ -4479,16 +4619,22 @@ static bool hasNewQueryEntry(const std::vector<int>& now, const std::vector<int>
 // この抑止は muteOwnChanges で一括 ON/OFF できる。OFF なら自分の起票・更新も通知する。
 // 担当者フィルタ ON なら、自分が担当でないチケットもあわせて除外する。
 // バージョンフィルタ ON なら、fixed_version 未指定かつ期日なしのチケットもあわせて除外する。
+// hiddenIds（非表示チケット）は「見なくて良い」の意思表示のため無条件に除外する。
+// （state.json への記録は呼び出し側が全件で行うので、非表示解除時に溜まった更新が
+// 一斉通知される「通知の嵐」は起きない）
 // issues の最終更新者は resolveUpdaters が確定済みであることを前提とする。
 // 戻り値の NotifyTarget::issue は issues の要素を指す。（issues より長く保持しない）
 // 終了要求による中断は nullopt を返す。（呼び出し側は state.json を書かずに抜ける）
 static std::optional<std::vector<NotifyTarget>> selectNotifyTargets(
     const std::vector<Issue>& issues, const PollState& prev,
-    bool muteOwnChanges, int myUserId)
+    bool muteOwnChanges, int myUserId,
+    const std::unordered_set<int>& hiddenIds = {})
 {
     std::vector<NotifyTarget> targets;
     for (const auto& is : issues) {
         if (g_shutdownRequested) return std::nullopt;
+        // 非表示チケットは通知しない
+        if (hiddenIds.count(is.id) != 0) continue;
         // 担当者フィルタで外れたチケットは通知しない
         if (!passesAssigneeFilter(is)) continue;
         // バージョン未指定は「将来の課題」なので通知しない（期日ありは通す）
@@ -4630,7 +4776,14 @@ static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         }
     }
 
-    auto targets = selectNotifyTargets(issues, prev, g_muteOwnChanges.load(), g_myUserId.load());
+    // 非表示チケットは通知から除外する。（スナップショットを取り、選定中のロック競合を避ける）
+    std::unordered_set<int> hiddenIds;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        hiddenIds = g_hiddenIds;
+    }
+    auto targets = selectNotifyTargets(issues, prev, g_muteOwnChanges.load(), g_myUserId.load(),
+                                       hiddenIds);
     if (!targets) return 0;  // 終了要求による中断
 
     if (!targets->empty()) emitNotifications(cfg, *targets);
@@ -4900,6 +5053,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
 
             int notified = deliverPollResults(exeDir, cfg, issues, prevState);
             refreshPins(exeDir, cfg, issues, session.groupIds, session.groupIdsResolved);
+            pruneHidden(exeDir, issues);
 
             // 「今すぐ更新」の完了通知。更新を検知した回は通知 Toast が出ているため重ねない
             if (manualTriggered && notified == 0 && !g_shutdownRequested)
@@ -5047,6 +5201,7 @@ int wmain() {
         g_sortByDue        = readRegDword(REG_SORT_BY_DUE, 0u) != 0;
         g_excludeNoVersion = readRegDword(REG_EXCLUDE_NO_VERSION, 0u) != 0;
         g_muteOwnChanges   = readRegDword(REG_MUTE_OWN_CHANGES, 1u) != 0;
+        g_excludeHidden    = readRegDword(REG_EXCLUDE_HIDDEN, 0u) != 0;
 
         writeLog("started");
         logSchedule(cfg.schedule);
@@ -5073,8 +5228,9 @@ int wmain() {
         // メニュー描画用フォントを初期化（以降、WM_MEASUREITEM / WM_DRAWITEM で使用する）
         initMenuFonts();
 
-        // ピン留めを復元する（起動直後のポーリング前でも一覧にピンを出せるようにする）
+        // ピン留めと非表示チケットを復元する（起動直後のポーリング前でも一覧に反映するため）
         loadPins(exeDir);
+        loadHidden(exeDir);
 
         // ポーリングスレッド起動（無効モード時は起動しない：設定はホットリロードしないため
         // 何度試行しても結果が変わらず、案内はトレイ tooltip と Toast が担う）

@@ -544,6 +544,86 @@ static void testSelectNotifyTargets() {
         auto r = selectNotifyTargets(issues, prev, true, ME);
         CHECK(r && r->size() == 1 && (*r)[0].kind == NotifyKind::New);
     }
+    // 非表示チケットは新規・更新とも通知しない（非表示でないチケットは通知する）
+    {
+        auto prev = makePrevState();
+        prev.issues[110] = {"2026-08-01T12:00:00Z", {1}, true};
+        std::vector<Issue> issues{makeIssue(109), makeIssue(110, "2026-08-02T00:00:00Z")};
+        std::unordered_set<int> hidden{109, 110};
+        auto r = selectNotifyTargets(issues, prev, true, ME, hidden);
+        CHECK(r && r->empty());
+        r = selectNotifyTargets(issues, prev, true, ME, {111});
+        CHECK(r && r->size() == 2);
+    }
+}
+
+// ==================== buildListRows（非表示チケット） ====================
+
+static void testBuildListRowsHidden() {
+    // 検証用の共有状態を組み立てる（フィルタは全て OFF・limit は十分大きく）
+    auto setup = [](std::initializer_list<int> issueIds, std::initializer_list<int> hiddenIds) {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_issues.clear();
+        for (int id : issueIds) {
+            Issue is;
+            is.id        = id;
+            is.updatedOn = "2026-08-0" + std::to_string(id % 9 + 1) + "T00:00:00Z";
+            g_issues.push_back(is);
+        }
+        g_pins.clear();
+        g_unreadIds = {issueIds.begin(), issueIds.end()};
+        g_hiddenIds = {hiddenIds.begin(), hiddenIds.end()};
+    };
+    int savedLimit = g_currentConfig.listLimit;
+    g_currentConfig.listLimit = 10;
+
+    // トグル OFF：非表示行も hidden フラグ付きで出るが、件数・未読には数えない
+    {
+        setup({1, 2, 3}, {2});
+        g_excludeHidden.store(false);
+        int visible = 0;
+        auto rows = buildListRows(visible);
+        CHECK(rows.size() == 3);
+        CHECK(visible == 2);
+        int hiddenRows = 0, unreadRows = 0;
+        for (const auto& r : rows) {
+            if (r.hidden) ++hiddenRows;
+            if (r.unread) ++unreadRows;
+        }
+        CHECK(hiddenRows == 1);
+        CHECK(unreadRows == 2);  // 非表示行の未読は数えない
+    }
+    // トグル ON：非表示行は行ごと出ない（件数は OFF と変わらない）
+    {
+        setup({1, 2, 3}, {2});
+        g_excludeHidden.store(true);
+        int visible = 0;
+        auto rows = buildListRows(visible);
+        CHECK(rows.size() == 2);
+        CHECK(visible == 2);
+        for (const auto& r : rows) CHECK(r.id != 2);
+    }
+    // 非表示行は list_limit の予算を消費しない（通常行は常に limit 件見える）
+    {
+        setup({1, 2, 3, 4}, {2});
+        g_excludeHidden.store(false);
+        g_currentConfig.listLimit = 3;
+        int visible = 0;
+        auto rows = buildListRows(visible);
+        CHECK(rows.size() == 4);  // 通常 3 行＋非表示 1 行
+        CHECK(visible == 3);
+        g_currentConfig.listLimit = 10;
+    }
+
+    // 後始末（他テストへの影響防止）
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_issues.clear();
+        g_unreadIds.clear();
+        g_hiddenIds.clear();
+    }
+    g_excludeHidden.store(false);
+    g_currentConfig.listLimit = savedLimit;
 }
 
 // テストの列挙実行と集計出力（失敗ありなら終了コード 1）
@@ -568,6 +648,7 @@ int main() {
     testQueryUrl();
     testPassesVersionFilter();
     testSelectNotifyTargets();
+    testBuildListRowsHidden();
     printf("checks: %d, failed: %d\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }
