@@ -13,6 +13,7 @@ A lightweight resident app that notifies you of Redmine ticket updates via Windo
 - Starts tracking tickets assigned to you with just a URL and an API key; polls on a schedule and shows toast notifications for new or updated tickets
 - Notification targets are freely adjustable via Redmine saved queries (query_ids)
 - Displays an open-ticket list from the tray, formatted with icons for due dates, assignees, and projects
+- Hovering over the tray icon also shows the list (the delay is adjustable, and the feature can be turned off)
 - The order and items of each list row are fully customizable via placeholders in the configuration
 - Pins keep important tickets in the list (they stay even after being closed)
 - Tickets you do not need to watch can be hidden, excluding them from notifications and the pending count
@@ -69,6 +70,8 @@ If you want to tune the tracking scope yourself, create custom queries in Redmin
 Everyday operations:
 
 - Left-click the tray icon to show the open-ticket list
+- Resting the cursor on the tray icon shows the same list (0.25 s by default; it closes automatically when the cursor leaves, and focus returns to the previous window)
+- Toggle hover display via "Show list on hover" in the right-click menu (ON by default, persists across restarts; while ON, the count tooltip is not shown)
 - Left-click a row to open the ticket in the browser and mark it as read; right-click to cycle pin → hidden → normal
 - Hidden tickets are shown in gray and excluded from notifications and the pending count ("Exclude hidden tickets" in the menu removes them from the list entirely)
 - Right-click the tray icon to access the menu for instant refresh, filters, and sort orders
@@ -86,6 +89,7 @@ The main configuration keys are listed below. See the comments in `redntfy.toml`
 | `[app]` | `schedule` | Polls per hour for each of the 24 hours |
 | `[app]` | `list_limit` | Number of rows in the list (default 20) |
 | `[app]` | `list_format` | Row format of the list (placeholder based) |
+| `[app]` | `hover_delay_ms` | Delay before the list appears on hover (milliseconds, 0-5000; default 250, 0 for immediate) |
 | `[app]` | `bug_trackers` | Tracker-name patterns that get a 💥 icon |
 | `[app]` | `duck_targets` | Process names to mute while a sound plays |
 | `[redmine]` | `url`, `api_key` | Connection settings (required) |
@@ -111,6 +115,7 @@ Switching the setting does not flood you with notifications.
 
 - Only Redmine global saved queries are supported (queries under a specific project cannot be referenced via the API)
 - Group-assignee detection covers all groups only with admin privileges; otherwise it only checks your own groups
+- The hover list does not work while the tray icon is in the hidden-icons overflow area (drag the icon onto the taskbar to pin it)
 - The configuration file is not hot-reloaded; a restart is required to apply changes
 - If the configuration is incomplete, the app stays resident in a guidance mode without notifications (follow the tray icon and its tooltip, fix the settings, and restart)
 

@@ -100,6 +100,17 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   （クリックできない行でバッジが消せなくなるのを防ぐため、表示範囲を件数の基準に揃えた）
   Toast の「チケットを開く」は OS がブラウザを直接起動するため既読化されない。
 
+- ホバー一覧は `WM_MOUSEMOVE`＋ワンショット `SetTimer`（`IDT_HOVER_TRIGGER`）のデバウンス方式  
+  `NIM_SETVERSION` は使わないこと。v4 化すると `WM_TRAYICON` の `lParam` 比較が全滅する。
+  表示中は `IDT_HOVER_AUTOCLOSE`（200ms）がカーソル場外 2 tick 連続で `EndMenu` し、
+  自動クローズ時のみ直前のフォアグラウンドへフォーカスを復元する。
+  ホバー ON（レジストリ HoverPopup、既定 ON）中は件数 tooltip を空にする。（`addTrayIcon` の
+  初期 tooltip も同様。無効モードの案内 tooltip とバッジは維持）
+  `handleTrayHover` は `g_tooltipUpdating` 中は見送る。（`Shell_NotifyIconW` の内部ポンプで
+  `WM_TIMER` が再入し、tooltip 更新の内側でモーダルループが入れ子になるため）
+  オーバーフロー領域のアイコンでは `Shell_NotifyIconGetRect` の矩形が一致せず機能しない。
+  （既知の制約として受容済み。gcalntfy と同じ）
+
 - Toast には AUMID 付きスタートメニューショートカットが必須（`ensureShortcut` が自動作成）
 
 ## References
