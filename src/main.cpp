@@ -153,7 +153,11 @@ static constexpr DWORD HOVER_AUTOCLOSE_POLL_MS = 200;
 // カーソルがアイコン・メニューの外に連続でこの tick 数（約 400ms）観測されたら閉じる
 static constexpr int   HOVER_AUTOCLOSE_TICKS   = 2;
 
-// 一覧を明示操作で閉じた直後、左クリックとホバー再表示を無視する猶予（ms）
+// 明示クローズ後にカーソルのアイコン離脱を監視する再アーム用ポーリングタイマー
+// （周期は HOVER_AUTOCLOSE_POLL_MS を共用する）
+static constexpr UINT  IDT_HOVER_REARM        = 3;
+
+// クリック起点の一覧を閉じた直後、左クリックを無視する猶予（ms。ホバー無効時に使う）
 // アイコンクリックで閉じるとメニュー解除（押下）→ WM_LBUTTONUP の順で届くため、放置すると
 // 閉じたはずの一覧が即座に再表示される。クリック 1 回分の押下〜開放が収まる長さとする
 static constexpr ULONGLONG LIST_CLICK_SUPPRESS_MS = 500;
@@ -254,8 +258,12 @@ static bool g_hoverAutoclosed     = false;
 static HWND g_hoverPrevForeground = nullptr;
 static int  g_hoverOutsideTicks   = 0;
 
-// 一覧（ホバー・クリック起点とも）を明示操作（アイコンクリック・Esc 等。自動クローズ以外）で
-// 閉じた時刻（GetTickCount64 の値。LIST_CLICK_SUPPRESS_MS の抑止判定に使う）
+// 明示操作で一覧を閉じた後、カーソルがアイコンから一度離れるまでホバー再表示を抑止するフラグ
+// （閉じてもカーソルが乗ったままだと、わずかな動きで即座に開き直るため。
+// IDT_HOVER_REARM の監視でアイコン離脱を検出したら解除する）
+static bool g_hoverSuppressed = false;
+
+// クリック起点の一覧を閉じた時刻（GetTickCount64 の値。LIST_CLICK_SUPPRESS_MS の抑止判定に使う）
 static ULONGLONG g_listCloseTick = 0;
 
 // スリープ復帰・ロック解除時の即時ポーリングフラグ
@@ -3272,6 +3280,7 @@ static void updateTrayTooltip(HWND hWnd) {
 static void removeTrayIcon(HWND hWnd) {
     KillTimer(hWnd, IDT_HOVER_TRIGGER);
     KillTimer(hWnd, IDT_HOVER_AUTOCLOSE);
+    KillTimer(hWnd, IDT_HOVER_REARM);
     auto nid = makeTrayNid(hWnd);
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
@@ -3978,7 +3987,8 @@ static void showTrayContextMenu(HWND hWnd) {
 // トレイアイコンホバー時のチケット一覧表示
 //
 // 契約：IDT_HOVER_TRIGGER の発火（または hover_delay_ms = 0 の即時経路）からのみ呼ばれる。
-// ホバー無効・無効モード・既に表示中・tooltip 更新中・明示クローズ直後の猶予内は無反応。
+// ホバー無効・無効モード・既に表示中・tooltip 更新中・明示クローズ後の抑止中
+// （カーソルがアイコンを離れるまで）は無反応。
 // 発火時点でカーソルがアイコン矩形内に留まっているかを再確認してから表示する。
 // （遅延中の離脱で発火した空タイマー対策）
 //
@@ -3997,9 +4007,7 @@ static void handleTrayHover(HWND hWnd) {
     // ここでモーダルループへ入ると外側の updateTrayTooltip が中断したまま残り、
     // 一覧を閉じた後の tooltip・バッジが更新されない。次の WM_MOUSEMOVE で張り直されるため見送りで足りる
     if (g_tooltipUpdating)           return;
-    // 明示操作で閉じた直後は再表示しない。（クリックで閉じてもカーソルが乗ったままだと
-    // わずかな動きで即座に開き直り、閉じる操作が効かないように見えるため）
-    if (GetTickCount64() - g_listCloseTick < LIST_CLICK_SUPPRESS_MS) return;
+    if (g_hoverSuppressed)           return;  // 明示クローズ後、アイコン離脱までは再表示しない
 
     RECT icon;
     if (!getTrayIconRect(hWnd, icon)) return;
@@ -4033,10 +4041,14 @@ static void handleTrayHover(HWND hWnd) {
 
     g_popupShowing.store(false);
 
-    // 明示操作（アイコンクリック・Esc 等）で閉じたら時刻を記録し、直後のホバー再表示を抑止する。
-    // （クリックで閉じてもカーソルが乗ったままだと、わずかな動きで即座に開き直るため）
-    // 自動クローズはカーソルが場外にあり誤爆しないため記録しない
-    if (!autoclosed) g_listCloseTick = GetTickCount64();
+    // 明示操作（アイコンクリック・Esc 等）で閉じたら、カーソルがアイコンから一度離れるまで
+    // ホバー再表示を抑止する。（乗ったままのわずかな動きで即座に開き直るため）
+    // 離脱の検出は IDT_HOVER_REARM のポーリングが担う。
+    // 自動クローズはカーソルが場外にあり誤爆しないため抑止しない
+    if (!autoclosed) {
+        g_hoverSuppressed = true;
+        SetTimer(hWnd, IDT_HOVER_REARM, HOVER_AUTOCLOSE_POLL_MS, nullptr);
+    }
 
     // 破棄済みウィンドウへの復元を避ける防御チェック
     if (autoclosed && restoreTo && IsWindow(restoreTo))
@@ -4062,8 +4074,7 @@ static void handleTrayLeftClick(HWND hWnd) {
     clearTrayTooltip(hWnd);
     showIssuePopup(hWnd);
     g_popupShowing.store(false);
-    // クリック起点の一覧も閉じ方はホバー起点と同じ（常に明示操作）ため、同様に時刻を記録して
-    // アイコンクリックで閉じた直後の再表示を抑止する
+    // アイコンクリックで閉じた直後の再表示を防ぐため、閉じた時刻を記録する
     g_listCloseTick = GetTickCount64();
     updateTrayTooltip(hWnd);
 }
@@ -4585,7 +4596,9 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             // ホバー検出のデバウンス：静止中は WM_MOUSEMOVE が来ないため、動くたびに
             // ワンショットタイマーを張り直せば「delay 時間静止したら表示」を判定できる。
             // hover_delay_ms = 0 は即時表示。（デバウンスなし）
-            if (g_hoverPopupEnabled.load() && !isDisabled() && !g_popupShowing.load()) {
+            // 明示クローズ後の抑止中（g_hoverSuppressed）はアームしない
+            if (g_hoverPopupEnabled.load() && !isDisabled() && !g_popupShowing.load()
+                && !g_hoverSuppressed) {
                 DWORD delay = g_hoverDelayMs.load();
                 if (delay == 0) {
                     KillTimer(hWnd, IDT_HOVER_TRIGGER);
@@ -4595,6 +4608,18 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                     SetTimer(hWnd, IDT_HOVER_TRIGGER, delay, nullptr);
                 }
             }
+        }
+        return 0;
+    }
+    if (msg == WM_TIMER && wParam == IDT_HOVER_REARM) {
+        // 明示クローズ後の抑止解除判定：カーソルがアイコンから離れたら再アームする。
+        // 矩形の取得失敗は離脱扱いにする。（抑止に倒し続けるとホバーが復帰不能になるため）
+        POINT pt;
+        GetCursorPos(&pt);
+        RECT icon = {};
+        if (!getTrayIconRect(hWnd, icon) || !PtInRect(&icon, pt)) {
+            g_hoverSuppressed = false;
+            KillTimer(hWnd, IDT_HOVER_REARM);
         }
         return 0;
     }
