@@ -70,7 +70,7 @@ If you want to tune the tracking scope yourself, create custom queries in Redmin
 Everyday operations:
 
 - Left-click the tray icon to show the open-ticket list
-- Resting the cursor on the tray icon shows the same list (0.25 s by default; it closes automatically when the cursor leaves, and focus returns to the previous window)
+- Resting the cursor on the tray icon shows the same list (0.2 s by default; it closes automatically when the cursor leaves, and focus returns to the previous window)
 - Toggle hover display via "Show list on hover" in the right-click menu (ON by default, persists across restarts; while ON, the count tooltip is not shown)
 - Left-click a row to open the ticket in the browser and mark it as read; right-click to cycle pin → hidden → normal
 - Hidden tickets are shown in gray and excluded from notifications and the pending count ("Exclude hidden tickets" in the menu removes them from the list entirely)
@@ -89,7 +89,7 @@ The main configuration keys are listed below. See the comments in `redntfy.toml`
 | `[app]` | `schedule` | Polls per hour for each of the 24 hours |
 | `[app]` | `list_limit` | Number of rows in the list (default 20) |
 | `[app]` | `list_format` | Row format of the list (placeholder based) |
-| `[app]` | `hover_delay_ms` | Delay before the list appears on hover (milliseconds, 0-5000; default 250, 0 for immediate) |
+| `[app]` | `hover_delay_ms` | Delay before the list appears on hover (milliseconds, 0-5000; default 200, 0 for immediate) |
 | `[app]` | `bug_trackers` | Tracker-name patterns that get a 💥 icon |
 | `[app]` | `duck_targets` | Process names to mute while a sound plays |
 | `[redmine]` | `url`, `api_key` | Connection settings (required) |

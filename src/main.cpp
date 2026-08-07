@@ -105,7 +105,7 @@ static const wchar_t* APP_AUMID = L"com.redntfy";
 static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 
 // ホバーで一覧を表示するまでの遅延（ms）。0 は即時表示
-static constexpr long long DEFAULT_HOVER_DELAY_MS = 250;
+static constexpr long long DEFAULT_HOVER_DELAY_MS = 200;
 static constexpr long long MIN_HOVER_DELAY_MS     = 0;
 static constexpr long long MAX_HOVER_DELAY_MS     = 5000;
 
@@ -393,7 +393,7 @@ struct Config {
     // バージョン欄判定情報（トラッカー定義・プロジェクトのバージョン定義）の再取得間隔（時間）
     // 超過していたら次のポーリングで直ちに再取得する。デフォルト 24。（1〜168）
     int versionMetaRefreshHours;
-    // ホバーで一覧を表示するまでの遅延（ms、0〜5000、0 で即時、デフォルト 250）
+    // ホバーで一覧を表示するまでの遅延（ms、0〜5000、0 で即時、デフォルト 200）
     long long hoverDelayMs;
 
     // [guard] ガードトーン設定（BLE ヘッドホン対処）
@@ -1436,7 +1436,7 @@ static Config loadConfig(const std::wstring& exeDir) {
     // バージョン欄判定情報の再取得間隔（時間）
     cfg.versionMetaRefreshHours = readAppInt("version_meta_refresh_hours", 24, 1, 168);
 
-    // ホバーで一覧を表示するまでの遅延（ms 単位。デフォルト 250、0〜5000 にクランプ、0 で即時）
+    // ホバーで一覧を表示するまでの遅延（ms 単位。デフォルト 200、0〜5000 にクランプ、0 で即時）
     cfg.hoverDelayMs = readAppInt("hover_delay_ms",
         static_cast<int>(DEFAULT_HOVER_DELAY_MS),
         static_cast<int>(MIN_HOVER_DELAY_MS),
