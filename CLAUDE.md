@@ -108,6 +108,9 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   初期 tooltip も同様。無効モードの案内 tooltip とバッジは維持）
   `handleTrayHover` は `g_tooltipUpdating` 中は見送る。（`Shell_NotifyIconW` の内部ポンプで
   `WM_TIMER` が再入し、tooltip 更新の内側でモーダルループが入れ子になるため）
+  一覧（ホバー・クリック起点とも）を明示操作で閉じた直後 500ms は左クリックとホバー再表示を
+  抑止する。（アイコンクリックの解除はメニュー解除 → `WM_LBUTTONUP` の順で届き、放置すると
+  閉じた一覧が即座に再表示されるため）
   オーバーフロー領域のアイコンでは `Shell_NotifyIconGetRect` の矩形が一致せず機能しない。
   （既知の制約として受容済み。gcalntfy と同じ）
 

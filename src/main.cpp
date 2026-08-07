@@ -153,6 +153,11 @@ static constexpr DWORD HOVER_AUTOCLOSE_POLL_MS = 200;
 // カーソルがアイコン・メニューの外に連続でこの tick 数（約 400ms）観測されたら閉じる
 static constexpr int   HOVER_AUTOCLOSE_TICKS   = 2;
 
+// 一覧を明示操作で閉じた直後、左クリックとホバー再表示を無視する猶予（ms）
+// アイコンクリックで閉じるとメニュー解除（押下）→ WM_LBUTTONUP の順で届くため、放置すると
+// 閉じたはずの一覧が即座に再表示される。クリック 1 回分の押下〜開放が収まる長さとする
+static constexpr ULONGLONG LIST_CLICK_SUPPRESS_MS = 500;
+
 // 即時ポーリングの抑制間隔（前回ポーリングからこの時間内は即時ポーリングをスキップ）
 static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
 
@@ -248,6 +253,10 @@ static bool g_hoverMode           = false;
 static bool g_hoverAutoclosed     = false;
 static HWND g_hoverPrevForeground = nullptr;
 static int  g_hoverOutsideTicks   = 0;
+
+// 一覧（ホバー・クリック起点とも）を明示操作（アイコンクリック・Esc 等。自動クローズ以外）で
+// 閉じた時刻（GetTickCount64 の値。LIST_CLICK_SUPPRESS_MS の抑止判定に使う）
+static ULONGLONG g_listCloseTick = 0;
 
 // スリープ復帰・ロック解除時の即時ポーリングフラグ
 static std::atomic<bool> g_forcePoll{false};
@@ -3969,8 +3978,9 @@ static void showTrayContextMenu(HWND hWnd) {
 // トレイアイコンホバー時のチケット一覧表示
 //
 // 契約：IDT_HOVER_TRIGGER の発火（または hover_delay_ms = 0 の即時経路）からのみ呼ばれる。
-// ホバー無効・無効モード・既に表示中・tooltip 更新中は無反応。発火時点でカーソルが
-// アイコン矩形内に留まっているかを再確認してから表示する。（遅延中の離脱で発火した空タイマー対策）
+// ホバー無効・無効モード・既に表示中・tooltip 更新中・明示クローズ直後の猶予内は無反応。
+// 発火時点でカーソルがアイコン矩形内に留まっているかを再確認してから表示する。
+// （遅延中の離脱で発火した空タイマー対策）
 //
 // 自動クローズ：表示中は IDT_HOVER_AUTOCLOSE を回し、カーソルがアイコン矩形・メニュー矩形の
 // いずれの内側にも無い状態が HOVER_AUTOCLOSE_TICKS 連続で観測されたら EndMenu で閉じる。
@@ -3987,6 +3997,9 @@ static void handleTrayHover(HWND hWnd) {
     // ここでモーダルループへ入ると外側の updateTrayTooltip が中断したまま残り、
     // 一覧を閉じた後の tooltip・バッジが更新されない。次の WM_MOUSEMOVE で張り直されるため見送りで足りる
     if (g_tooltipUpdating)           return;
+    // 明示操作で閉じた直後は再表示しない。（クリックで閉じてもカーソルが乗ったままだと
+    // わずかな動きで即座に開き直り、閉じる操作が効かないように見えるため）
+    if (GetTickCount64() - g_listCloseTick < LIST_CLICK_SUPPRESS_MS) return;
 
     RECT icon;
     if (!getTrayIconRect(hWnd, icon)) return;
@@ -4020,6 +4033,12 @@ static void handleTrayHover(HWND hWnd) {
 
     g_popupShowing.store(false);
 
+    // 明示操作（アイコンクリック等）で閉じたら時刻を記録し、直後の左クリックと
+    // ホバー再表示を抑止する。アイコンクリックの解除はメニュー解除（押下）→ WM_LBUTTONUP の
+    // 順で届くため、記録しないと閉じた一覧が即座に再表示される。
+    // 自動クローズはカーソルが場外にあり誤爆しないため記録しない
+    if (!autoclosed) g_listCloseTick = GetTickCount64();
+
     // 破棄済みウィンドウへの復元を避ける防御チェック
     if (autoclosed && restoreTo && IsWindow(restoreTo))
         SetForegroundWindow(restoreTo);
@@ -4029,14 +4048,21 @@ static void handleTrayHover(HWND hWnd) {
 
 // トレイアイコン左クリック時の処理
 // チケット一覧ポップアップを表示する。無効モード中は表示しない。
-// 表示中（ホバー起点を含む）の再入は無視する。
+// 表示中（ホバー起点を含む）の再入と、一覧を明示操作で閉じた直後
+// LIST_CLICK_SUPPRESS_MS 以内のクリックは無視する。
 static void handleTrayLeftClick(HWND hWnd) {
     if (g_popupShowing.load()) return;  // ホバーで既に表示中なら二重起動しない
+    // 一覧をアイコンクリックで閉じた直後の WM_LBUTTONUP は「閉じる操作」の後半のため
+    // 無視する。（放置すると閉じた一覧が即座に再表示され、消えて出直す挙動に見える）
+    if (GetTickCount64() - g_listCloseTick < LIST_CLICK_SUPPRESS_MS) return;
     if (isDisabled()) return;  // 無効モード中は一覧を出さない（ポーリング停止中で出すものがない）
     g_popupShowing.store(true);
     clearTrayTooltip(hWnd);
     showIssuePopup(hWnd);
     g_popupShowing.store(false);
+    // クリック起点の一覧も閉じ方はホバー起点と同じ（常に明示操作）ため、同様に時刻を記録して
+    // アイコンクリックで閉じた直後の再表示を抑止する
+    g_listCloseTick = GetTickCount64();
     updateTrayTooltip(hWnd);
 }
 
