@@ -13,7 +13,7 @@ A lightweight resident app that notifies you of Redmine ticket updates via Windo
 - Starts tracking tickets assigned to you with just a URL and an API key; polls on a schedule and shows toast notifications for new or updated tickets
 - Notification targets are freely adjustable via Redmine saved queries (query_ids)
 - Displays an open-ticket list from the tray, formatted with icons for due dates, assignees, and projects
-- Hovering over the tray icon also shows the list (the delay is adjustable, and the feature can be turned off)
+- The list appears just by hovering, and never steals focus, so it does not interrupt your typing
 - The order and items of each list row are fully customizable via placeholders in the configuration
 - Pins keep important tickets in the list (they stay even after being closed)
 - Tickets you do not need to watch can be hidden, excluding them from notifications and the pending count
@@ -69,11 +69,9 @@ If you want to tune the tracking scope yourself, create custom queries in Redmin
 
 Everyday operations:
 
-- Resting the cursor on the tray icon shows the open-ticket list (0.2 s by default)
-- A list shown by hovering closes automatically when the cursor leaves, and focus returns to the previous window
-- Hover display can be turned off via "Show list on hover" in the right-click menu, and the setting persists across restarts
-- Left-clicking the tray icon also shows the list, and left-clicking while it is shown closes it
-- While hover display is ON, the count tooltip is not shown
+- Rest the cursor on the tray icon (0.2 s by default) or left-click it to show the open-ticket list
+- The list closes automatically when the cursor leaves both the icon and the list (left-clicking the icon also closes it)
+- The pending count is shown in the list footer, and the red badge on the icon indicates unread tickets
 - Left-click a row to open the ticket in the browser and mark it as read; right-click to cycle pin → hidden → normal
 - Hidden tickets are shown in gray and excluded from notifications and the pending count ("Exclude hidden tickets" in the menu removes them from the list entirely)
 - Right-click the tray icon to access the menu for instant refresh, filters, and sort orders
@@ -117,7 +115,7 @@ Switching the setting does not flood you with notifications.
 
 - Only Redmine global saved queries are supported (queries under a specific project cannot be referenced via the API)
 - Group-assignee detection covers all groups only with admin privileges; otherwise it only checks your own groups
-- Hover display does not work while the tray icon is in the hidden-icons overflow area (left-click still opens the list)
+- An icon in the hidden-icons overflow area cannot be opened by hover (left-click still works)
 - The configuration file is not hot-reloaded; a restart is required to apply changes
 - If the configuration is incomplete, the app stays resident in a guidance mode without notifications (follow the tray icon and its tooltip, fix the settings, and restart)
 
