@@ -11,8 +11,9 @@
  * 自分が起票したチケットの流入（author.id で判定）は通知しない。
  * 自分の操作による更新と、前回ポーリング以降の自分の更新が原因の流入（最終 journal の user.id で判定）も通知しない。
  * 検知済み状態は「チケット id → updated_on ＋所属クエリ集合」を state.json（v2）に永続化して重複通知を防ぐ。
- * トレイアイコンのホバー（既定、トグルで無効化可）または左クリックで未処理チケットの一覧を表示し、
- * 行の右クリックで 通常 → ピン留め → 非表示 → 通常 の順に状態を切り替えられる。（ピンの件数に上限はない）
+ * トレイアイコンのホバーまたは左クリックで、フォーカスを奪わない非アクティブの自前ポップアップに
+ * 未処理チケットの一覧を表示し、行の右クリックで 通常 → ピン留め → 非表示 → 通常 の順に
+ * 状態を切り替えられる。（ピンの件数に上限はない）
  * ピンは pins.json に永続化し、保存クエリの集合から外れたチケットも一覧に表示し続ける。
  * 非表示チケットは hidden.json に永続化し、グレー表示・通知と件数から除外・
  * 「非表示チケットを除外」トグル ON で一覧からも出さない。
@@ -134,7 +135,6 @@ static constexpr UINT IDM_EXCLUDE_NO_VERSION  = 40014; // バージョン未指�
 static constexpr UINT IDM_MUTE_OWN_CHANGES    = 40015; // 自分の操作による起票・更新を通知抑止するトグル（一覧・tooltip は変更しない）
 static constexpr UINT IDM_OPEN_GUIDE          = 40016; // セットアップガイド（GitHub Pages）を開く
 static constexpr UINT IDM_EXCLUDE_HIDDEN      = 40017; // 非表示チケットを一覧から除外するトグル（OFF はグレーで表示）
-static constexpr UINT IDM_HOVER_POPUP         = 40018; // ホバーでの一覧表示トグル
 
 static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/redntfy";
 // セットアップガイド（GitHub Pages。docs/ 配下の内容が公開される）
@@ -142,25 +142,16 @@ static constexpr wchar_t GUIDE_URL[]                  = L"https://aviscaerulea.g
 static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/redntfy/releases";
 static constexpr wchar_t GITHUB_API_RELEASES_LATEST[] = L"https://api.github.com/repos/aviscaerulea/redntfy/releases/latest";
 
-// 左クリック一覧のチケット項目（IDM_ISSUE_BASE + index で最大 50 件）
-static constexpr UINT IDM_ISSUE_BASE = 41000;
-static constexpr UINT IDM_ISSUE_MAX  = 41050;
+// 一覧ポップアップの最大行数（ピン・非表示込みのハードキャップ。旧メニュー実装の 50 を踏襲）
+static constexpr UINT LIST_ROW_MAX = 50;
 
-// ホバー表示のワンショット遅延タイマーと、ホバー表示中の自動クローズ用ポーリングタイマー
-static constexpr UINT  IDT_HOVER_TRIGGER       = 1;
-static constexpr UINT  IDT_HOVER_AUTOCLOSE     = 2;
-static constexpr DWORD HOVER_AUTOCLOSE_POLL_MS = 200;
-// カーソルがアイコン・メニューの外に連続でこの tick 数（約 400ms）観測されたら閉じる
-static constexpr int   HOVER_AUTOCLOSE_TICKS   = 2;
-
-// 明示クローズ後にカーソルのアイコン離脱を監視する再アーム用ポーリングタイマー
-// （周期は HOVER_AUTOCLOSE_POLL_MS を共用する）
-static constexpr UINT  IDT_HOVER_REARM        = 3;
-
-// 一覧を明示操作で閉じた直後、左クリックを無視する猶予（ms）
-// アイコンクリックで閉じるとメニュー解除（押下）→ WM_LBUTTONUP の順で届くため、放置すると
-// 閉じたはずの一覧が即座に再表示される。クリック 1 回分の押下〜開放が収まる長さとする
-static constexpr ULONGLONG LIST_CLICK_SUPPRESS_MS = 500;
+// ホバー表示のワンショット遅延タイマーと、一覧ポップアップの監視用ポーリングタイマー
+// IDT_LIST_WATCH は表示中の離脱検出と、明示クローズ後のホバー再アーム保留の解除を兼ねる
+static constexpr UINT  IDT_HOVER_TRIGGER  = 1;
+static constexpr UINT  IDT_LIST_WATCH     = 2;
+static constexpr DWORD LIST_WATCH_POLL_MS = 200;
+// カーソルがアイコン・ポップアップの外に連続でこの tick 数（約 400ms）観測されたら閉じる
+static constexpr int   LIST_LEAVE_TICKS   = 2;
 
 // 即時ポーリングの抑制間隔（前回ポーリングからこの時間内は即時ポーリングをスキップ）
 static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
@@ -240,32 +231,20 @@ static std::atomic<bool> g_muteOwnChanges{true};
 // トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングループと通知スレッドが参照）
 static HWND g_hWnd = nullptr;
 
-// トレイのポップアップメニュー表示中フラグ（ツールチップ更新抑制用）
+// トレイのポップアップ表示中フラグ（一覧ポップアップ可視、または右クリックメニュー表示中。
+// ツールチップ・バッジ更新の抑制用）
 static std::atomic<bool> g_popupShowing{false};
 
-// ホバーで一覧を表示するかのトグル（レジストリ HoverPopup で永続化、デフォルト ON）
-static std::atomic<bool> g_hoverPopupEnabled{true};
 // ホバー遅延（ms、0〜5000 にクランプ済み）。起動時に loadConfig の値を反映し以降不変
 static std::atomic<DWORD> g_hoverDelayMs{static_cast<DWORD>(DEFAULT_HOVER_DELAY_MS)};
 
-// ホバー起点表示の自動クローズ制御。トレイ WndProc スレッドのみが読み書きするため atomic 不要
-// g_hoverMode：ホバー起点で一覧を表示中か（クリック起点と自動クローズ適用を区別する）
-// g_hoverAutoclosed：自動クローズで EndMenu を呼んだか（true のときのみフォアグラウンド復元）
-// g_hoverPrevForeground：表示直前のフォアグラウンドウィンドウ（自動クローズ時の復元先）
-// g_hoverOutsideTicks：カーソルがアイコン・メニュー矩形の外に居た連続 tick 数
-static bool g_hoverMode           = false;
-static bool g_hoverAutoclosed     = false;
-static HWND g_hoverPrevForeground = nullptr;
-static int  g_hoverOutsideTicks   = 0;
-
-// 明示操作で一覧を閉じた後、カーソルがアイコンから一度離れるまでホバー再表示を抑止するフラグ
-// （閉じてもカーソルが乗ったままだと、わずかな動きで即座に開き直るため。
-// IDT_HOVER_REARM の監視でアイコン離脱を検出したら解除する）
-static bool g_hoverSuppressed = false;
-
-// 一覧を明示操作で閉じた時刻（起点を問わない。GetTickCount64 の値。
-// LIST_CLICK_SUPPRESS_MS の抑止判定に使う）
-static ULONGLONG g_listCloseTick = 0;
+// 一覧ポップアップの開閉制御。トレイ WndProc スレッドのみが読み書きするため atomic 不要
+// g_listOutsideTicks：カーソルがアイコン・ポップアップ矩形の外に居た連続 tick 数
+// g_hoverRearmPending：明示クローズ後、カーソルがアイコンから離れるまでホバー再表示を
+//   保留するフラグ。（閉じてもカーソルが乗ったままだと、わずかな動きで即座に開き直るため。
+//   IDT_LIST_WATCH の監視でアイコン離脱を検出したら解除する）
+static int  g_listOutsideTicks  = 0;
+static bool g_hoverRearmPending = false;
 
 // スリープ復帰・ロック解除時の即時ポーリングフラグ
 static std::atomic<bool> g_forcePoll{false};
@@ -500,7 +479,7 @@ static HANDLE g_soundThread = nullptr;
 // exe ディレクトリパス（wmain 起動時に確定し、WndProc スレッドからも参照する）
 static std::wstring g_exeDir;
 
-// 左クリックポップアップのチケット項目描画用フォント（initMenuFonts で初期化）
+// 一覧ポップアップのチケット行描画用フォント（initMenuFonts で初期化）
 static HFONT g_hMenuFont     = nullptr;
 static HFONT g_hMenuFontBold = nullptr;  // 未読行用の太字（フェイス・サイズは g_hMenuFont と同一）
 static HFONT g_hMenuFontSemiBold = nullptr;  // ラベル内の部分強調用（同上）
@@ -2109,7 +2088,6 @@ static constexpr const wchar_t* REG_SORT_BY_DUE       = L"SortByDue";
 static constexpr const wchar_t* REG_EXCLUDE_NO_VERSION = L"ExcludeNoVersion";
 static constexpr const wchar_t* REG_MUTE_OWN_CHANGES  = L"MuteOwnChanges";
 static constexpr const wchar_t* REG_EXCLUDE_HIDDEN    = L"ExcludeHidden";
-static constexpr const wchar_t* REG_HOVER_POPUP       = L"HoverPopup";
 static constexpr const wchar_t* REG_NOTIFIED_VERSION  = L"NotifiedUpdateVersion";
 
 // Windows スタートアップ登録用レジストリ（HKCU Run キー）
@@ -2937,10 +2915,9 @@ static void addTrayIcon(HWND hWnd) {
     auto nid = makeTrayNid(hWnd);
     nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
-    // ホバー表示が有効なときは初期 tooltip も出さない。（updateTrayTooltip の抑止と同じ理由。
-    // 初回ポーリング完了までの間にホバーすると tooltip と一覧が重なるため）
-    // 無効モードはホバーが無反応のため表示し、直後の案内 tooltip 更新に引き継ぐ
-    if (isDisabled() || !g_hoverPopupEnabled.load())
+    // 件数ツールチップは全廃のため、通常時は初期 tooltip も出さない。（一覧はホバーで出る）
+    // 無効モードのみ表示し、直後の案内 tooltip 更新に引き継ぐ
+    if (isDisabled())
         wcscpy_s(nid.szTip, L"読み込み中...");
     UINT iconId = isDisabled() ? IDI_APP_ICON_DISABLE : IDI_APP_ICON;
     nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(iconId));
@@ -3225,17 +3202,13 @@ static std::vector<ListRow> buildListRows(int& visible) {
     return rows;
 }
 
-// トレイアイコンのツールチップを更新する
-// 「未処理 N 件」に未読があれば「（未読 M 件）」を続けて表示し、赤バッジは未読ありを表す。
-// 未読件数は一覧に出る行から数えるため、画面上の太字行数と一致する。
-// 無効モード中は件数の代わりに原因別の設定確認案内を表示する。
-// ポップアップメニュー表示中は更新しない
-//
-// ホバー表示が有効なときは件数ツールチップを空にする。同じホバー操作でツールチップと
-// 一覧が重なって表示され、機能が衝突するためだ。一覧は件数を含む上位互換の情報を
-// 示すため、表示を止めても失われる情報はない。
-// 無効モードは例外としてホバー表示自体が無反応のため、設定確認案内のツールチップを維持する。
-// バッジ更新はホバー表示の有無に関わらず継続する。（件数の有無を示す唯一の常時手掛かりのため）
+// トレイアイコンの状態表示（ツールチップ・バッジ）を更新する
+// 件数ツールチップは全廃済みで、通常時は空 tooltip の維持と赤バッジ（未読あり）の更新のみを行う。
+// （件数は一覧ポップアップのフッタが、未読の有無はバッジが担う。ツールチップを出すと
+// 同じホバー操作で一覧と重なって衝突する）
+// 未読件数は一覧に出る行から数えるため、バッジの有無と画面上の太字行の有無が一致する。
+// 無効モード中は原因別の設定確認案内をツールチップに表示する。（一覧が開けないため例外）
+// ポップアップ表示中は更新しない
 static void updateTrayTooltip(HWND hWnd) {
     if (g_popupShowing.load()) return;
     if (g_tooltipUpdating) return;
@@ -3264,31 +3237,27 @@ static void updateTrayTooltip(HWND hWnd) {
     for (const auto& r : rows) {
         if (r.unread) ++unread;
     }
-    std::wstring tip = L"未処理 " + std::to_wstring(visible) + L" 件";
-    if (unread > 0) tip += L"（未読 " + std::to_wstring(unread) + L" 件）";
 
+    // szTip は makeTrayNid のゼロ初期化で空文字列のまま送る。（tooltip なしを維持する）
     auto nid = makeTrayNid(hWnd);
     nid.uFlags = NIF_TIP;
-    // szTip は makeTrayNid のゼロ初期化で空文字列。ホバー表示が無効なときだけ件数を書き込む
-    if (!g_hoverPopupEnabled.load())
-        wcscpy_s(nid.szTip, tip.c_str());
     Shell_NotifyIconW(NIM_MODIFY, &nid);
     updateTrayIcon(hWnd, unread > 0);
     g_tooltipUpdating = false;
 }
 
-// トレイアイコンを除去する（ホバー関連タイマーも道連れに破棄する）
+// トレイアイコンを除去する（一覧ポップアップ関連タイマーも道連れに破棄する）
 static void removeTrayIcon(HWND hWnd) {
     KillTimer(hWnd, IDT_HOVER_TRIGGER);
-    KillTimer(hWnd, IDT_HOVER_AUTOCLOSE);
-    KillTimer(hWnd, IDT_HOVER_REARM);
+    KillTimer(hWnd, IDT_LIST_WATCH);
     auto nid = makeTrayNid(hWnd);
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
 
-// メニュー描画用フォントの初期化
-// OS のメニューフォント設定を取得して左クリックポップアップのチケット項目描画用フォントを作成する。
+// 一覧・メニュー描画用フォントの初期化
+// OS のメニューフォント設定を取得して、一覧ポップアップの行描画用フォントを作成する。
+// （右クリックメニューのバージョン更新通知行のオーナードローも g_hMenuFont を共用する）
 static void initMenuFonts() {
     NONCLIENTMETRICSW ncm = { sizeof(ncm) };
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
@@ -3339,11 +3308,11 @@ struct ColorRange {
     bool     keepColor = false;  // true なら color を無視して範囲外と同じ色で描く
 };
 
-// 左クリックポップアップのチケット項目（IDM_ISSUE_BASE + index に対応、WndProc スレッドのみ使用）
+// 一覧ポップアップのチケット項目（行レイアウトの index に対応、トレイ WndProc スレッドのみ使用）
 struct IssueItem {
     int          id     = 0;
     std::wstring url;            // {redmine.url}/issues/{id}
-    std::wstring label;          // 描画テキスト（WM_DRAWITEM / WM_MEASUREITEM で使用）
+    std::wstring label;          // 描画テキスト（drawIssueRow / measureIssueRow で使用）
     // label 内で文字色とウェイトを変える範囲（空 = 分割描画しない）。buildIssueLabel が組み立てる
     std::vector<ColorRange> ranges;
     bool         unread     = false; // 未読（まだ一覧から開いていない）＝太字で描く
@@ -3363,7 +3332,7 @@ static constexpr wchar_t PIN_MARK[] = L"📌 ";
 
 // ピンマーカーのカラー絵文字描画資源（初回描画時に遅延生成し、以降は再利用する）
 // 明示解放はしない。プロセス終了まで保持する。（g_hMenuFont と同じ扱い）
-// アクセスは WndProc スレッド（WM_DRAWITEM）のみでロック不要。
+// アクセスはトレイ WndProc スレッド（paintListWindow → drawIssueRow）のみでロック不要。
 static ID2D1Factory1*        g_pD2DFactory  = nullptr;  // デバイス非依存（作り直し不要）
 static IDWriteTextFormat*    g_pPinFormat   = nullptr;  // 同上（メニューフォント由来）
 static ID2D1DCRenderTarget*  g_pPinRT       = nullptr;  // BindDC / BeginDraw / EndDraw 用
@@ -3386,7 +3355,7 @@ static void releasePinD2DTarget() {
 }
 
 // ピンマーカー描画資源の遅延初期化
-// hdc は描画先のメニュー DC で、DirectWrite のフォントサイズをメニューフォントの
+// hdc は描画先の DC で、DirectWrite のフォントサイズをメニューフォントの
 // 実効 em 高（px）へ合わせる計測にのみ使う。戻り値 false は GDI フォールバックを表す。
 static bool ensurePinD2D(HDC hdc) {
     if (g_pinD2DFailed) return false;
@@ -3536,7 +3505,7 @@ static constexpr wchar_t BUG_MARK[] = L"💥 ";
 //   期限切れの期日とバグマーカーは ALERT_TEXT_COLOR で描くため、位置を ranges に記録する。
 //   （ranges はオフセット昇順で並べる契約。展開順の追記がそのまま昇順になる）
 // 引数に ListRow を丸ごと取るのは、同じ型の要素が増えて位置引数では取り違えを防げないため。
-// ピン記号はラベルに含めない。WM_DRAWITEM が IssueItem::pinned を見てマーカー列に描く。
+// ピン記号はラベルに含めない。drawIssueRow が IssueItem::pinned を見てマーカー列に描く。
 static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
                                   long long todayDays) {
     IssueLabel r;
@@ -3596,8 +3565,9 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
 // トレイポップアップの表示位置とアライメントを算出する
 //
 // タスクバーが配置された辺（下・上・左・右）にポップアップを密着させて表示する。
-// タスクバーに沿った軸（水平タスクバーなら X、垂直なら Y）はカーソル位置を起点とし、
-// 画面端超過は TrackPopupMenu の自動反転に任せる。
+// タスクバーに沿った軸（水平タスクバーなら X、垂直なら Y）はカーソル位置を起点とする。
+// 画面端超過の扱いは呼び出し側の責務。（右クリックメニューは TrackPopupMenu の自動反転、
+// 一覧ポップアップは showListPopup がモニタ作業領域へクランプする）
 // SHAppBarMessage 失敗時や uEdge が想定外なら現状挙動（カーソル位置＋左上アライメント）
 // に戻し、必ずポップアップが出るようにする。
 struct TrayPopupPos {
@@ -3637,114 +3607,10 @@ static bool getTrayIconRect(HWND hWnd, RECT& rcOut) {
     return SUCCEEDED(Shell_NotifyIconGetRect(&nii, &rcOut));
 }
 
-// 自スレッド所有の可視ポップアップメニューウィンドウ（クラス #32768）にカーソルが乗っているか
-// EnumThreadWindows 方式で列挙する。
-// 表示直後や破棄済みの過渡状態は false 側に落ちるが、自動クローズは連続 tick 判定のため単発の false は無害。
-static bool isCursorOverAnyMenuWindow(POINT pt) {
-    struct Ctx { POINT pt; bool over; } ctx = { pt, false };
-    EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM lp) -> BOOL {
-        auto* c = reinterpret_cast<Ctx*>(lp);
-        wchar_t cls[16] = {};
-        if (!GetClassNameW(hwnd, cls, ARRAYSIZE(cls))) return TRUE;
-        if (wcscmp(cls, L"#32768") != 0)               return TRUE;
-        if (!IsWindowVisible(hwnd))                    return TRUE;
-        RECT rc;
-        if (!GetWindowRect(hwnd, &rc))                 return TRUE;
-        if (PtInRect(&rc, c->pt)) {
-            c->over = true;
-            return FALSE;
-        }
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&ctx));
-    return ctx.over;
-}
-
-// 一覧を明示操作で閉じた直後の共通後処理（ホバー起点・クリック起点とも）
-// 閉じた時刻を記録して、直後に届く WM_LBUTTONUP が「開く」操作に化けるのを防ぐ。
-// （アイコンクリックでの解除はメニュー解除（押下）→ WM_LBUTTONUP の順で届くため）
-// カーソルがまだアイコン上にあるなら、一度離れるまでホバー再表示を抑止する。
-// （乗ったままのわずかな動きで即座に開き直るため。既にアイコン外で閉じた（行クリック等）
-// なら「一度離れる」は満たされており抑止しない）
-// 離脱の検出は IDT_HOVER_REARM のポーリングが担う。SetTimer 失敗時は抑止しない。
-// （解除経路がこのタイマーしかなく、失敗すると抑止が永久に残るため）
-static void noteListClosedByUser(HWND hWnd) {
-    g_listCloseTick = GetTickCount64();
-    POINT pt;
-    GetCursorPos(&pt);
-    RECT icon;
-    if (getTrayIconRect(hWnd, icon) && PtInRect(&icon, pt))
-        g_hoverSuppressed =
-            SetTimer(hWnd, IDT_HOVER_REARM, HOVER_AUTOCLOSE_POLL_MS, nullptr) != 0;
-}
-
-// 左クリック時のチケット一覧ポップアップ表示
-//
-// 表示行の選定・並べ替え・絞り込みは buildListRows に委ねる。（tooltip の未読件数と同じ根拠）
-// 行の左クリックでチケットを開いてその 1 件だけ既読にする。（非表示のグレー行も同様に開ける）
-// 右クリックは状態の遷移（通常 → ピン留め → 非表示 → 通常）で、既読にはしない。
-// フッタの「未処理 N 件」はフィルタを通った件数で、フィルタで外れたピンと非表示チケットは数えない。
-static void showIssuePopup(HWND hWnd) {
-    const Config& cfg = g_currentConfig;
-    int visible = 0;
-    auto rows = buildListRows(visible);
-
-    // 「今日」（期日の赤判定用）と経過日数の基準日は 1 回だけ求めて全行に使う。
-    // 行ごとに求めると日付境界をまたいだ瞬間に同じ一覧内で判定が揺れる
-    const int todayYmd = todayJstYmd();
-    const long long todayDays = todayJstDaySerial();
-    auto makeItem = [&](const ListRow& row) {
-        IssueItem it;
-        it.id  = row.id;
-        it.url = issueUrl(cfg, row.id);
-        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), todayDays);
-        it.label  = std::move(lbl.text);
-        it.ranges = std::move(lbl.ranges);
-        it.unread = row.unread;
-        it.pinned = row.pinned;
-        it.hidden = row.hidden;
-        it.closed = row.closed;
-        return it;
-    };
-
-    g_issueItems.clear();
-    HMENU hMenu = CreatePopupMenu();
-    if (!hMenu) {
-        writeLog("showIssuePopup: CreatePopupMenu failed");
-        return;
-    }
-    if (rows.empty()) {
-        AppendMenuW(hMenu, MF_STRING, IDM_OPEN_QUERY, NO_ISSUES);
-    }
-    else {
-        UINT idx = 0;
-        for (const auto& row : rows) {
-            if (idx >= (IDM_ISSUE_MAX - IDM_ISSUE_BASE)) break;
-            // MFT_OWNERDRAW で WM_MEASUREITEM / WM_DRAWITEM に描画を委譲する。
-            // dwItemData にインデックスを渡し、描画時に g_issueItems から参照する。
-            MENUITEMINFOW mii = { sizeof(mii) };
-            mii.fMask      = MIIM_FTYPE | MIIM_ID | MIIM_DATA;
-            mii.fType      = MFT_OWNERDRAW;
-            mii.wID        = IDM_ISSUE_BASE + idx;
-            mii.dwItemData = static_cast<ULONG_PTR>(idx);
-            InsertMenuItemW(hMenu, idx, TRUE, &mii);
-            g_issueItems.push_back(makeItem(row));
-            ++idx;
-        }
-        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-        std::wstring footer = L"未処理 " + std::to_wstring(visible)
-            + L" 件（クリックでウェブ表示 ／ 右クリックでピン留め・非表示）";
-        AppendMenuW(hMenu, MF_STRING, IDM_OPEN_QUERY, footer.c_str());
-    }
-
-    POINT pt;
-    GetCursorPos(&pt);
-    auto pos = computeTrayPopupPos(pt);
-    forceForeground(hWnd);
-    // TPM_LEFTBUTTON のみ指定する（TPM_RIGHTBUTTON を加えると右クリックも WM_COMMAND
-    // を発火してしまい、状態遷移用の WM_MENURBUTTONUP が届かなくなる）
-    TrackPopupMenu(hMenu, TPM_LEFTBUTTON | pos.alignFlags, pos.x, pos.y, 0, hWnd, nullptr);
-    DestroyMenu(hMenu);
-}
+// 一覧ポップアップの表示・非表示・可視判定（実装は walkIssueLabel 等の描画基盤の後方にある）
+static void showListPopup(HWND trayWnd);
+static void hideListPopup(HWND trayWnd);
+static bool isListPopupVisible();
 
 // ==================== 更新チェック ====================
 
@@ -3921,6 +3787,9 @@ static BOOL drawVersionMenuItem(DRAWITEMSTRUCT* dis) {
 // メニュー項目はトグル状態（音声通知・スタートアップ等）を読み取り、
 // その場で構築する。（チェック状態は呼び出し時の最新値を反映）
 static void showTrayContextMenu(HWND hWnd) {
+    // 一覧ポップアップが出ていれば先に閉じる。（メニューと重なるのを防ぎ、メニュー終了時の
+    // g_popupShowing.store(false) が可視の一覧とフラグを食い違わせるのも防ぐ）
+    if (isListPopupVisible()) hideListPopup(hWnd);
     g_popupShowing.store(true);
     clearTrayTooltip(hWnd);
     POINT pt;
@@ -3963,10 +3832,6 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_STRING | (g_excludeHidden ? MF_CHECKED : MF_UNCHECKED),
         IDM_EXCLUDE_HIDDEN, L"非表示チケットを除外");
 
-    // ホバーでの一覧表示トグル（レジストリ永続化、デフォルト ON）
-    AppendMenuW(hMenu, MF_STRING | (g_hoverPopupEnabled ? MF_CHECKED : MF_UNCHECKED),
-        IDM_HOVER_POPUP, L"ホバーで一覧を表示");
-
     // 自分の操作による起票・更新の通知抑止（レジストリ永続化。既定 ON）
     AppendMenuW(hMenu, MF_STRING | (g_muteOwnChanges ? MF_CHECKED : MF_UNCHECKED),
         IDM_MUTE_OWN_CHANGES, L"自分の操作による更新を通知しない");
@@ -4004,29 +3869,14 @@ static void showTrayContextMenu(HWND hWnd) {
 }
 
 // トレイアイコンホバー時のチケット一覧表示
-//
 // 契約：IDT_HOVER_TRIGGER の発火（または hover_delay_ms = 0 の即時経路）からのみ呼ばれる。
-// ホバー無効・無効モード・既に表示中・tooltip 更新中・明示クローズ後の抑止中
-// （カーソルがアイコンを離れるまで）は無反応。
-// 発火時点でカーソルがアイコン矩形内に留まっているかを再確認してから表示する。
+// 無効モード・表示中・再アーム保留中（明示クローズ後、カーソルがアイコンを離れるまで）は
+// 無反応。発火時点でカーソルがアイコン矩形内に留まっているかを再確認してから表示する。
 // （遅延中の離脱で発火した空タイマー対策）
-//
-// 自動クローズ：表示中は IDT_HOVER_AUTOCLOSE を回し、カーソルがアイコン矩形・メニュー矩形の
-// いずれの内側にも無い状態が HOVER_AUTOCLOSE_TICKS 連続で観測されたら EndMenu で閉じる。
-// TrackPopupMenu のモーダルループ中も WM_TIMER は WndProc に配送されるため成立する。
-//
-// フォーカス復元：ホバー表示はキーボードフォーカスを奪うため、自動クローズで閉じた場合のみ
-// 表示直前のフォアグラウンドウィンドウへ復元する。項目クリックや Esc・外側クリックで
-// 閉じた場合はユーザの明示操作なので復元しない。
 static void handleTrayHover(HWND hWnd) {
-    if (!g_hoverPopupEnabled.load()) return;
-    if (isDisabled())                return;
-    if (g_popupShowing.load())       return;
-    // Shell_NotifyIconW の内部メッセージポンプ経由の発火（tooltip 更新の内側）では表示しない。
-    // ここでモーダルループへ入ると外側の updateTrayTooltip が中断したまま残り、
-    // 一覧を閉じた後の tooltip・バッジが更新されない。次の WM_MOUSEMOVE で張り直されるため見送りで足りる
-    if (g_tooltipUpdating)           return;
-    if (g_hoverSuppressed)           return;  // 明示クローズ後、アイコン離脱までは再表示しない
+    if (isDisabled())          return;
+    if (g_popupShowing.load()) return;
+    if (g_hoverRearmPending)   return;
 
     RECT icon;
     if (!getTrayIconRect(hWnd, icon)) return;
@@ -4034,60 +3884,21 @@ static void handleTrayHover(HWND hWnd) {
     GetCursorPos(&pt);
     if (!PtInRect(&icon, pt)) return;
 
-    // forceForeground で自プロセスへ移る前のフォアグラウンドを記憶する
-    HWND prev = GetForegroundWindow();
-    if (prev == hWnd) prev = nullptr;
-
-    g_hoverPrevForeground = prev;
-    g_hoverAutoclosed     = false;
-    g_hoverOutsideTicks   = 0;
-    g_hoverMode           = true;
-
-    g_popupShowing.store(true);
-    clearTrayTooltip(hWnd);
-
-    // 自動クローズ用ポーリングはモーダルループ突入前に開始する
-    SetTimer(hWnd, IDT_HOVER_AUTOCLOSE, HOVER_AUTOCLOSE_POLL_MS, nullptr);
-    showIssuePopup(hWnd);
-    KillTimer(hWnd, IDT_HOVER_AUTOCLOSE);
-
-    bool autoclosed = g_hoverAutoclosed;
-    HWND restoreTo  = g_hoverPrevForeground;
-    g_hoverMode           = false;
-    g_hoverAutoclosed     = false;
-    g_hoverPrevForeground = nullptr;
-    g_hoverOutsideTicks   = 0;
-
-    g_popupShowing.store(false);
-
-    // 自動クローズはカーソルが場外にあり誤爆しないため後処理は不要
-    if (!autoclosed) noteListClosedByUser(hWnd);
-
-    // 破棄済みウィンドウへの復元を避ける防御チェック
-    if (autoclosed && restoreTo && IsWindow(restoreTo))
-        SetForegroundWindow(restoreTo);
-
-    updateTrayTooltip(hWnd);
+    showListPopup(hWnd);
 }
 
 // トレイアイコン左クリック時の処理
-// チケット一覧ポップアップを表示する。無効モード中は表示しない。
-// ホバー表示とは独立に動作し、表示中の再入と、一覧を明示操作で閉じた直後
-// LIST_CLICK_SUPPRESS_MS 以内のクリックは無視する。
-// （後者により、表示中のクリックは「閉じる」操作として確定する。閉じる押下 →
-// WM_LBUTTONUP の順で届くため、猶予がないと閉じた直後に開き直ってしまう）
+// 一覧ポップアップのトグル：表示中なら閉じ、非表示なら遅延なしで即表示する。
+// ポップアップは非アクティブでマウスキャプチャも取らないため、アイコンのクリックは
+// 表示中でも通常どおりここへ届く。（モーダルメニュー時代の解除・猶予の補正は不要）
+// 無効モード中は表示しない。（ポーリング停止中で出すものがない）
 static void handleTrayLeftClick(HWND hWnd) {
-    if (g_popupShowing.load()) return;  // 表示中なら二重起動しない
-    // 一覧をアイコンクリックで閉じた直後の WM_LBUTTONUP は「閉じる操作」の後半のため
-    // 無視する。（放置すると閉じた一覧が即座に再表示され、消えて出直す挙動に見える）
-    if (GetTickCount64() - g_listCloseTick < LIST_CLICK_SUPPRESS_MS) return;
-    if (isDisabled()) return;  // 無効モード中は一覧を出さない（ポーリング停止中で出すものがない）
-    g_popupShowing.store(true);
-    clearTrayTooltip(hWnd);
-    showIssuePopup(hWnd);
-    g_popupShowing.store(false);
-    noteListClosedByUser(hWnd);
-    updateTrayTooltip(hWnd);
+    if (g_popupShowing.load()) {
+        hideListPopup(hWnd);
+        return;
+    }
+    if (isDisabled()) return;
+    showListPopup(hWnd);
 }
 
 // 当日ログファイルのパスを取得し、存在しなければ logs フォルダのパスを返す
@@ -4107,9 +3918,9 @@ static std::wstring getCurrentLogTarget() {
 }
 
 // 開いたチケット 1 件を既読にする
-// TrackPopupMenu の WM_COMMAND がポップアップ終了前に届く環境がある。
-// その場合は g_popupShowing 中の直接呼びが捨てられるため、PostMessage でキューに積む。
-// 積んでおけば、WM_COMMAND がどちらの順序で届いてもポップアップ終了後に必ず反映される。
+// 行クリック時点では一覧ポップアップがまだ可視で、g_popupShowing 中の直接呼びは
+// updateTrayTooltip に捨てられる。PostMessage でキューに積んでおけば、
+// この後の hideListPopup（フラグ解除）を経てから必ず反映される。
 static void markIssueRead(int issueId) {
     bool wasUnread;
     {
@@ -4120,7 +3931,7 @@ static void markIssueRead(int issueId) {
 }
 
 // WM_COMMAND ディスパッチ
-// メニュー選択（IDM_*）と一覧クリック（IDM_ISSUE_BASE 以降。開いた 1 件を既読にする）を処理する。
+// 右クリックメニューの選択（IDM_*）を処理する。（一覧の行操作は listWndProc が直接扱う）
 static void handleTrayCommand(UINT id) {
     if (id == IDM_UPDATE_NOW) {
         if (isDisabled()) return;  // メニュー非活性と揃えた二重ガード
@@ -4168,14 +3979,6 @@ static void handleTrayCommand(UINT id) {
         // 件数・未読・通知はトグルと無関係に常に非表示チケットを除外しているため変化しない。
         // （非表示行は list_limit の予算外で、切り替えても通常行の窓は動かない）
         // 一覧は次に開いた時点で組み直されるが、経路は他のフィルタ系トグルと揃えておく
-        if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
-        return;
-    }
-    if (id == IDM_HOVER_POPUP) {
-        // 保留中ホバータイマーの取消は不要（コンテキストメニューを開いた時点で取消済み）
-        g_hoverPopupEnabled.store(!g_hoverPopupEnabled.load());
-        writeRegDword(REG_HOVER_POPUP, g_hoverPopupEnabled.load() ? 1u : 0u);
-        // ON で件数ツールチップを消し、OFF で復活させる
         if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
         return;
     }
@@ -4230,17 +4033,6 @@ static void handleTrayCommand(UINT id) {
             ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         return;
     }
-    if (id >= IDM_ISSUE_BASE && id < IDM_ISSUE_MAX) {
-        UINT idx = id - IDM_ISSUE_BASE;
-        if (idx < g_issueItems.size() && isHttpUrl(g_issueItems[idx].url)) {
-            ShellExecuteW(nullptr, L"open", g_issueItems[idx].url.c_str(),
-                          nullptr, nullptr, SW_SHOWNORMAL);
-            // URL の検証を通った行だけ既読にする。（不正な URL の行は開かないため未読のまま残す）
-            // ShellExecuteW の戻り値は見ない。関連付け不備でブラウザが起動しない場合まで
-            // 未読を守るより、経路を単純に保つ方を採る。
-            markIssueRead(g_issueItems[idx].id);
-        }
-    }
 }
 
 // ラベルを色範囲の境界でセグメントに分けて走査し、総幅を返す
@@ -4248,9 +4040,9 @@ static void handleTrayCommand(UINT id) {
 // 範囲ごとにフォントを切り替えるため、幅は各セグメントの合算になる。計測と描画で同じ走査を
 // 通すことが要点で、片方だけ「ラベル全体を 1 回計測」に戻すと行幅・取消線と実描画幅が食い違う。
 // セグメント境界は常に空白の位置に来るため、分割による字形整形の差は視認されない。
-// textRect が nullptr なら描画せず幅だけを返す。（measureIssueMenuItem 用）
-// uniformColor=true は選択行用で、範囲の色を無視して textColor 一色で描く。
-// （ハイライト背景上の赤は読みにくい。ウェイトは幅が変わるため選択行でも維持する）
+// textRect が nullptr なら描画せず幅だけを返す。（measureIssueRow 用）
+// uniformColor=true はホット行用で、範囲の色を無視して textColor 一色で描く。
+// （ハイライト背景上の赤は読みにくい。ウェイトは幅が変わるためホット行でも維持する）
 static int walkIssueLabel(HDC hdc, const IssueItem& item, const RECT* textRect,
                           COLORREF textColor, HFONT baseFont, HFONT emphFont,
                           bool uniformColor) {
@@ -4293,16 +4085,11 @@ static void issueLabelFonts(bool unread, HFONT& baseFont, HFONT& emphFont) {
     emphFont = unread ? g_hMenuFontBold : g_hMenuFontSemiBold;
 }
 
-// 左クリックポップアップの owner-draw 項目サイズ計算
-// 戻り値：TRUE で処理済み、FALSE で未処理（DefWindowProcW へ）
-static BOOL measureIssueMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
-    if (mis->CtlType != ODT_MENU) return FALSE;
-    UINT eidx = static_cast<UINT>(mis->itemData);
-    if (eidx >= g_issueItems.size()) return FALSE;
-    const auto& item = g_issueItems[eidx];
-    HDC   hdc = GetDC(hWnd);
+// 一覧行のサイズ計算
+// ラベル幅は描画と同じ走査で求める。（別経路で測ると行幅・取消線が実描画幅と食い違う）
+// 幅にはピンマーカー列（全行で同幅）と左 4px・右 16px のパディングを含める。
+static SIZE measureIssueRow(HDC hdc, const IssueItem& item) {
     HFONT old = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
-    // ラベル幅は描画と同じ走査で求める（別経路で測ると行幅・取消線が実描画幅と食い違う）
     HFONT baseFont = nullptr, emphFont = nullptr;
     issueLabelFonts(item.unread, baseFont, emphFont);
     SIZE sz = {};
@@ -4321,38 +4108,31 @@ static BOOL measureIssueMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
     SIZE markSz = {};
     GetTextExtentPoint32W(hdc, PIN_MARK, static_cast<int>(wcslen(PIN_MARK)), &markSz);
     SelectObject(hdc, old);
-    ReleaseDC(hWnd, hdc);
     // パディングは左 4 px + 右 16 px。（左はピンマーカー列が続くため控えめにする）
-    mis->itemWidth  = static_cast<UINT>(sz.cx + markSz.cx) + 20;
-    mis->itemHeight = static_cast<UINT>(sz.cy) + 6;
-    return TRUE;
+    sz.cx += markSz.cx + 20;
+    sz.cy += 6;
+    return sz;
 }
 
-// 左クリックポップアップの owner-draw 項目描画
-// ODS_SELECTED に応じた背景色・テキスト色を切り替え、closed フラグが立つ項目には
-// DrawTextW 後に 2 px の取消線を手動で重ね描画する。
+// 一覧行の描画
+// hot（カーソルが乗っている行）に応じた背景色・テキスト色を切り替え、closed フラグが
+// 立つ項目には DrawTextW 後に 2 px の取消線を手動で重ね描画する。
 // IssueLabel::ranges に色付け範囲がある行は、範囲ごとに文字色を変えて分割描画する。
 // hidden フラグが立つ項目は非活性の慣例に合わせて全体を COLOR_GRAYTEXT 一色で描く。
-// （期日超過などの範囲色より優先する）選択時はハイライト背景に GRAYTEXT が沈んで
+// （期日超過などの範囲色より優先する）ホット時はハイライト背景に GRAYTEXT が沈んで
 // 読めないため、GRAYTEXT と HIGHLIGHTTEXT の中間色へ明度を上げる。（非活性感は保つ）
-static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
-    if (dis->CtlType != ODT_MENU) return FALSE;
-    UINT eidx = static_cast<UINT>(dis->itemData);
-    if (eidx >= g_issueItems.size()) return FALSE;
-    const auto& item     = g_issueItems[eidx];
-    bool        selected = (dis->itemState & ODS_SELECTED) != 0;
-
-    FillRect(dis->hDC, &dis->rcItem,
+static void drawIssueRow(HDC hdc, const RECT& rcItem, const IssueItem& item, bool hot) {
+    FillRect(hdc, &rcItem,
         reinterpret_cast<HBRUSH>(
-            static_cast<INT_PTR>(selected ? COLOR_HIGHLIGHT + 1 : COLOR_MENU + 1)));
+            static_cast<INT_PTR>(hot ? COLOR_HIGHLIGHT + 1 : COLOR_MENU + 1)));
 
-    RECT textRect  = dis->rcItem;
-    textRect.left += 4;  // 左パディング（measureIssueMenuItem の確保幅と揃える）
-    SetBkMode(dis->hDC, TRANSPARENT);
+    RECT textRect  = rcItem;
+    textRect.left += 4;  // 左パディング（measureIssueRow の確保幅と揃える）
+    SetBkMode(hdc, TRANSPARENT);
     COLORREF textColor;
     if (item.hidden) {
         textColor = GetSysColor(COLOR_GRAYTEXT);
-        if (selected) {
+        if (hot) {
             // ハイライト背景上でも読めるよう HIGHLIGHTTEXT と 1:1 で混色する。
             // 固定色でなくシステム色から作ることでテーマ（ダーク・ハイコントラスト）に追随する
             COLORREF hi = GetSysColor(COLOR_HIGHLIGHTTEXT);
@@ -4362,33 +4142,33 @@ static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
         }
     }
     else {
-        textColor = GetSysColor(selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT);
+        textColor = GetSysColor(hot ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT);
     }
-    SetTextColor(dis->hDC, textColor);
-    HFONT oldFont = static_cast<HFONT>(SelectObject(dis->hDC, g_hMenuFont));
-    // ピンマーカー列（measureIssueMenuItem と同じ幅を全行に確保し、ピン留め行のみ 📌 を描く）
+    SetTextColor(hdc, textColor);
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
+    // ピンマーカー列（measureIssueRow と同じ幅を全行に確保し、ピン留め行のみ 📌 を描く）
     SIZE markSz = {};
-    GetTextExtentPoint32W(dis->hDC, PIN_MARK, static_cast<int>(wcslen(PIN_MARK)), &markSz);
+    GetTextExtentPoint32W(hdc, PIN_MARK, static_cast<int>(wcslen(PIN_MARK)), &markSz);
     if (item.pinned) {
         // マーカー列だけ Direct2D で描いてカラー絵文字にする。列幅は GDI 計測値のまま使い、
-        // 行幅・インデント・取消線の座標計算（measureIssueMenuItem と共有）を変えない。
+        // 行幅・インデント・取消線の座標計算（measureIssueRow と共有）を変えない。
         RECT markRect  = textRect;
         markRect.right = markRect.left + markSz.cx;
-        COLORREF bgColor = GetSysColor(selected ? COLOR_HIGHLIGHT : COLOR_MENU);
-        if (!drawPinMarkColor(dis->hDC, markRect, bgColor, textColor)) {
+        COLORREF bgColor = GetSysColor(hot ? COLOR_HIGHLIGHT : COLOR_MENU);
+        if (!drawPinMarkColor(hdc, markRect, bgColor, textColor)) {
             // D2D が使えない環境では従来どおり GDI で単色の 📌 を描く
-            DrawTextW(dis->hDC, PIN_MARK, -1, &textRect,
+            DrawTextW(hdc, PIN_MARK, -1, &textRect,
                 DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
         }
     }
     textRect.left += markSz.cx;
     // ラベルは色範囲ごとにフォントと色を切り替えて描く。（ピンマーカー列の幅は通常フォント基準）
-    // 走査は measureIssueMenuItem と共有するため、描画幅と行幅・取消線が必ず一致する
+    // 走査は measureIssueRow と共有するため、描画幅と行幅・取消線が必ず一致する
     HFONT baseFont = nullptr, emphFont = nullptr;
     issueLabelFonts(item.unread, baseFont, emphFont);
-    int labelWidth = walkIssueLabel(dis->hDC, item, &textRect, textColor,
-                                   baseFont, emphFont, selected || item.hidden);
-    SetTextColor(dis->hDC, textColor);  // 打ち消し線が textColor を使うため戻す
+    int labelWidth = walkIssueLabel(hdc, item, &textRect, textColor,
+                                   baseFont, emphFont, hot || item.hidden);
+    SetTextColor(hdc, textColor);  // 打ち消し線が textColor を使うため戻す
     if (item.closed) {
         constexpr int STRIKE_THICKNESS = 2;
         // 中央から 1 px だけ下寄せにして視認性を上げる
@@ -4404,26 +4184,399 @@ static BOOL drawIssueMenuItem(DRAWITEMSTRUCT* dis) {
             lineY - STRIKE_THICKNESS / 2 + STRIKE_THICKNESS
         };
         HBRUSH hLineBrush = CreateSolidBrush(textColor);
-        FillRect(dis->hDC, &strikeRect, hLineBrush);
+        FillRect(hdc, &strikeRect, hLineBrush);
         DeleteObject(hLineBrush);
     }
-    SelectObject(dis->hDC, oldFont);
-    return TRUE;
+    SelectObject(hdc, oldFont);
+}
+
+// ==================== 一覧ポップアップウィンドウ ====================
+// TrackPopupMenu のモーダルメニューをやめ、フォーカスを一切奪わない非アクティブの
+// 自前ポップアップ（WS_EX_NOACTIVATE）で一覧を表示する。
+// 非モーダルのため、フォーカス復元・EndMenu・クローズ直後のクリック猶予といった
+// モーダルメニュー時代の補正処理は存在しない。キー入力は受けないマウス専用の UI。
+// 開く：ホバー（IDT_HOVER_TRIGGER 経由）またはアイコン左クリック（即時）。
+// 閉じる：アイコンとポップアップ両方からの離脱（IDT_LIST_WATCH が監視）・
+// アイコン左クリックのトグル・行クリックでチケットを開いたとき。起点によらず同一ルール。
+
+static constexpr wchar_t LIST_WND_CLASS[] = L"redntfy_list";
+
+// 一覧の行種別と配置（クライアント座標）。表示のたびに構築する
+enum class ListRowKind { Issue, Separator, Footer, Empty };
+struct ListRowLayout {
+    ListRowKind kind;
+    int         top;
+    int         height;
+    size_t      index;  // Issue のとき g_issueItems のインデックス（他種別は未使用の 0）
+};
+static HWND g_listWnd = nullptr;                 // 初回表示時に生成して以降使い回す
+static std::vector<ListRowLayout> g_listLayout;  // トレイ WndProc スレッド専用
+static std::wstring g_listFooterText;            // フッタ行の文言（0 件時は未使用）
+static int g_listHotRow = -1;                    // ホット行（g_listLayout の添字。-1 = なし）
+
+// 一覧ポップアップが画面に出ているか（ウィンドウ未生成は非表示扱い）
+static bool isListPopupVisible() {
+    return g_listWnd && IsWindowVisible(g_listWnd);
+}
+
+// 後方定義の関数を一覧ウィンドウの WndProc から呼ぶための前方宣言
+static void markIssueRead(int issueId);
+static void handleTrayCommand(UINT id);
+static void cycleIssueState(size_t itemIndex);
+
+// クライアント座標 y の行ヒットテスト（セパレータは対象外）。ヒットなしは -1
+static int listRowHitTest(int y) {
+    for (size_t i = 0; i < g_listLayout.size(); ++i) {
+        const auto& row = g_listLayout[i];
+        if (row.kind == ListRowKind::Separator) continue;
+        if (y >= row.top && y < row.top + row.height) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+// 行のクライアント矩形（横幅はウィンドウ全幅）
+static RECT listRowRect(HWND hWnd, const ListRowLayout& row) {
+    RECT rc;
+    GetClientRect(hWnd, &rc);
+    rc.top    = row.top;
+    rc.bottom = row.top + row.height;
+    return rc;
+}
+
+// フッタ・0 件行の描画（単色テキスト行。クリック可能なためホット時はハイライトする）
+static void drawTextRow(HDC hdc, const RECT& rc, const wchar_t* text, bool hot) {
+    FillRect(hdc, &rc, reinterpret_cast<HBRUSH>(
+        static_cast<INT_PTR>(hot ? COLOR_HIGHLIGHT + 1 : COLOR_MENU + 1)));
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, GetSysColor(hot ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT));
+    RECT textRect = rc;
+    textRect.left += 4;  // チケット行と同じ左パディング
+    HFONT old = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
+    DrawTextW(hdc, text, -1, &textRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+    SelectObject(hdc, old);
+}
+
+// 一覧ウィンドウの全面描画
+// メモリ DC にダブルバッファで全行を描いてから転送し、チラつきを防ぐ。
+// （drawPinMarkColor の D2D は BindDC で任意の HDC に描けるため、メモリ DC でも成立する）
+static void paintListWindow(HWND hWnd) {
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hWnd, &ps);
+    RECT client;
+    GetClientRect(hWnd, &client);
+    HDC     hMem    = CreateCompatibleDC(hdc);
+    HBITMAP hBmp    = CreateCompatibleBitmap(hdc, client.right, client.bottom);
+    HBITMAP hOldBmp = static_cast<HBITMAP>(SelectObject(hMem, hBmp));
+    FillRect(hMem, &client, reinterpret_cast<HBRUSH>(static_cast<INT_PTR>(COLOR_MENU + 1)));
+    for (size_t i = 0; i < g_listLayout.size(); ++i) {
+        const auto& row = g_listLayout[i];
+        RECT rc = client;
+        rc.top    = row.top;
+        rc.bottom = row.top + row.height;
+        bool hot = (static_cast<int>(i) == g_listHotRow);
+        switch (row.kind) {
+        case ListRowKind::Issue:
+            if (row.index < g_issueItems.size())
+                drawIssueRow(hMem, rc, g_issueItems[row.index], hot);
+            break;
+        case ListRowKind::Separator: {
+            // メニューのセパレータ相当の 1px 水平線
+            int  y    = (rc.top + rc.bottom) / 2;
+            RECT line = { rc.left + 2, y, rc.right - 2, y + 1 };
+            HBRUSH br = CreateSolidBrush(GetSysColor(COLOR_GRAYTEXT));
+            FillRect(hMem, &line, br);
+            DeleteObject(br);
+            break;
+        }
+        case ListRowKind::Footer:
+            drawTextRow(hMem, rc, g_listFooterText.c_str(), hot);
+            break;
+        case ListRowKind::Empty:
+            drawTextRow(hMem, rc, NO_ISSUES, hot);
+            break;
+        }
+    }
+    BitBlt(hdc, 0, 0, client.right, client.bottom, hMem, 0, 0, SRCCOPY);
+    SelectObject(hMem, hOldBmp);
+    DeleteObject(hBmp);
+    DeleteDC(hMem);
+    EndPaint(hWnd, &ps);
+}
+
+// 一覧ポップアップのウィンドウプロシージャ
+// 非アクティブ（WS_EX_NOACTIVATE + MA_NOACTIVATE）のためキー入力は届かない。マウス専用。
+// 行の左クリック＝チケットを開いて既読化して閉じる。フッタ・0 件行＝クエリ画面を開いて閉じる。
+// 行の右クリック＝状態遷移で、一覧は開いたまま。（通常 → ピン留め → 非表示 → 通常）
+// 離脱による自動クローズはトレイ側の IDT_LIST_WATCH が担い、ここでは扱わない。
+static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_PAINT) {
+        paintListWindow(hWnd);
+        return 0;
+    }
+    if (msg == WM_MOUSEACTIVATE) {
+        // クリックでもアクティブ化しない（WS_EX_NOACTIVATE の補強。フォーカス非奪取の要）
+        return MA_NOACTIVATE;
+    }
+    if (msg == WM_MOUSEMOVE) {
+        int hit = listRowHitTest(static_cast<short>(HIWORD(lParam)));
+        if (hit != g_listHotRow) {
+            // 変化した行だけ再描画してチラつきを抑える（erase FALSE：行描画が背景ごと塗る）
+            int prev = g_listHotRow;
+            g_listHotRow = hit;
+            if (prev >= 0 && prev < static_cast<int>(g_listLayout.size())) {
+                RECT rc = listRowRect(hWnd, g_listLayout[prev]);
+                InvalidateRect(hWnd, &rc, FALSE);
+            }
+            if (hit >= 0) {
+                RECT rc = listRowRect(hWnd, g_listLayout[hit]);
+                InvalidateRect(hWnd, &rc, FALSE);
+            }
+        }
+        // ウィンドウ外へ出たときのホット解除用（毎回の再登録は無害）
+        TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hWnd, 0 };
+        TrackMouseEvent(&tme);
+        return 0;
+    }
+    if (msg == WM_MOUSELEAVE) {
+        if (g_listHotRow >= 0 && g_listHotRow < static_cast<int>(g_listLayout.size())) {
+            RECT rc = listRowRect(hWnd, g_listLayout[g_listHotRow]);
+            g_listHotRow = -1;
+            InvalidateRect(hWnd, &rc, FALSE);
+        }
+        return 0;
+    }
+    if (msg == WM_LBUTTONUP) {
+        int hit = listRowHitTest(static_cast<short>(HIWORD(lParam)));
+        if (hit < 0) return 0;
+        const auto& row = g_listLayout[hit];
+        if (row.kind == ListRowKind::Issue && row.index < g_issueItems.size()) {
+            const auto& item = g_issueItems[row.index];
+            // URL 検証を通った行だけ開いて既読化する（誤既読の防止。旧メニュー実装と同じ契約）
+            if (isHttpUrl(item.url)) {
+                ShellExecuteW(nullptr, L"open", item.url.c_str(),
+                              nullptr, nullptr, SW_SHOWNORMAL);
+                markIssueRead(item.id);
+            }
+        }
+        else {
+            // フッタ・0 件行はクエリ画面を開く（既存の IDM_OPEN_QUERY 処理を共用）
+            handleTrayCommand(IDM_OPEN_QUERY);
+        }
+        // チケットを開いたら一覧は役目を終える
+        if (g_hWnd) hideListPopup(g_hWnd);
+        return 0;
+    }
+    if (msg == WM_RBUTTONUP) {
+        int hit = listRowHitTest(static_cast<short>(HIWORD(lParam)));
+        if (hit >= 0 && g_listLayout[hit].kind == ListRowKind::Issue)
+            cycleIssueState(g_listLayout[hit].index);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+// 一覧ポップアップウィンドウの生成（初回のみ。以降は表示/非表示で使い回す）
+// WS_EX_NOACTIVATE：表示・クリックでもフォアグラウンドを奪わない（本ウィンドウの核）
+// WS_EX_TOOLWINDOW：タスクバー・Alt+Tab に出さない
+// WS_EX_TOPMOST：タスクバー近傍でも手前に出す
+static HWND ensureListWindow() {
+    if (g_listWnd) return g_listWnd;
+    WNDCLASSEXW wc = {};
+    wc.cbSize        = sizeof(wc);
+    wc.style         = CS_DROPSHADOW;
+    wc.lpfnWndProc   = listWndProc;
+    wc.hInstance     = GetModuleHandleW(nullptr);
+    // UNICODE 未定義ビルドのため IDC_ARROW（MAKEINTRESOURCE）は LPSTR に展開される。W 版へ読み替える
+    wc.hCursor       = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
+    wc.lpszClassName = LIST_WND_CLASS;
+    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        writeLog("list: RegisterClassExW failed: " + std::to_string(GetLastError()));
+        return nullptr;
+    }
+    g_listWnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        LIST_WND_CLASS, nullptr, WS_POPUP | WS_BORDER,
+        0, 0, 0, 0, g_hWnd, nullptr, wc.hInstance, nullptr);
+    if (!g_listWnd)
+        writeLog("list: CreateWindowExW failed: " + std::to_string(GetLastError()));
+    return g_listWnd;
+}
+
+// 一覧ポップアップの表示（ホバー・左クリック共通）
+// 表示行の選定・並べ替え・絞り込みは buildListRows に委ねる。（バッジの未読判定と同じ根拠）
+// 行の左クリックでチケットを開いてその 1 件だけ既読にする。（非表示のグレー行も同様に開ける）
+// フッタの「未処理 N 件」はフィルタを通った件数で、フィルタで外れたピンと非表示チケットは数えない。
+// 表示中は IDT_LIST_WATCH（トレイ側タイマー）が離脱を監視して閉じる。
+static void showListPopup(HWND trayWnd) {
+    HWND hWnd = ensureListWindow();
+    if (!hWnd) return;
+
+    const Config& cfg = g_currentConfig;
+    int visible = 0;
+    auto rows = buildListRows(visible);
+
+    // 「今日」（期日の赤判定用）と経過日数の基準日は 1 回だけ求めて全行に使う。
+    // 行ごとに求めると日付境界をまたいだ瞬間に同じ一覧内で判定が揺れる
+    const int todayYmd = todayJstYmd();
+    const long long todayDays = todayJstDaySerial();
+    auto makeItem = [&](const ListRow& row) {
+        IssueItem it;
+        it.id  = row.id;
+        it.url = issueUrl(cfg, row.id);
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), todayDays);
+        it.label  = std::move(lbl.text);
+        it.ranges = std::move(lbl.ranges);
+        it.unread = row.unread;
+        it.pinned = row.pinned;
+        it.hidden = row.hidden;
+        it.closed = row.closed;
+        return it;
+    };
+
+    g_issueItems.clear();
+    g_listLayout.clear();
+    g_listHotRow = -1;
+
+    // カーソル位置のモニタ作業領域を先に取得する。（行の打ち切り判定と位置クランプの両方に使う）
+    POINT cursor;
+    GetCursorPos(&cursor);
+    MONITORINFO mi = { sizeof(mi) };
+    const bool haveMi =
+        GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &mi) != FALSE;
+    // WS_BORDER の枠を差し引いたクライアント高の上限（取得失敗時は打ち切りなし）
+    RECT frame = { 0, 0, 0, 0 };
+    AdjustWindowRectEx(&frame, WS_POPUP | WS_BORDER, FALSE,
+        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST);
+    const int maxClientH = haveMi
+        ? static_cast<int>(mi.rcWork.bottom - mi.rcWork.top) - (frame.bottom - frame.top)
+        : INT_MAX;
+
+    // 行レイアウトの構築と全体サイズの計測
+    HDC hdc = GetDC(hWnd);
+    int width = 0;
+    int y     = 0;
+    auto pushRow = [&](ListRowKind kind, int h, size_t index) {
+        g_listLayout.push_back({ kind, y, h, index });
+        y += h;
+    };
+    // テキスト行（フッタ・0 件行）の高さと幅（チケット行と同じ左 4・右 16 のパディング込み）
+    // 計測は描画（drawTextRow）と同じ g_hMenuFont で行う。（DC の選択状態に依存させない）
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
+    TEXTMETRICW tm = {};
+    GetTextMetricsW(hdc, &tm);
+    const int textRowHeight = tm.tmHeight + 6;
+    SelectObject(hdc, oldFont);
+    auto textRowWidth = [&](const wchar_t* text) {
+        HFONT prev = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
+        SIZE sz = {};
+        GetTextExtentPoint32W(hdc, text, static_cast<int>(wcslen(text)), &sz);
+        SelectObject(hdc, prev);
+        return static_cast<int>(sz.cx) + 20;
+    };
+
+    if (rows.empty()) {
+        g_listFooterText.clear();
+        width = textRowWidth(NO_ISSUES);
+        pushRow(ListRowKind::Empty, textRowHeight, 0);
+    }
+    else {
+        // セパレータとフッタは必ず出すため、その高さを先に予約して行を詰める
+        const int tailHeight = 9 + textRowHeight;
+        size_t idx = 0;
+        for (const auto& row : rows) {
+            if (idx >= LIST_ROW_MAX) break;
+            g_issueItems.push_back(makeItem(row));
+            SIZE sz = measureIssueRow(hdc, g_issueItems.back());
+            // 作業領域に収まらない行は打ち切る。（スクロールを持たないため、
+            // 画面外へはみ出して操作不能な行を作らない）
+            if (y + static_cast<int>(sz.cy) + tailHeight > maxClientH) {
+                g_issueItems.pop_back();
+                break;
+            }
+            width = (std::max)(width, static_cast<int>(sz.cx));
+            pushRow(ListRowKind::Issue, static_cast<int>(sz.cy), idx);
+            ++idx;
+        }
+        g_listFooterText = L"未処理 " + std::to_wstring(visible)
+            + L" 件（クリックでウェブ表示 ／ 右クリックでピン留め・非表示）";
+        width = (std::max)(width, textRowWidth(g_listFooterText.c_str()));
+        pushRow(ListRowKind::Separator, 9, 0);  // メニューのセパレータ相当（余白込み）
+        pushRow(ListRowKind::Footer, textRowHeight, 0);
+    }
+    ReleaseDC(hWnd, hdc);
+
+    // クライアントサイズ → ウィンドウサイズ（WS_BORDER の枠分を上乗せ）
+    RECT wr = { 0, 0, width, y };
+    AdjustWindowRectEx(&wr, WS_POPUP | WS_BORDER, FALSE,
+        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST);
+    const int w = wr.right - wr.left;
+    const int h = wr.bottom - wr.top;
+
+    // 位置はタスクバーの辺に密着させる。computeTrayPopupPos のアライメント指示
+    // （BOTTOMALIGN＝底辺を y に、RIGHTALIGN＝右辺を x に合わせる）を座標へ翻訳し、
+    // メニューの自動反転の代わりにモニタ作業領域内へクランプして画面外を防ぐ
+    auto pos = computeTrayPopupPos(cursor);
+    int wx = pos.x;
+    int wy = pos.y;
+    if (pos.alignFlags & TPM_RIGHTALIGN)  wx -= w;
+    if (pos.alignFlags & TPM_BOTTOMALIGN) wy -= h;
+    if (haveMi) {
+        wx = (std::max)(static_cast<int>(mi.rcWork.left),
+                        (std::min)(wx, static_cast<int>(mi.rcWork.right) - w));
+        wy = (std::max)(static_cast<int>(mi.rcWork.top),
+                        (std::min)(wy, static_cast<int>(mi.rcWork.bottom) - h));
+    }
+
+    // SWP_NOACTIVATE でフォーカスを奪わずに表示する
+    SetWindowPos(hWnd, HWND_TOPMOST, wx, wy, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(hWnd, nullptr, FALSE);
+
+    g_popupShowing.store(true);
+    g_listOutsideTicks = 0;
+    // 離脱監視の開始。失敗時は表示を諦めて閉じる。（閉じる手段が離脱かクリックしかなく、
+    // 監視なしでは出しっぱなしになるため）
+    if (!SetTimer(trayWnd, IDT_LIST_WATCH, LIST_WATCH_POLL_MS, nullptr)) {
+        writeLog("list: SetTimer(IDT_LIST_WATCH) failed");
+        ShowWindow(hWnd, SW_HIDE);
+        g_popupShowing.store(false);
+    }
+}
+
+// 一覧ポップアップを閉じる（離脱・トグル・行クリックの共通経路）
+// カーソルがまだアイコン上にあるときはホバー再アームを保留し、IDT_LIST_WATCH を
+// 保留解除の監視に転用する。（閉じた直後の微動で即座に開き直るのを防ぐ。
+// アイコンから離れたら監視側が保留を解除してタイマーを止める）
+// SetTimer は既存タイマーの張り直しとして常に呼ぶ。（失敗すると保留が解除不能になるため、
+// 失敗時は保留しない）
+static void hideListPopup(HWND trayWnd) {
+    if (g_listWnd) ShowWindow(g_listWnd, SW_HIDE);
+    g_popupShowing.store(false);
+    g_listHotRow = -1;
+
+    POINT pt;
+    GetCursorPos(&pt);
+    RECT icon;
+    if (getTrayIconRect(trayWnd, icon) && PtInRect(&icon, pt)) {
+        g_hoverRearmPending =
+            SetTimer(trayWnd, IDT_LIST_WATCH, LIST_WATCH_POLL_MS, nullptr) != 0;
+    }
+    else {
+        g_hoverRearmPending = false;
+        KillTimer(trayWnd, IDT_LIST_WATCH);
+    }
+    // バッジ（未読の有無）を最新化する
+    updateTrayTooltip(trayWnd);
 }
 
 // チケット項目の状態を通常 → ピン留め → 非表示 → 通常の順に遷移させる
-// （左クリックポップアップ上の右クリック）
-// g_pins・g_hiddenIds と item.pinned/hidden を更新し、自スレッド所有のメニューウィンドウを
-// 再描画する。（マーカー・グレーの描画自体は WM_DRAWITEM が pinned/hidden を参照して行う）
+// （一覧ポップアップ上の行右クリック）
+// g_pins・g_hiddenIds と item.pinned/hidden を更新し、当該行を再描画する。
+// （マーカー・グレーの描画自体は drawIssueRow が pinned/hidden を参照して行う）
 // 状態は排他で、ピン留め → 非表示の遷移でピンは解除される。ピンの件数に上限はない。
 // 非表示は通知対象外のため、非表示への遷移時は未読からも取り除く。（太字と件数の残留を防ぐ）
-static void cycleIssueState(UINT itemIdx, HMENU hm) {
-    UINT id = GetMenuItemID(hm, static_cast<int>(itemIdx));
-    if (id < IDM_ISSUE_BASE || id >= IDM_ISSUE_MAX) return;
-    UINT eidx = id - IDM_ISSUE_BASE;
-    if (eidx >= g_issueItems.size()) return;
+static void cycleIssueState(size_t itemIndex) {
+    if (itemIndex >= g_issueItems.size()) return;
 
-    auto& item = g_issueItems[eidx];
+    auto& item = g_issueItems[itemIndex];
     bool nowPinned, nowHidden;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
@@ -4468,25 +4621,23 @@ static void cycleIssueState(UINT itemIdx, HMENU hm) {
             nowHidden = false;
         }
     }
-    // 描画は WM_DRAWITEM が pinned/hidden を参照するため、フラグ更新と再描画だけで見た目が切り替わる
+    // 描画は drawIssueRow が pinned/hidden を参照するため、フラグ更新と再描画だけで見た目が切り替わる
     item.pinned = nowPinned;
     item.hidden = nowHidden;
     if (nowHidden) item.unread = false;  // 非表示行は太字にしない（buildListRows と同じ扱い）
 
-    // 自スレッド所有のポップアップメニューウィンドウ（クラス名 "#32768"）を全て再描画する
-    // FindWindowW はグローバル検索でタイミング依存・他プロセスの誤ヒットがあるため EnumThreadWindows を用いる
-    EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM) -> BOOL {
-        wchar_t className[16] = {};
-        if (GetClassNameW(hwnd, className, ARRAYSIZE(className))
-            && wcscmp(className, L"#32768") == 0) {
-            // erase は FALSE にして背景消去を抑止する。メニューの WM_PAINT が全項目
-            // （owner-draw 行・セパレータ・フッタ）を描き直すため消去は不要。
-            // TRUE だと全面消去→再描画の白フラッシュ（チラつき）が見える
-            InvalidateRect(hwnd, nullptr, FALSE);
-            UpdateWindow(hwnd);
+    // 当該行だけを再描画する。（erase は FALSE：行描画が背景ごと塗るため消去は不要で、
+    // TRUE だと全面消去→再描画の白フラッシュ（チラつき）が見える）
+    if (g_listWnd) {
+        for (const auto& row : g_listLayout) {
+            if (row.kind == ListRowKind::Issue && row.index == itemIndex) {
+                RECT rc = listRowRect(g_listWnd, row);
+                InvalidateRect(g_listWnd, &rc, FALSE);
+                UpdateWindow(g_listWnd);
+                break;
+            }
         }
-        return TRUE;
-    }, 0);
+    }
     // 遷移で必ずどちらかの集合が変わるが、片側だけの変化を追う分岐より両方の保存の方が単純で、
     // 書き出しはどちらも小さい。（tmp 経由の atomicWriteJson で破損もしない）
     savePins(g_exeDir);
@@ -4585,9 +4736,8 @@ static void enterDisabledMode(HWND hWnd, DisabledReason reason,
 }
 
 // トレイ用ウィンドウプロシージャ
-// トレイアイコン操作（左クリック一覧・右クリックメニュー・ホバー一覧）、ホバー関連タイマー、
-// tooltip 更新、無効モード遷移、
-// メニューのオーナードロー（新版通知・チケット行）、ポップアップ右クリックの状態遷移、
+// トレイアイコン操作（左クリックトグル・右クリックメニュー・ホバー一覧）、一覧関連タイマー、
+// tooltip・バッジ更新、無効モード遷移、右クリックメニューのオーナードロー（新版通知）、
 // スリープ復帰・ロック解除の即時ポーリング、エクスプローラ再起動時のアイコン再登録を振り分ける。
 static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAYICON) {
@@ -4603,9 +4753,8 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             // ホバー検出のデバウンス：静止中は WM_MOUSEMOVE が来ないため、動くたびに
             // ワンショットタイマーを張り直せば「delay 時間静止したら表示」を判定できる。
             // hover_delay_ms = 0 は即時表示。（デバウンスなし）
-            // 明示クローズ後の抑止中（g_hoverSuppressed）はアームしない
-            if (g_hoverPopupEnabled.load() && !isDisabled() && !g_popupShowing.load()
-                && !g_hoverSuppressed) {
+            // 表示中と再アーム保留中（明示クローズ後、アイコン離脱まで）はアームしない
+            if (!isDisabled() && !g_popupShowing.load() && !g_hoverRearmPending) {
                 DWORD delay = g_hoverDelayMs.load();
                 if (delay == 0) {
                     KillTimer(hWnd, IDT_HOVER_TRIGGER);
@@ -4618,42 +4767,41 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         }
         return 0;
     }
-    if (msg == WM_TIMER && wParam == IDT_HOVER_REARM) {
-        // 明示クローズ後の抑止解除判定：カーソルがアイコンから離れたら再アームする。
-        // 矩形の取得失敗は離脱扱いにする。（抑止に倒し続けるとホバーが復帰不能になるため）
-        POINT pt;
-        GetCursorPos(&pt);
-        RECT icon = {};
-        if (!getTrayIconRect(hWnd, icon) || !PtInRect(&icon, pt)) {
-            g_hoverSuppressed = false;
-            KillTimer(hWnd, IDT_HOVER_REARM);
-        }
-        return 0;
-    }
     if (msg == WM_TIMER && wParam == IDT_HOVER_TRIGGER) {
         // ワンショット化：発火したら即座に殺してから表示に進む
         KillTimer(hWnd, IDT_HOVER_TRIGGER);
         handleTrayHover(hWnd);
         return 0;
     }
-    if (msg == WM_TIMER && wParam == IDT_HOVER_AUTOCLOSE) {
-        // ホバー起点の表示のみが対象。クリック起点やコンテキストメニュー表示中は何もしない
-        if (!g_hoverMode) return 0;
+    if (msg == WM_TIMER && wParam == IDT_LIST_WATCH) {
         POINT pt;
         GetCursorPos(&pt);
-        RECT icon = {};
-        // アイコン矩形の取得失敗（過渡状態）は場外と数えず今回の判定を見送る。
-        // getTrayIconRect の契約どおり保守的＝閉じない側に倒し、次の tick で再判定する
-        if (!getTrayIconRect(hWnd, icon)) return 0;
-        bool inIcon = PtInRect(&icon, pt);
-        bool inMenu = isCursorOverAnyMenuWindow(pt);
-        if (inIcon || inMenu) {
-            g_hoverOutsideTicks = 0;
+        if (g_listWnd && IsWindowVisible(g_listWnd)) {
+            // 表示中：アイコンとポップアップの両方から離れた状態が連続したら閉じる。
+            // アイコン矩形の取得失敗（過渡状態）は場外と数えず今回の判定を見送る。
+            // getTrayIconRect の契約どおり保守的＝閉じない側に倒し、次の tick で再判定する
+            RECT icon = {};
+            if (!getTrayIconRect(hWnd, icon)) return 0;
+            RECT wnd = {};
+            GetWindowRect(g_listWnd, &wnd);
+            if (PtInRect(&icon, pt) || PtInRect(&wnd, pt)) {
+                g_listOutsideTicks = 0;
+            }
+            else if (++g_listOutsideTicks >= LIST_LEAVE_TICKS) {
+                hideListPopup(hWnd);
+            }
         }
-        else if (++g_hoverOutsideTicks >= HOVER_AUTOCLOSE_TICKS) {
-            // フォアグラウンド復元の判定に使うため、EndMenu の前にフラグを立てる
-            g_hoverAutoclosed = true;
-            EndMenu();
+        else if (g_hoverRearmPending) {
+            // 明示クローズ後の再アーム保留：カーソルがアイコンから離れたら解除して止める。
+            // 矩形の取得失敗は離脱扱いにする。（保留に倒し続けるとホバーが復帰不能になるため）
+            RECT icon = {};
+            if (!getTrayIconRect(hWnd, icon) || !PtInRect(&icon, pt)) {
+                g_hoverRearmPending = false;
+                KillTimer(hWnd, IDT_LIST_WATCH);
+            }
+        }
+        else {
+            KillTimer(hWnd, IDT_LIST_WATCH);  // 非表示かつ保留なしの迷子タイマーは止める
         }
         return 0;
     }
@@ -4670,23 +4818,16 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         handleTrayCommand(LOWORD(wParam));
         return 0;
     }
+    // オーナードローは右クリックメニューのバージョン更新通知行のみ（一覧は自前ウィンドウ描画）
     if (msg == WM_MEASUREITEM) {
         auto* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
         if (mis->CtlType == ODT_MENU && mis->itemID == IDM_OPEN_GITHUB)
             return measureVersionMenuItem(hWnd, mis) ? TRUE : DefWindowProcW(hWnd, msg, wParam, lParam);
-        if (measureIssueMenuItem(hWnd, mis)) return TRUE;
     }
     if (msg == WM_DRAWITEM) {
         auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
         if (dis->CtlType == ODT_MENU && dis->itemID == IDM_OPEN_GITHUB)
             return drawVersionMenuItem(dis) ? TRUE : DefWindowProcW(hWnd, msg, wParam, lParam);
-        if (drawIssueMenuItem(dis)) return TRUE;
-    }
-    // 左クリックポップアップ上の右クリック：状態を遷移させる（通常 → ピン留め → 非表示 → 通常）
-    // WM_MENURBUTTONUP は TPM_RIGHTBUTTON 指定なしでも右クリックで届く。（選択は発生しない）
-    if (msg == WM_MENURBUTTONUP) {
-        cycleIssueState(static_cast<UINT>(wParam), reinterpret_cast<HMENU>(lParam));
-        return 0;
     }
     if (msg == WM_DESTROY) {
         PostQuitMessage(0);
@@ -5460,8 +5601,6 @@ int wmain() {
         // 通知音を読み込みノーマライズしてキャッシュに格納（以降の再生はキャッシュを使用）
         loadWavAndNormalize(exeDir, cfg);
 
-        // ホバー設定は addTrayIcon が初期 tooltip の表示可否判定に使うため、登録前に確定させる
-        g_hoverPopupEnabled = readRegDword(REG_HOVER_POPUP, 1u) != 0;
         // toml のホバー遅延を確定（0〜5000 にクランプ済みの値）
         g_hoverDelayMs.store(static_cast<DWORD>(cfg.hoverDelayMs));
 
@@ -5498,7 +5637,7 @@ int wmain() {
             }
         }
 
-        // メニュー描画用フォントを初期化（以降、WM_MEASUREITEM / WM_DRAWITEM で使用する）
+        // 一覧・メニュー描画用フォントを初期化（一覧ポップアップとバージョン通知行が使用する）
         initMenuFonts();
 
         // ピン留めと非表示チケットを復元する（起動直後のポーリング前でも一覧に反映するため）
