@@ -266,6 +266,9 @@ static bool g_hoverSuppressed = false;
 // クリック起点の一覧を閉じた時刻（GetTickCount64 の値。LIST_CLICK_SUPPRESS_MS の抑止判定に使う）
 static ULONGLONG g_listCloseTick = 0;
 
+// ホバー一覧表示中のメッセージフィルタフック（表示中のみ install。トレイ WndProc スレッド専用）
+static HHOOK g_hoverMsgHook = nullptr;
+
 // スリープ復帰・ロック解除時の即時ポーリングフラグ
 static std::atomic<bool> g_forcePoll{false};
 
@@ -3984,6 +3987,28 @@ static void showTrayContextMenu(HWND hWnd) {
     updateTrayTooltip(hWnd);
 }
 
+// ホバー一覧のモーダルループ用メッセージフィルタ
+// トレイアイコン上での左ボタン操作をメニューへ渡さず握りつぶす。
+// TrackPopupMenu はメニュー外の押下で閉じるため、フィルタなしではアイコン左クリックが
+// 「一覧を閉じる操作」として効いてしまう。（ホバー ON 中の左クリック完全無効の一環）
+// アイコン外の押下（Esc・外側クリック等）は素通しし、従来どおりメニューを閉じる。
+static LRESULT CALLBACK hoverMenuMsgFilter(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == MSGF_MENU) {
+        auto* m = reinterpret_cast<MSG*>(lParam);
+        if (m->message == WM_LBUTTONDOWN || m->message == WM_LBUTTONUP
+            || m->message == WM_LBUTTONDBLCLK) {
+            RECT icon;
+            // MSG::pt はメッセージ発生時のスクリーン座標。
+            // メニューウィンドウ上の座標は素通しする。（アイコン矩形がメニューと重なる配置で
+            // 行やフッタのクリックまで不発にしないため。自動クローズの判定と同じ優先順）
+            if (g_hWnd && !isCursorOverAnyMenuWindow(m->pt)
+                && getTrayIconRect(g_hWnd, icon) && PtInRect(&icon, m->pt))
+                return TRUE;  // アイコン上の左ボタンは不発（メニューは開いたまま）
+        }
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
 // トレイアイコンホバー時のチケット一覧表示
 //
 // 契約：IDT_HOVER_TRIGGER の発火（または hover_delay_ms = 0 の即時経路）からのみ呼ばれる。
@@ -4029,7 +4054,15 @@ static void handleTrayHover(HWND hWnd) {
 
     // 自動クローズ用ポーリングはモーダルループ突入前に開始する
     SetTimer(hWnd, IDT_HOVER_AUTOCLOSE, HOVER_AUTOCLOSE_POLL_MS, nullptr);
+    // アイコン上の左クリックを不発にするフィルタ。（表示中のみ有効）
+    // install 失敗時は nullptr のままで、クリックで閉じる従来挙動に縮退する
+    g_hoverMsgHook = SetWindowsHookExW(WH_MSGFILTER, hoverMenuMsgFilter,
+        nullptr, GetCurrentThreadId());
     showIssuePopup(hWnd);
+    if (g_hoverMsgHook) {
+        UnhookWindowsHookEx(g_hoverMsgHook);
+        g_hoverMsgHook = nullptr;
+    }
     KillTimer(hWnd, IDT_HOVER_AUTOCLOSE);
 
     bool autoclosed = g_hoverAutoclosed;
@@ -4041,13 +4074,19 @@ static void handleTrayHover(HWND hWnd) {
 
     g_popupShowing.store(false);
 
-    // 明示操作（アイコンクリック・Esc 等）で閉じたら、カーソルがアイコンから一度離れるまで
-    // ホバー再表示を抑止する。（乗ったままのわずかな動きで即座に開き直るため）
-    // 離脱の検出は IDT_HOVER_REARM のポーリングが担う。
+    // 明示操作（Esc・外側クリック等）で閉じたとき、カーソルがまだアイコン上にあるなら
+    // 一度離れるまでホバー再表示を抑止する。（乗ったままのわずかな動きで即座に開き直るため）
+    // 既にアイコン外で閉じた（行クリック等）なら「一度離れる」は満たされており抑止しない。
+    // 離脱の検出は IDT_HOVER_REARM のポーリングが担う。SetTimer 失敗時は抑止しない。
+    // （解除経路がこのタイマーしかなく、失敗すると抑止が永久に残るため）
     // 自動クローズはカーソルが場外にあり誤爆しないため抑止しない
     if (!autoclosed) {
-        g_hoverSuppressed = true;
-        SetTimer(hWnd, IDT_HOVER_REARM, HOVER_AUTOCLOSE_POLL_MS, nullptr);
+        POINT cpt;
+        GetCursorPos(&cpt);
+        RECT iconRc;
+        if (getTrayIconRect(hWnd, iconRc) && PtInRect(&iconRc, cpt))
+            g_hoverSuppressed =
+                SetTimer(hWnd, IDT_HOVER_REARM, HOVER_AUTOCLOSE_POLL_MS, nullptr) != 0;
     }
 
     // 破棄済みウィンドウへの復元を避ける防御チェック
