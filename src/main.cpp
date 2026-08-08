@@ -106,9 +106,15 @@ static const wchar_t* APP_AUMID = L"com.redntfy";
 static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 
 // ホバーで一覧を表示するまでの遅延（ms）。0 は即時表示
-static constexpr long long DEFAULT_HOVER_DELAY_MS = 200;
+static constexpr long long DEFAULT_HOVER_DELAY_MS = 100;
 static constexpr long long MIN_HOVER_DELAY_MS     = 0;
 static constexpr long long MAX_HOVER_DELAY_MS     = 5000;
+
+// ホバー自動表示直後にアイコン左クリックの「閉じる」を無視する猶予（ms）。0 で無効
+// （一覧を出すつもりのクリックが、先行したホバー表示により「閉じる」へ化けるのを防ぐ）
+static constexpr long long DEFAULT_HOVER_CLICK_GUARD_MS = 300;
+static constexpr long long MIN_HOVER_CLICK_GUARD_MS     = 0;
+static constexpr long long MAX_HOVER_CLICK_GUARD_MS     = 5000;
 
 // トレイアイコン用メッセージ ID
 static constexpr UINT WM_TRAYICON        = WM_USER + 1;
@@ -238,13 +244,21 @@ static std::atomic<bool> g_popupShowing{false};
 // ホバー遅延（ms、0〜5000 にクランプ済み）。起動時に loadConfig の値を反映し以降不変
 static std::atomic<DWORD> g_hoverDelayMs{static_cast<DWORD>(DEFAULT_HOVER_DELAY_MS)};
 
+// ホバー自動表示直後のクリック猶予（ms、0〜5000 にクランプ済み）。
+// 起動時に loadConfig の値を反映し以降不変
+static std::atomic<DWORD> g_hoverClickGuardMs{static_cast<DWORD>(DEFAULT_HOVER_CLICK_GUARD_MS)};
+
 // 一覧ポップアップの開閉制御。トレイ WndProc スレッドのみが読み書きするため atomic 不要
 // g_listOutsideTicks：カーソルがアイコン・ポップアップ矩形の外に居た連続 tick 数
 // g_hoverRearmPending：明示クローズ後、カーソルがアイコンから離れるまでホバー再表示を
 //   保留するフラグ。（閉じてもカーソルが乗ったままだと、わずかな動きで即座に開き直るため。
 //   IDT_LIST_WATCH の監視でアイコン離脱を検出したら解除する）
-static int  g_listOutsideTicks  = 0;
-static bool g_hoverRearmPending = false;
+// g_hoverShownAt：ホバーで自動表示した時刻（GetTickCount64）。左クリック表示とクローズで
+//   0 に戻す。（不変条件：非 0 はホバー起点の一覧が表示中のときだけ）
+//   ホバー自動表示直後の左クリックを「閉じる」と解釈しないための判定に使う
+static int       g_listOutsideTicks  = 0;
+static bool      g_hoverRearmPending = false;
+static ULONGLONG g_hoverShownAt      = 0;
 
 // スリープ復帰・ロック解除時の即時ポーリングフラグ
 static std::atomic<bool> g_forcePoll{false};
@@ -381,8 +395,11 @@ struct Config {
     // バージョン欄判定情報（トラッカー定義・プロジェクトのバージョン定義）の再取得間隔（時間）
     // 超過していたら次のポーリングで直ちに再取得する。デフォルト 24。（1〜168）
     int versionMetaRefreshHours;
-    // ホバーで一覧を表示するまでの遅延（ms、0〜5000、0 で即時、デフォルト 200）
+    // ホバーで一覧を表示するまでの遅延（ms、0〜5000、0 で即時、デフォルト 100）
     long long hoverDelayMs;
+
+    // ホバー自動表示直後にアイコン左クリックを無視する猶予（ms、0〜5000、0 で無効、デフォルト 300）
+    long long hoverClickGuardMs;
 
     // [guard] ガードトーン設定（BLE ヘッドホン対処）
     int   guardToneMs;      // ガードトーン長（冒頭・末尾共通、ms。0 で無効、デフォルト 1500）
@@ -1424,11 +1441,17 @@ static Config loadConfig(const std::wstring& exeDir) {
     // バージョン欄判定情報の再取得間隔（時間）
     cfg.versionMetaRefreshHours = readAppInt("version_meta_refresh_hours", 24, 1, 168);
 
-    // ホバーで一覧を表示するまでの遅延（ms 単位。デフォルト 200、0〜5000 にクランプ、0 で即時）
+    // ホバーで一覧を表示するまでの遅延（ms 単位。デフォルト 100、0〜5000 にクランプ、0 で即時）
     cfg.hoverDelayMs = readAppInt("hover_delay_ms",
         static_cast<int>(DEFAULT_HOVER_DELAY_MS),
         static_cast<int>(MIN_HOVER_DELAY_MS),
         static_cast<int>(MAX_HOVER_DELAY_MS));
+
+    // ホバー自動表示直後に左クリックを無視する猶予（ms 単位。デフォルト 300、0〜5000 にクランプ、0 で無効）
+    cfg.hoverClickGuardMs = readAppInt("hover_click_guard_ms",
+        static_cast<int>(DEFAULT_HOVER_CLICK_GUARD_MS),
+        static_cast<int>(MIN_HOVER_CLICK_GUARD_MS),
+        static_cast<int>(MAX_HOVER_CLICK_GUARD_MS));
 
     // [guard] ガードトーン設定
     cfg.guardToneMs = (int)readConfigFloat("guard", "tone_ms", 1500.0f, 0.0f, 10000.0f);
@@ -3885,20 +3908,34 @@ static void handleTrayHover(HWND hWnd) {
     if (!PtInRect(&icon, pt)) return;
 
     showListPopup(hWnd);
+    // ホバー起点の時刻を記録する。（左クリックの「閉じる」猶予判定用）
+    // 表示が成立したときだけ記録し、不変条件「非 0 はホバー起点の一覧が表示中のときだけ」を
+    // 保つ。（クローズ側の hideListPopup が 0 に戻す）
+    if (g_popupShowing.load()) g_hoverShownAt = GetTickCount64();
 }
 
 // トレイアイコン左クリック時の処理
 // 一覧ポップアップのトグル：表示中なら閉じ、非表示なら遅延なしで即表示する。
+// ただしホバー自動表示から hover_click_guard_ms（0 で無効）以内の左クリックは無視する。
+// （一覧を出すつもりのクリックの直前にホバー表示が割り込むと、クリックが「閉じる」に
+// 化けて「クリックしたのに何も出ない」体験になるため。左クリックで表示した場合は
+// 意図が明確なので猶予なしで直ちに閉じられる。右クリックメニューは対象外）
 // ポップアップは非アクティブでマウスキャプチャも取らないため、アイコンのクリックは
-// 表示中でも通常どおりここへ届く。（モーダルメニュー時代の解除・猶予の補正は不要）
+// 表示中でも通常どおりここへ届く。（モーダルメニュー時代の解除補正は不要）
 // 無効モード中は表示しない。（ポーリング停止中で出すものがない）
 static void handleTrayLeftClick(HWND hWnd) {
     if (g_popupShowing.load()) {
+        DWORD guard = g_hoverClickGuardMs.load();
+        if (g_hoverShownAt != 0 && guard != 0 &&
+            GetTickCount64() - g_hoverShownAt < guard) {
+            return;
+        }
         hideListPopup(hWnd);
         return;
     }
     if (isDisabled()) return;
     showListPopup(hWnd);
+    g_hoverShownAt = 0;  // 左クリック起点は猶予なし（直ちに左クリックで閉じられる）
 }
 
 // 当日ログファイルのパスを取得し、存在しなければ logs フォルダのパスを返す
@@ -4198,6 +4235,8 @@ static void drawIssueRow(HDC hdc, const RECT& rcItem, const IssueItem& item, boo
 // 開く：ホバー（IDT_HOVER_TRIGGER 経由）またはアイコン左クリック（即時）。
 // 閉じる：アイコンとポップアップ両方からの離脱（IDT_LIST_WATCH が監視）・
 // アイコン左クリックのトグル・行クリックでチケットを開いたとき。起点によらず同一ルール。
+// 唯一の例外として、ホバー自動表示から hover_click_guard_ms 以内のアイコン左クリックは
+// 無視する。（詳細は handleTrayLeftClick を参照）
 
 static constexpr wchar_t LIST_WND_CLASS[] = L"redntfy_list";
 
@@ -4551,6 +4590,9 @@ static void hideListPopup(HWND trayWnd) {
     if (g_listWnd) ShowWindow(g_listWnd, SW_HIDE);
     g_popupShowing.store(false);
     g_listHotRow = -1;
+    // ホバー起点の記録を破棄する。（クリック猶予は表示中の一覧にだけ効かせる。
+    // 残すと右クリックメニュー表示中など後続の g_popupShowing = true で猶予が誤発動する）
+    g_hoverShownAt = 0;
 
     POINT pt;
     GetCursorPos(&pt);
@@ -5601,8 +5643,9 @@ int wmain() {
         // 通知音を読み込みノーマライズしてキャッシュに格納（以降の再生はキャッシュを使用）
         loadWavAndNormalize(exeDir, cfg);
 
-        // toml のホバー遅延を確定（0〜5000 にクランプ済みの値）
+        // toml のホバー遅延・クリック猶予を確定（0〜5000 にクランプ済みの値）
         g_hoverDelayMs.store(static_cast<DWORD>(cfg.hoverDelayMs));
+        g_hoverClickGuardMs.store(static_cast<DWORD>(cfg.hoverClickGuardMs));
 
         addTrayIcon(g_hWnd);
 

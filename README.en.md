@@ -69,8 +69,8 @@ If you want to tune the tracking scope yourself, create custom queries in Redmin
 
 Everyday operations:
 
-- Rest the cursor on the tray icon (0.2 s by default) or left-click it to show the open-ticket list
-- The list closes automatically when the cursor leaves both the icon and the list (left-clicking the icon also closes it)
+- Rest the cursor on the tray icon (0.1 s by default) or left-click it to show the open-ticket list
+- The list closes automatically when the cursor leaves both the icon and the list (left-clicking the icon also closes it, except within 0.3 s right after a hover-triggered display)
 - The pending count is shown in the list footer, and the red badge on the icon indicates unread tickets
 - Left-click a row to open the ticket in the browser and mark it as read; right-click to cycle pin → hidden → normal
 - Hidden tickets are shown in gray and excluded from notifications and the pending count ("Exclude hidden tickets" in the menu removes them from the list entirely)
@@ -89,7 +89,8 @@ The main configuration keys are listed below. See the comments in `redntfy.toml`
 | `[app]` | `schedule` | Polls per hour for each of the 24 hours |
 | `[app]` | `list_limit` | Number of rows in the list (default 20) |
 | `[app]` | `list_format` | Row format of the list (placeholder based) |
-| `[app]` | `hover_delay_ms` | Delay before the list appears on hover (milliseconds, 0-5000; default 200, 0 for immediate) |
+| `[app]` | `hover_delay_ms` | Delay before the list appears on hover (milliseconds, 0-5000; default 100, 0 for immediate) |
+| `[app]` | `hover_click_guard_ms` | Grace period after a hover-triggered display during which a left click does not close the list (milliseconds, 0-5000; default 300, 0 to disable) |
 | `[app]` | `bug_trackers` | Tracker-name patterns that get a 💥 icon |
 | `[app]` | `duck_targets` | Process names to mute while a sound plays |
 | `[redmine]` | `url`, `api_key` | Connection settings (required) |
