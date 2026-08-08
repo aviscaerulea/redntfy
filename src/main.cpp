@@ -141,6 +141,7 @@ static constexpr UINT IDM_EXCLUDE_NO_VERSION  = 40014; // バージョン未指�
 static constexpr UINT IDM_MUTE_OWN_CHANGES    = 40015; // 自分の操作による起票・更新を通知抑止するトグル（一覧・tooltip は変更しない）
 static constexpr UINT IDM_OPEN_GUIDE          = 40016; // セットアップガイド（GitHub Pages）を開く
 static constexpr UINT IDM_EXCLUDE_HIDDEN      = 40017; // 非表示チケットを一覧から除外するトグル（OFF はグレーで表示）
+static constexpr UINT IDM_HOVER_POPUP         = 40018; // ホバーで一覧を自動表示するトグル（OFF でも左クリックでは開ける）
 
 static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/redntfy";
 // セットアップガイド（GitHub Pages。docs/ 配下の内容が公開される）
@@ -226,6 +227,10 @@ static std::atomic<bool> g_excludeNoVersion{false};
 // 未処理件数・未読件数・通知は本トグルと無関係に常に非表示チケットを除外する。
 // （「見なくて良いもの」の意思表示は id 単位の g_hiddenIds 側が持ち、本トグルは見え方だけを変える）
 static std::atomic<bool> g_excludeHidden{false};
+
+// ホバーで一覧を自動表示するトグル（レジストリ永続化。既定 ON）
+// OFF は hover_delay_ms を無視してホバーでは表示しない。（左クリックでの表示は従来どおり）
+static std::atomic<bool> g_hoverPopupEnabled{true};
 
 // 自分の操作による起票・更新を通知抑止するトグル（レジストリ永続化。既定 ON）
 // deliverPollResults の 3 か所の判定（新規流入の起票者、新規流入の直近更新者、既存更新の更新者）を
@@ -2111,6 +2116,7 @@ static constexpr const wchar_t* REG_SORT_BY_DUE       = L"SortByDue";
 static constexpr const wchar_t* REG_EXCLUDE_NO_VERSION = L"ExcludeNoVersion";
 static constexpr const wchar_t* REG_MUTE_OWN_CHANGES  = L"MuteOwnChanges";
 static constexpr const wchar_t* REG_EXCLUDE_HIDDEN    = L"ExcludeHidden";
+static constexpr const wchar_t* REG_HOVER_POPUP       = L"HoverPopupEnabled";
 static constexpr const wchar_t* REG_NOTIFIED_VERSION  = L"NotifiedUpdateVersion";
 
 // Windows スタートアップ登録用レジストリ（HKCU Run キー）
@@ -3872,6 +3878,10 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_STRING | childFlags | (g_muteInMeeting ? MF_CHECKED : MF_UNCHECKED),
         IDM_MUTE_IN_MEETING, L"　　マイク/カメラ使用中は無効にする");
 
+    // ホバーで一覧を自動表示するトグル（レジストリ永続化。既定 ON。OFF でも左クリックでは開ける）
+    AppendMenuW(hMenu, MF_STRING | (g_hoverPopupEnabled ? MF_CHECKED : MF_UNCHECKED),
+        IDM_HOVER_POPUP, L"ホバーで一覧を表示");
+
     // スタートアップ登録トグル（HKCU Run キー）
     AppendMenuW(hMenu, MF_STRING | (isStartupRegistered() ? MF_CHECKED : MF_UNCHECKED),
         IDM_STARTUP, L"スタートアップ登録");
@@ -3893,13 +3903,14 @@ static void showTrayContextMenu(HWND hWnd) {
 
 // トレイアイコンホバー時のチケット一覧表示
 // 契約：IDT_HOVER_TRIGGER の発火（または hover_delay_ms = 0 の即時経路）からのみ呼ばれる。
-// 無効モード・表示中・再アーム保留中（明示クローズ後、カーソルがアイコンを離れるまで）は
-// 無反応。発火時点でカーソルがアイコン矩形内に留まっているかを再確認してから表示する。
-// （遅延中の離脱で発火した空タイマー対策）
+// 無効モード・トグル OFF（「ホバーで一覧を表示」）・表示中・再アーム保留中（明示クローズ後、
+// カーソルがアイコンを離れるまで）は無反応。発火時点でカーソルがアイコン矩形内に留まって
+// いるかを再確認してから表示する。（遅延中の離脱で発火した空タイマー対策）
 static void handleTrayHover(HWND hWnd) {
-    if (isDisabled())          return;
-    if (g_popupShowing.load()) return;
-    if (g_hoverRearmPending)   return;
+    if (isDisabled())                 return;
+    if (!g_hoverPopupEnabled.load())  return;
+    if (g_popupShowing.load())        return;
+    if (g_hoverRearmPending)          return;
 
     RECT icon;
     if (!getTrayIconRect(hWnd, icon)) return;
@@ -4030,6 +4041,14 @@ static void handleTrayCommand(UINT id) {
             g_muteInMeeting.store(!g_muteInMeeting.load());
             writeRegDword(REG_MUTE_IN_MEETING, g_muteInMeeting.load() ? 1u : 0u);
         }
+        return;
+    }
+    if (id == IDM_HOVER_POPUP) {
+        // ホバー発火のゲート 2 箇所（trayWndProc の WM_MOUSEMOVE のアーム条件と
+        // handleTrayHover の先頭ガード）に効く。KillTimer は投函済み WM_TIMER を
+        // 除去しないが、遅れて発火しても先頭ガードが止めるため OFF は直ちに効く。
+        g_hoverPopupEnabled.store(!g_hoverPopupEnabled.load());
+        writeRegDword(REG_HOVER_POPUP, g_hoverPopupEnabled.load() ? 1u : 0u);
         return;
     }
     if (id == IDM_STARTUP) {
@@ -4795,8 +4814,10 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             // ホバー検出のデバウンス：静止中は WM_MOUSEMOVE が来ないため、動くたびに
             // ワンショットタイマーを張り直せば「delay 時間静止したら表示」を判定できる。
             // hover_delay_ms = 0 は即時表示。（デバウンスなし）
-            // 表示中と再アーム保留中（明示クローズ後、アイコン離脱まで）はアームしない
-            if (!isDisabled() && !g_popupShowing.load() && !g_hoverRearmPending) {
+            // トグル OFF・表示中・再アーム保留中（明示クローズ後、アイコン離脱まで）は
+            // アームしない
+            if (!isDisabled() && g_hoverPopupEnabled.load()
+                && !g_popupShowing.load() && !g_hoverRearmPending) {
                 DWORD delay = g_hoverDelayMs.load();
                 if (delay == 0) {
                     KillTimer(hWnd, IDT_HOVER_TRIGGER);
@@ -5657,6 +5678,7 @@ int wmain() {
         g_excludeNoVersion = readRegDword(REG_EXCLUDE_NO_VERSION, 0u) != 0;
         g_muteOwnChanges   = readRegDword(REG_MUTE_OWN_CHANGES, 1u) != 0;
         g_excludeHidden    = readRegDword(REG_EXCLUDE_HIDDEN, 0u) != 0;
+        g_hoverPopupEnabled = readRegDword(REG_HOVER_POPUP, 1u) != 0;
 
         writeLog("started");
         logSchedule(cfg.schedule);
