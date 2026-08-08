@@ -70,9 +70,10 @@ If you want to tune the tracking scope yourself, create custom queries in Redmin
 Everyday operations:
 
 - Resting the cursor on the tray icon shows the open-ticket list (0.2 s by default)
-- The list closes automatically when the cursor leaves, and focus returns to the previous window
+- A list shown by hovering closes automatically when the cursor leaves, and focus returns to the previous window
 - Hover display can be turned off via "Show list on hover" in the right-click menu, and the setting persists across restarts
-- While hover display is ON, the count tooltip and left-click are disabled; when OFF, left-clicking the icon shows the list
+- Left-clicking the tray icon also shows the list, and left-clicking while it is shown closes it
+- While hover display is ON, the count tooltip is not shown
 - Left-click a row to open the ticket in the browser and mark it as read; right-click to cycle pin → hidden → normal
 - Hidden tickets are shown in gray and excluded from notifications and the pending count ("Exclude hidden tickets" in the menu removes them from the list entirely)
 - Right-click the tray icon to access the menu for instant refresh, filters, and sort orders
@@ -116,8 +117,7 @@ Switching the setting does not flood you with notifications.
 
 - Only Redmine global saved queries are supported (queries under a specific project cannot be referenced via the API)
 - Group-assignee detection covers all groups only with admin privileges; otherwise it only checks your own groups
-- Hover display does not work while the tray icon is in the hidden-icons overflow area, so the list cannot be opened
-- To work around it, pin the icon by dragging it onto the taskbar, or turn hover display off and use left-click
+- Hover display does not work while the tray icon is in the hidden-icons overflow area (left-click still opens the list)
 - The configuration file is not hot-reloaded; a restart is required to apply changes
 - If the configuration is incomplete, the app stays resident in a guidance mode without notifications (follow the tray icon and its tooltip, fix the settings, and restart)
 
