@@ -4930,7 +4930,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
 // 非表示トップレベルウィンドウを作成してトレイメッセージ受信に使用する
 // HWND_MESSAGE ではなく nullptr 親（トップレベル）にすることで WM_POWERBROADCAST を受信できる
-// 失敗時は nullptr を返す（GetLastError 込みでログを残す）。トレイ UI はこのアプリの
+// 失敗時は nullptr を返す。（GetLastError 込みでログを残す）トレイ UI はこのアプリの
 // 唯一の操作面かつ唯一の終了経路のため、呼び出し側は失敗時に常駐へ進まず終了すること。
 // （ウィンドウ無しでメッセージループに入ると、終了手段のない不可視常駐になる）
 static HWND createTrayWindow() {
@@ -4967,7 +4967,7 @@ static VOID WINAPI onNetworkChange(PVOID, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION
 // ピン留めの鮮度維持
 //
 // 取得集合に居るピンは集合側の内容で更新し、集合から外れたピン（クローズ・担当変更等）は
-// 個別取得で最新化する（集合外ピンの件数分の HTTP/ポーリング）。個別取得の失敗時（削除済み・
+// 個別取得で最新化する。（集合外ピンの件数分の HTTP/ポーリング）個別取得の失敗時（削除済み・
 // 接続エラー）は前回キャッシュの内容のまま表示を継続する。
 static void refreshPins(const std::wstring& exeDir, const Config& cfg,
                         const std::vector<Issue>& issues, const std::vector<int>& groupIds,
