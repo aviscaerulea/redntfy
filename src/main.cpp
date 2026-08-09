@@ -402,6 +402,8 @@ struct Config {
     std::vector<int> queryIds;
 
     std::vector<int>          schedule;         // 24 要素（0 時〜23 時の 1 時間あたりポーリング回数、0 で休止）
+    // 添字は JST（UTC+9）固定の時。OS のタイムゾーン設定に依存しない。
+    // 待機時間の計算とログ表示はローカル時刻基準。
     int                       listLimit;        // 一覧の非ピン表示件数（デフォルト 20。ピンと非表示は本値の予算外）
     // 一覧の行フォーマット（解析済みトークン列。既定は従来の固定並びと同一）
     std::vector<FormatToken>  listFormat;
@@ -752,7 +754,8 @@ static void logSchedule(const std::vector<int>& schedule) {
 
 // 次のポーリング予定時刻（時・分）を計算する共通ロジック
 // 60/pollsPerHour 分間隔で正時 :00 起点。次の境界が 60 分以上に達したら翌時 00 分へ繰り上げる。
-// 設定ロード側で [1, 60] にクランプ済みだが、ヘルパー単体での除算ゼロを防ぐためガードする。
+// schedule の 0 は休止時間帯を表す正規値で、pollsPerHour == 0 は 1 回/時（次の正時まで）として
+// 扱う。これは休止時間帯の待機が依存する契約であり、除算ゼロ回避の副作用ではない。
 static void calcNextPollTime(int pollsPerHour, int& outHour, int& outMin) {
     if (pollsPerHour <= 0) pollsPerHour = 1;
     SYSTEMTIME now;
@@ -1321,6 +1324,8 @@ static std::optional<toml::table> loadToml(const std::wstring& path) {
 
 // schedule 配列を TOML テーブルから読み込む（なければ nullopt）
 // 各要素は [0, 60] にクランプする。（0 = その時間帯は休止）
+// 戻り値は常に 24 要素（超過分は切り捨て、不足分は 1 で補完、非整数要素は 1 扱い）。
+// 呼び出し側は時をそのまま添字に使い範囲検査をしないため、この要素数が前提になる。
 static std::optional<std::vector<int>> readSchedule(const std::optional<toml::table>& tbl) {
     if (!tbl) return std::nullopt;
     const auto* arr = (*tbl)["app"]["schedule"].as_array();
@@ -2522,7 +2527,7 @@ cleanup:
 
 // WASAPI バッファに不可聴正弦波を書き込む
 //
-// サンプルレートがナイキスト周波数未満の場合はゼロ埋めにフォールバックする。
+// トーン周波数がナイキスト周波数（サンプルレートの半分）以上の場合はゼロ埋めにフォールバックする。
 // phase はバッファ分割供給間で位相を維持するための参照引数。
 static void fillToneBuffer(BYTE* buf, UINT32 frames,
                            const WAVEFORMATEX& wavFmt, double& phase) {
@@ -2861,7 +2866,8 @@ static void dispatchToastXml(std::wstring xml, const std::wstring& permalink,
 // Toast 通知を表示する
 //
 // OS に通知を登録して即 return する。（コールバック待機なし）
-// アプリアイコン（exe 同フォルダの app.ico）と「チケットを開く」ボタンを含む通知を表示する。
+// アプリアイコン（exe 同フォルダの app.ico）を含む通知を表示する。
+// permalink が非空かつ http(s) のときだけ「チケットを開く」ボタンが付く。空で渡すとボタンなし。
 // silent=true（デフォルト）：OS 通知音を無効化する。（アプリ側で sound.wav を鳴らすため）
 // silent=false：<audio> タグを省略し OS 標準通知音を鳴らす。
 static void showToast(const std::wstring& line1, const std::wstring& line2,
@@ -3145,8 +3151,9 @@ struct ListRow {
 // OFF なら hidden フラグ付きで通す。（グレー参考表示。フィルタは通常行と同じく適用するが、
 // list_limit の予算には数えない。枠を消費させると更新の多い非表示チケットが上位に浮上して
 // 未読の通常行を窓外へ押し出し、バッジ・未読件数から消してしまうため）
-// visible には表示フィルタを通った未処理件数（絞り込み前）を返す。ピン留めは数えない。
-// （明示の意思表示であって未処理件数ではないため、フィルタで外れたピンを件数に足し戻さない）
+// visible には表示フィルタを通った未処理件数（絞り込み前）を返す。フィルタを通ったピンは
+// 通常行と同じく数える。数えないのはフィルタで外れたピンと取得集合外のピンだけだ。
+// （ピン留めは明示の意思表示であって未処理件数ではないため、件数に足し戻さない）
 // 非表示チケットもトグルにかかわらず数えない。（「見なくて良い」の意思表示のため）
 // tooltip の未読件数も本関数の結果から数える。表示と同じ選定を通すことで「未読 N 件」と
 // 画面上の太字行数を一致させる。（一覧に出ない未読は数に出さず、バッジも点けない）
@@ -4125,8 +4132,9 @@ static void handleTrayCommand(UINT id) {
 // セグメント境界は空白位置に来ることが多いが、期限切れの件名のように本文中で分かれる場合もある。
 // 分割による字形整形の差は数 px にとどまるため受容する。
 // textRect が nullptr なら描画せず幅だけを返す。（measureIssueRow 用）
-// uniformColor=true はホット行用で、範囲の色を無視して textColor 一色で描く。
-// （ハイライト背景上の赤は読みにくい。ウェイトは幅が変わるためホット行でも維持する）
+// uniformColor=true は範囲の色を無視して textColor 一色で描く。要求元はホット行と非表示行の
+// 両方だ。（ハイライト背景上の赤は読みにくい。ウェイトは幅が変わるためホット行でも維持する）
+// 非表示行は「見なくて良い」ことを示すグレー一色を範囲色より優先する。
 static int walkIssueLabel(HDC hdc, const IssueItem& item, const RECT* textRect,
                           COLORREF textColor, HFONT baseFont, HFONT emphFont,
                           bool uniformColor) {
@@ -5735,7 +5743,8 @@ int wmain() {
 
         // 更新チェックスレッド起動（起動時に 1 回のみ実行）
         // detach しない。プロセス終了時の静的破棄と競合しないよう、シャットダウン時に join する。
-        // （HTTP タイムアウトは最大 30 秒のため、起動直後に即終了した場合のみ join が待つ）
+        // （HTTP タイムアウトは接続 15 秒＋受信 30 秒で最大約 45 秒のため、起動直後に
+        // 即終了した場合のみ join が待つ）
         if (cfg.updateCheckEnabled) {
             try {
                 updateThread = std::thread(checkForUpdates);
