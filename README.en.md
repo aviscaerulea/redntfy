@@ -6,19 +6,19 @@
 [![License](https://img.shields.io/github/license/aviscaerulea/redntfy)](LICENSE)
 [![Build](https://github.com/aviscaerulea/redntfy/actions/workflows/release.yml/badge.svg)](https://github.com/aviscaerulea/redntfy/actions/workflows/release.yml)
 
-A lightweight resident app that notifies you of Redmine ticket updates via Windows toast notifications and lets you browse your open tickets from the system tray.
+A lightweight resident app that notifies you of Redmine ticket updates via Windows notifications and lets you browse your open tickets from the system tray.
 
 ## Features
 
-- Starts tracking tickets assigned to you with just a URL and an API key; polls on a schedule and shows toast notifications for new or updated tickets
-- Notification targets are freely adjustable via Redmine saved queries (query_ids)
+- Starts tracking tickets assigned to you with just a URL and an API key; polls on a schedule and shows Windows notifications for new or updated tickets
+- Notification targets are freely adjustable via Redmine custom queries (query_ids)
 - Displays an open-ticket list from the tray, formatted with icons for due dates, assignees, and projects
 - The list appears just by hovering, and never steals focus, so it does not interrupt your typing
 - The order and items of each list row are fully customizable via placeholders in the configuration
 - Pins keep important tickets in the list (they stay even after being closed)
 - Tickets you do not need to watch can be hidden, excluding them from notifications and the pending count
 - Instant refresh, filters, and sort orders are available from the tray menu
-- Notification sounds are loudness-normalized, and auto-muted while a microphone or camera is in use (e.g. during meetings)
+- Notification sounds are loudness-normalized, and silenced while a microphone or camera is in use, i.e. during meetings (toggleable from the menu)
 - Checks GitHub Releases for a newer version at startup
 - Lightweight: about 7 MB of physical memory while resident
 
@@ -63,20 +63,10 @@ That is all it takes — the app starts tracking open tickets assigned to you (a
 If you want to tune the tracking scope yourself, create custom queries in Redmine and set `query_ids`.
 
 1. In Redmine, filter the issue list **without specifying a project** and save it as a custom query
-   - Queries saved under a specific project cannot be referenced via the API, so they must be created as global queries
+   - Queries saved under a specific project cannot be referenced via the API, so they must be created as global custom queries
 2. Take note of `N` in the resulting URL `/issues?query_id=N` (one per query if you track multiple)
 3. Add `query_ids = [12, 34]` to `redntfy.local.toml`
 4. Restart `redntfy.exe`
-
-Everyday operations:
-
-- Rest the cursor on the tray icon (0.1 s by default) or left-click it to show the open-ticket list
-- Hover auto-display can be turned off via "マウスホバーで一覧を自動表示" (Auto-show list on hover) in the menu (left-clicking always opens the list)
-- The list closes automatically when the cursor leaves both the icon and the list (left-clicking the icon also closes it, except within 0.3 s right after a hover-triggered display)
-- The pending count is shown in the list footer, and the red badge on the icon indicates unread tickets
-- Left-click a row to open the ticket in the browser and mark it as read; right-click to cycle pin → hidden → normal
-- Hidden tickets are shown in gray and excluded from notifications and the pending count ("Exclude hidden tickets" in the menu removes them from the list entirely)
-- Right-click the tray icon to access the menu for instant refresh, filters, and sort orders
 
 ## Configuration
 
@@ -88,15 +78,15 @@ The main configuration keys are listed below. See the comments in `redntfy.toml`
 
 | Section | Key | Description |
 | --- | --- | --- |
-| `[app]` | `schedule` | Polls per hour for each of the 24 hours |
+| `[app]` | `schedule` | Polls per hour for each hour of the day (array of 24 values; 0 pauses polling) |
 | `[app]` | `list_limit` | Number of rows in the list (default 20) |
 | `[app]` | `list_format` | Row format of the list (placeholder based) |
 | `[app]` | `hover_delay_ms` | Delay before the list appears on hover (milliseconds, 0-5000; default 100, 0 for immediate) |
 | `[app]` | `hover_click_guard_ms` | Grace period after a hover-triggered display during which a left click does not close the list (milliseconds, 0-5000; default 300, 0 to disable) |
 | `[app]` | `bug_trackers` | Tracker-name patterns that get a 💥 icon |
-| `[app]` | `duck_targets` | Process names to mute while a sound plays |
+| `[app]` | `duck_targets` | Other apps' process names to mute while the notification sound plays |
 | `[redmine]` | `url`, `api_key` | Connection settings (required) |
-| `[redmine]` | `query_ids` | Saved-query ids to track (if omitted, tracks tickets assigned to you) |
+| `[redmine]` | `query_ids` | Custom-query ids to track (if omitted, tracks tickets assigned to you) |
 | `[loudness]` | `enabled`, `target` | Loudness normalization for the notification sound |
 | `[update]` | `enabled` | Update check at startup |
 
@@ -106,17 +96,17 @@ The main configuration keys are listed below. See the comments in `redntfy.toml`
 
 | Aspect | Set | Not set |
 | --- | --- | --- |
-| Tracked tickets | Union of the specified saved queries | Open tickets assigned to you (and your groups) |
+| Tracked tickets | Union of the specified custom queries | Open tickets assigned to you (and your groups) |
 | Preparation | Requires creating custom queries in Redmine | Works with just `url` and `api_key` |
 | Scope tuning | Freely adjustable via query filters | Fixed (no filtering) |
-| Screen opened from notifications/list | The first query's issue list | The issue list filtered by assignee = me |
+| Redmine screen opened from notifications/list | The first query's issue list | The issue list filtered by assignee = me |
 
 A good way to start is without `query_ids`, then create custom queries and set it once you want to tune the tracking scope.
 Switching the setting does not flood you with notifications.
 
 ## Limitations
 
-- Only Redmine global saved queries are supported (queries under a specific project cannot be referenced via the API)
+- Only Redmine global custom queries are supported (queries under a specific project cannot be referenced via the API)
 - Group-assignee detection covers all groups only with admin privileges; otherwise it only checks your own groups
 - An icon in the hidden-icons overflow area cannot be opened by hover (left-click still works)
 - The configuration file is not hot-reloaded; a restart is required to apply changes
