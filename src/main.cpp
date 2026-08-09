@@ -2543,7 +2543,7 @@ static void fillToneBuffer(BYTE* buf, UINT32 frames,
 
 // g_wavCache のノーマライズ済み PCM データを WASAPI 共有モードで再生する
 //
-// 再生フロー（guardEnabled が true の場合）:
+// 再生フロー（ガードトーン長 tone_ms が 0 より大きい場合）:
 //   ガードトーン（リードイン） → 通知音（チャイム）→ ガードトーン（リードアウト）
 // g_wavCache.valid == false（sound.wav なし）の場合は何もしない。
 // WASAPI 共有モードで再生するため、OS のオーディオエンジンがリサンプリングを自動処理する。
@@ -2712,7 +2712,7 @@ static DWORD WINAPI soundThread(LPVOID param) {
 
 // WASAPI で通知音（16bit PCM WAV）を再生する
 //
-// 再生フロー（guard.enabled が true の場合）:
+// 再生フロー（ガードトーン長 tone_ms が 0 より大きい場合）:
 //   ガードトーン（リードイン）→ 通知音（チャイム）→ ガードトーン（リードアウト）
 // g_wavCache.valid == false の場合は音声を再生せずに終了する。（Toast 通知は呼び出し側で別途表示）
 // ダッキング: cfg.duckTargets に指定されたプロセスを再生中ミュートし、全再生完了後に復元する。
