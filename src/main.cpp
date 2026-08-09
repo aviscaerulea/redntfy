@@ -4576,7 +4576,7 @@ static void showListPopup(HWND trayWnd) {
             ++idx;
         }
         g_listFooterText = L"未処理 " + std::to_wstring(visible)
-            + L" 件（クリックでウェブ表示 ／ 右クリックでピン留め・非表示）";
+            + L" 件（クリックでブラウザ表示 ／ 右クリックでピン留め・非表示）";
         width = (std::max)(width, textRowWidth(g_listFooterText.c_str()));
         pushRow(ListRowKind::Separator, 9, 0);  // メニューのセパレータ相当（余白込み）
         pushRow(ListRowKind::Footer, textRowHeight, 0);
