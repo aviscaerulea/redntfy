@@ -4264,6 +4264,15 @@ static void drawIssueRow(HDC hdc, const RECT& rcItem, const IssueItem& item, boo
 
 static constexpr wchar_t LIST_WND_CLASS[] = L"redntfy_list";
 
+// 一覧ポップアップのウィンドウスタイル（CreateWindowExW と AdjustWindowRectEx で共有する）
+// 3 箇所で食い違うと枠サイズと実ウィンドウのレイアウトがずれるため 1 箇所に集約する。
+// WS_POPUP | WS_BORDER：メニュー相当の枠付きポップアップ。
+// WS_EX_NOACTIVATE：表示・クリックでもフォアグラウンドを奪わない（本ウィンドウの核）。
+// WS_EX_TOOLWINDOW：タスクバー・Alt+Tab に出さない。
+// WS_EX_TOPMOST：タスクバー近傍でも手前に出す。
+static constexpr DWORD LIST_WND_STYLE   = WS_POPUP | WS_BORDER;
+static constexpr DWORD LIST_WND_EXSTYLE = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+
 // 一覧の行種別と配置（クライアント座標）。表示のたびに構築する
 enum class ListRowKind { Issue, Separator, Footer, Empty };
 struct ListRowLayout {
@@ -4460,8 +4469,8 @@ static HWND ensureListWindow() {
         writeLog("list: RegisterClassExW failed: " + std::to_string(GetLastError()));
         return nullptr;
     }
-    g_listWnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-        LIST_WND_CLASS, nullptr, WS_POPUP | WS_BORDER,
+    g_listWnd = CreateWindowExW(LIST_WND_EXSTYLE,
+        LIST_WND_CLASS, nullptr, LIST_WND_STYLE,
         0, 0, 0, 0, g_hWnd, nullptr, wc.hInstance, nullptr);
     if (!g_listWnd)
         writeLog("list: CreateWindowExW failed: " + std::to_string(GetLastError()));
@@ -4511,8 +4520,7 @@ static void showListPopup(HWND trayWnd) {
         GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &mi) != FALSE;
     // WS_BORDER の枠を差し引いたクライアント高の上限（取得失敗時は打ち切りなし）
     RECT frame = { 0, 0, 0, 0 };
-    AdjustWindowRectEx(&frame, WS_POPUP | WS_BORDER, FALSE,
-        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST);
+    AdjustWindowRectEx(&frame, LIST_WND_STYLE, FALSE, LIST_WND_EXSTYLE);
     const int maxClientH = haveMi
         ? static_cast<int>(mi.rcWork.bottom - mi.rcWork.top) - (frame.bottom - frame.top)
         : INT_MAX;
@@ -4573,8 +4581,7 @@ static void showListPopup(HWND trayWnd) {
 
     // クライアントサイズ → ウィンドウサイズ（WS_BORDER の枠分を上乗せ）
     RECT wr = { 0, 0, width, y };
-    AdjustWindowRectEx(&wr, WS_POPUP | WS_BORDER, FALSE,
-        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST);
+    AdjustWindowRectEx(&wr, LIST_WND_STYLE, FALSE, LIST_WND_EXSTYLE);
     const int w = wr.right - wr.left;
     const int h = wr.bottom - wr.top;
 
