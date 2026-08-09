@@ -65,7 +65,8 @@ If you want to tune the tracking scope yourself, create custom queries in Redmin
 1. In Redmine, filter the issue list **without specifying a project** and save it as a custom query
    - Queries saved under a specific project cannot be referenced via the API, so they must be created as global queries
 2. Take note of `N` in the resulting URL `/issues?query_id=N` (one per query if you track multiple)
-3. Add `query_ids = [12, 34]` to `redntfy.local.toml` and restart
+3. Add `query_ids = [12, 34]` to `redntfy.local.toml`
+4. Restart `redntfy.exe`
 
 Everyday operations:
 

@@ -13,7 +13,7 @@ Redmine の更新チケットを Windows Toast 通知で知らせ、未処理チ
 - URL と API キーだけで自分の担当チケットの追跡を開始でき、定期チェックで新着や更新を Toast 通知
 - 通知対象は Redmine のカスタムクエリ（query_ids）で自由に調整可能
 - タスクトレイから未処理チケット一覧を表示し、期日、担当、プロジェクトをアイコンで整形
-- 一覧はカーソルを乗せるだけで表示され、フォーカスを奪わないため作業中の入力を妨げない
+- 一覧はカーソルを乗せるだけで開き、フォーカスを奪わないため作業中の入力を妨げない
 - 一覧の行の並びや表示項目は設定のプレースホルダ指定で自由にカスタマイズ可能
 - 気になるチケットはピン留めで一覧に固定（クローズしても消えない）
 - 見なくて良いチケットは非表示にして、通知と未処理件数から除外
@@ -31,14 +31,14 @@ Redmine の更新チケットを Windows Toast 通知で知らせ、未処理チ
 
 ### 手順
 
-Scoop を使う場合の手順です。
+Scoop での導入手順です。
 
 ```powershell
 scoop bucket add aviscaerulea https://github.com/aviscaerulea/scoop-bucket
 scoop install redntfy
 ```
 
-zip から手動で導入する場合、[Releases](https://github.com/aviscaerulea/redntfy/releases/latest) から zip をダウンロードし、任意のフォルダに展開して `redntfy.exe` を実行してください。
+zip から手動で導入するときは、[Releases](https://github.com/aviscaerulea/redntfy/releases/latest) から zip をダウンロードしてください。次に任意のフォルダへ展開します。最後に `redntfy.exe` を実行します。
 
 ## 使い方
 
@@ -46,7 +46,7 @@ zip から手動で導入する場合、[Releases](https://github.com/aviscaerul
 画像付きの詳しい手順は [セットアップガイド](https://aviscaerulea.github.io/redntfy/) を参照してください。
 
 1. Redmine の「個人設定」→「API アクセスキー」でキーを取得する
-2. `redntfy.exe` と同じフォルダに `redntfy.local.toml` を作成し、接続情報を記載する
+2. `redntfy.exe` と同じフォルダに、接続情報を書いた `redntfy.local.toml` を作成する
 
    ```toml
    [redmine]
@@ -61,10 +61,11 @@ zip から手動で導入する場合、[Releases](https://github.com/aviscaerul
 これだけで、自分（と所属グループ）が担当のオープンチケットの追跡が始まります。
 追跡範囲を自分で調整したいときは、Redmine のカスタムクエリを作成して `query_ids` を設定します。
 
-1. Redmine で **プロジェクトを指定せず** にチケット一覧を絞り込み、カスタムクエリとして保存する
+1. Redmine で **プロジェクトを指定せず** に絞り込んだチケット一覧を、カスタムクエリとして保存する
    - 特定プロジェクト配下で保存したクエリは API から参照できないため、必ずグローバルクエリとして作成する
 2. 保存後の URL `/issues?query_id=N` の `N` を控える（複数クエリを追跡するなら各クエリ分）
-3. `redntfy.local.toml` に `query_ids = [12, 34]` の形式で追記して再起動する
+3. `redntfy.local.toml` に `query_ids = [12, 34]` の形式で追記する
+4. `redntfy.exe` を再起動する
 
 起動後の日常操作は以下のとおりです。
 
@@ -79,8 +80,8 @@ zip から手動で導入する場合、[Releases](https://github.com/aviscaerul
 ## 設定
 
 動作設定は `redntfy.exe` と同じフォルダの `redntfy.toml` に記載します。
-`redntfy.local.toml` を置くとキー単位で上書きされ、接続情報の分離や環境毎の差分管理に使えます。
-検知済み状態は `state.json`、ピン留めは `pins.json`、非表示チケットは `hidden.json` に保存され、再起動後も保持されます。
+`redntfy.local.toml` を置くとキー単位で上書きでき、接続情報の分離や環境ごとの差分管理に使えます。
+検知済み状態は `state.json`、ピン留めは `pins.json`、非表示チケットは `hidden.json` に保存し、再起動後も保持します。
 
 主要な設定項目は以下のとおりです。詳細は `redntfy.toml` のコメントを参照してください。
 
