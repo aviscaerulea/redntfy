@@ -8,16 +8,30 @@
 
 A lightweight resident app that notifies you of Redmine ticket updates via Windows notifications and lets you browse your open tickets from the system tray.
 
+Its main features are notifications for new or updated tickets and the open-ticket list opened from the tray icon.
+
+Measured physical memory usage is about 7 MB.
+
 ## Features
 
-- Starts tracking tickets assigned to you with just a URL and an API key; polls on a schedule and shows Windows notifications for new or updated tickets
-- Notification targets are freely adjustable via Redmine custom queries (query_ids)
-- Displays an open-ticket list from the tray, formatted with icons for due dates, assignees, and projects
-- The order and items of each list row are fully customizable via placeholders in the configuration
-- Pins keep important tickets in the list (they stay even after being closed)
-- Tickets you do not need to watch can be hidden, excluding them from notifications and the pending count
-- Instant refresh, filters, and sort orders are available from the tray menu
-- Lightweight: about 7 MB of physical memory while resident
+- Ticket notifications: polls Redmine and notifies you of new or updated tickets, via Windows notification and sound
+- System tray: view the open-ticket list and change settings from the tray icon
+  - List format: the order and items of each row can be specified with placeholders
+  - Pins: keep important tickets in the list (they stay even after being closed)
+  - Hiding: excludes tickets you do not need to watch from notifications and the pending count
+  - Browser display: clicking a row or the footer opens it in the browser
+- Tracking scope: notification targets are adjustable via Redmine custom queries (query_ids)
+- Zero-configuration start: tracks tickets assigned to you and your groups with just a URL and an API key
+
+### System tray
+
+The tray icon shows a red badge in the bottom-right corner when there are unread tickets. Keeping the cursor on the icon opens the same open-ticket list as a left click. Hover display can be toggled with "マウスホバーで一覧を自動表示" (Auto-show list on hover) in the tray menu.
+
+The open-ticket list never takes focus, so it does not interrupt typing in the window you were using. It closes automatically when the cursor leaves both the icon and the list, and a left click toggles it open or closed. The list is mouse-only and cannot be operated with the keyboard.
+
+Each row of the list shows the due date, assignee, project, and time since the last update, with icons. Unread tickets are shown in bold, and the pending count appears in the footer. Clicking a row opens the ticket in the browser and marks it as read, and right-clicking a row cycles through pinned, hidden, and normal.
+
+Right-clicking the tray icon opens the tray menu, which provides various settings.
 
 ## Installation
 
