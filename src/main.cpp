@@ -4271,7 +4271,7 @@ static constexpr wchar_t LIST_WND_CLASS[] = L"redntfy_list";
 // 一覧ポップアップのウィンドウスタイル（CreateWindowExW と AdjustWindowRectEx で共有する）
 // 3 箇所で食い違うと枠サイズと実ウィンドウのレイアウトがずれるため 1 箇所に集約する。
 // WS_POPUP | WS_BORDER：メニュー相当の枠付きポップアップ。
-// WS_EX_NOACTIVATE：表示・クリックでもフォアグラウンドを奪わない（本ウィンドウの核）。
+// WS_EX_NOACTIVATE：表示・クリックでもフォアグラウンドを奪わない。（本ウィンドウの核）
 // WS_EX_TOOLWINDOW：タスクバー・Alt+Tab に出さない。
 // WS_EX_TOPMOST：タスクバー近傍でも手前に出す。
 static constexpr DWORD LIST_WND_STYLE   = WS_POPUP | WS_BORDER;
