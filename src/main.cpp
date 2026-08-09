@@ -361,6 +361,10 @@ struct PinEntry {
     bool isBugTracker    = false;  // バグ・障害トラッカー（💥 マーカー。集合外ピンも表示できるよう永続化）
     std::string updaterDisplay;    // 最終更新者の表示名（姓。集合外ピンも表示できるよう永続化）
     std::string updaterFirst;      // 最終更新者の名（{firstname} 用。集合外ピンも表示できるよう永続化）
+
+    // 全フィールドの一致で等価とする（refreshPins の変更検知が使う）
+    // 既定実装にする理由は、フィールド追加時に比較の追記漏れで更新が黙って捨てられるのを防ぐため。
+    bool operator==(const PinEntry&) const = default;
 };
 
 // 一覧行フォーマットの要素種別（FormatToken::element の値）
@@ -5019,34 +5023,29 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
             fetched.assignedToGroup = isGroupAssignee(groupIds, fetched.assignedToId);
             src = &fetched;
         }
-        // 判定集合が未解決の間はグループフラグを比較・更新しない。空集合との突合結果（全 false）で
-        // 保存済みの true を書き戻してしまうため。（解決後のポーリングで追いつく）
-        bool groupChanged = src && groupIdsResolved
-            && p.assignedToGroup != src->assignedToGroup;
-        // 最終更新者は src 側で確定している場合だけ比較・更新する。集合外ピンの個別取得
+        if (!src) continue;
+        // 反映後の姿を候補として組み、元の値と 1 回だけ比較する。（変更検知と反映の列挙を一元化）
+        PinEntry candidate = p;
+        candidate.subject     = src->subject;
+        // project は journals と違って include 不要で常に含まれるため、updaterDisplay の
+        // ような「非空のときだけ更新」ガードは要らない。（別プロジェクトへの移動を追随する）
+        candidate.projectName = src->projectName;
+        candidate.updatedOn   = src->updatedOn;
+        candidate.closed      = src->closed;
+        candidate.dueDate     = src->dueDate;
+        // トラッカー判定は設定との照合だけで決まり、グループ判定のような未解決状態がない
+        candidate.isBugTracker = src->isBugTracker;
+        // 判定集合が未解決の間はグループフラグを書き込まない。空集合との突合結果（全 false）で
+        // 保存済みの true を潰してしまうため。（解決後のポーリングで追いつく）
+        if (groupIdsResolved) candidate.assignedToGroup = src->assignedToGroup;
+        // 最終更新者は src 側で確定している場合だけ書き込む。集合外ピンの個別取得
         // （fetchIssue）は journals を含まず updaterDisplay が空のため、保存済みの値を保つ
-        bool updaterChanged = src && !src->updaterDisplay.empty()
-            && (p.updaterDisplay != src->updaterDisplay
-                || p.updaterFirst != src->updaterFirstName);
-        if (src && (p.subject != src->subject || p.updatedOn != src->updatedOn
-                    || p.closed != src->closed || p.dueDate != src->dueDate
-                    || p.projectName != src->projectName
-                    || p.isBugTracker != src->isBugTracker
-                    || groupChanged || updaterChanged)) {
-            p.subject     = src->subject;
-            // project は journals と違って include 不要で常に含まれるため、updaterDisplay の
-            // ような「非空のときだけ更新」ガードは要らない。（別プロジェクトへの移動を追随する）
-            p.projectName = src->projectName;
-            p.updatedOn   = src->updatedOn;
-            p.closed      = src->closed;
-            p.dueDate     = src->dueDate;
-            // トラッカー判定は設定との照合だけで決まり、グループ判定のような未解決状態がない
-            p.isBugTracker  = src->isBugTracker;
-            if (groupIdsResolved) p.assignedToGroup = src->assignedToGroup;
-            if (!src->updaterDisplay.empty()) {
-                p.updaterDisplay = src->updaterDisplay;
-                p.updaterFirst   = src->updaterFirstName;
-            }
+        if (!src->updaterDisplay.empty()) {
+            candidate.updaterDisplay = src->updaterDisplay;
+            candidate.updaterFirst   = src->updaterFirstName;
+        }
+        if (candidate != p) {
+            p       = candidate;
             changed = true;
         }
     }
