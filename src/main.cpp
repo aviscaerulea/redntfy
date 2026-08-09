@@ -3889,7 +3889,7 @@ static void showTrayContextMenu(HWND hWnd) {
 
     // ホバーで一覧を自動表示するトグル（レジストリ永続化。既定 ON。OFF でも左クリックでは開ける）
     AppendMenuW(hMenu, MF_STRING | (g_hoverPopupEnabled ? MF_CHECKED : MF_UNCHECKED),
-        IDM_HOVER_POPUP, L"ホバーで一覧を表示");
+        IDM_HOVER_POPUP, L"マウスホバーで一覧を自動表示");
 
     // スタートアップ登録トグル（HKCU Run キー）
     AppendMenuW(hMenu, MF_STRING | (isStartupRegistered() ? MF_CHECKED : MF_UNCHECKED),
@@ -3912,7 +3912,7 @@ static void showTrayContextMenu(HWND hWnd) {
 
 // トレイアイコンホバー時のチケット一覧表示
 // 契約：IDT_HOVER_TRIGGER の発火（または hover_delay_ms = 0 の即時経路）からのみ呼ばれる。
-// 無効モード・トグル OFF（「ホバーで一覧を表示」）・表示中・再アーム保留中（明示クローズ後、
+// 無効モード・トグル OFF（「マウスホバーで一覧を自動表示」）・表示中・再アーム保留中（明示クローズ後、
 // カーソルがアイコンを離れるまで）は無反応。発火時点でカーソルがアイコン矩形内に留まって
 // いるかを再確認してから表示する。（遅延中の離脱で発火した空タイマー対策）
 static void handleTrayHover(HWND hWnd) {
