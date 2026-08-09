@@ -391,7 +391,7 @@ struct Config {
     std::vector<int> queryIds;
 
     std::vector<int>          schedule;         // 24 要素（0 時〜23 時の 1 時間あたりポーリング回数、0 で休止）
-    int                       listLimit;        // 一覧の非ピン表示件数（デフォルト 20）
+    int                       listLimit;        // 一覧の非ピン表示件数（デフォルト 20。ピンと非表示は本値の予算外）
     // 一覧の行フォーマット（解析済みトークン列。既定は従来の固定並びと同一）
     std::vector<FormatToken>  listFormat;
     // 💥 を付けるトラッカー名（* のワイルドカード可。既定は空＝どのチケットにも付けない）
