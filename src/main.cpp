@@ -5736,13 +5736,16 @@ int wmain() {
         // CancelMibChangeNotify2 は実行中コールバックの完了を待ってリターンするため UAF は発生しない（MSDN 保証）
         if (hNetNotify) CancelMibChangeNotify2(hNetNotify);
 
-        // バックグラウンドスレッドを停止（waitInterruptible が 100 ms 単位でフラグを監視している）
-        // 無効モード起動時はスレッド未起動のため joinable で判定する
-        if (pollThread.joinable()) pollThread.join();
-
         // ループ終了後のクリーンアップ
         WTSUnRegisterSessionNotification(g_hWnd);
         removeTrayIcon(g_hWnd);
+
+        // ポーリングスレッドを停止（waitInterruptible が 100 ms 単位でフラグを監視している）
+        // 無効モード起動時はスレッド未起動のため joinable で判定する。
+        // トレイアイコン削除より後に置き、ユーザから見た終了は即座に完了させる。
+        // ただし PostMessage(g_hWnd, ...) を発火し得るため DestroyWindow より前で必ず join する。
+        if (pollThread.joinable()) pollThread.join();
+
         DestroyWindow(g_hWnd);
         g_hWnd = nullptr;  // 破棄済みハンドルの再利用を防ぐ（catch の後始末ガードが誤発火しないため）
 
