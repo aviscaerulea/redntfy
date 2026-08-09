@@ -23,7 +23,7 @@ A sister tool, [gcalntfy](https://github.com/aviscaerulea/gcalntfy), notifies yo
   - Pins: keep important tickets in the list (they stay even after being closed)
   - Hiding: excludes tickets you do not need to watch from notifications and the pending count
   - Browser display: clicking a row or the footer opens it in the browser
-- Narrowing the target: Redmine custom queries (query_ids) select which tickets are notified and listed
+- Narrowing the target: Redmine custom queries (one or more) freely choose which tickets are notified and listed
 - Zero-configuration start: targets tickets assigned to you and your groups with just a URL and an API access key
 
 ### System tray
