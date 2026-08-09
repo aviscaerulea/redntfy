@@ -816,6 +816,12 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return "";
+    // タイムアウト値（名前解決・接続・送信・受信の順、単位はミリ秒）
+    // 名前解決の 0 は無制限を意味する。（タイムアウトの無効ではなく待ち続ける設定）
+    // 既定値から変更しているのは接続の 15 秒のみで、送信・受信は既定の 30 秒をそのまま指定する。
+    // 既定の接続 60 秒はトレイ常駐アプリのポーリング周期に対して長すぎるため短縮した。
+    // 受信の 30 秒は読み取り 1 回ごとに適用されるため、応答全体の受信にかかる
+    // 合計待ち時間には上限がない。（巨大な応答や細切れの応答では 30 秒を超えて待つ）
     WinHttpSetTimeouts(hSession, 0, 15000, 30000, 30000);
 
     URL_COMPONENTS uc = {};
