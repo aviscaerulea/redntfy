@@ -4,9 +4,12 @@
 param([string]$Version = "0.0.0", [switch]$Release, [switch]$Test)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
+# 先頭の v を除去する。呼び出し元の Taskfile は既に剥がしているが、手動実行やタグ名の直渡しに
+# 備える。v が残ると後段の major.minor.patch 抽出が不成立で VERSIONINFO が 0,0,0,0 に落ち、
+# UI 側が前置する v と二重化する。
 $Version = $Version -replace '^v', ''
 
-# vcpkg パス設定（VCPKG_INSTALLATION_ROOT 環境変数 → Scoop シム の優先順）
+# vcpkg パス設定（VCPKG_INSTALLATION_ROOT 環境変数 → Scoop シムの優先順）
 if ($env:VCPKG_INSTALLATION_ROOT) {
     $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
 }
@@ -40,6 +43,8 @@ $devShellDll = Join-Path $vsPath "Common7\Tools\Microsoft.VisualStudio.DevShell.
 Import-Module $devShellDll
 Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments "-arch=x64"
 
+# out\version.h は APP_VERSION を供給する生成物で、src/main.cpp を include するテスト exe も
+# 必要とする。そのため -Test の早期 exit より前に生成する。
 "#define APP_VERSION L`"$Version`"" | Set-Content -Encoding UTF8NoBOM out\version.h
 
 # 単体テストのビルド（-Test 時のみ。rc は不要で、最適化なしでコンパイル時間を優先する）
