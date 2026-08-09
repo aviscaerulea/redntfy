@@ -726,7 +726,7 @@ static void writeLog(const std::string& msg) {
     CloseHandle(hFile);
 }
 
-// schedule 配列と1日の概算ポーリング回数をログ出力する
+// schedule 配列と 1 日の概算ポーリング回数をログ出力する
 static void logSchedule(const std::vector<int>& schedule) {
     int total = 0;
     std::string s = "schedule: [";
