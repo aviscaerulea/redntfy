@@ -427,7 +427,7 @@ struct WavCache {
 };
 static WavCache g_wavCache;
 
-// ポーリングスレッド → WndProc スレッド: チケット一覧の受け渡し（g_mtx で保護）
+// ポーリングスレッド → WndProc スレッド：チケット一覧の受け渡し（g_mtx で保護）
 static std::mutex              g_mtx;
 static std::vector<Issue>      g_issues;   // updated_on 降順ソート済み
 static std::vector<PinEntry>   g_pins;     // ピン留め（g_mtx で保護。上限なし）
@@ -2543,7 +2543,7 @@ static void fillToneBuffer(BYTE* buf, UINT32 frames,
 
 // g_wavCache のノーマライズ済み PCM データを WASAPI 共有モードで再生する
 //
-// 再生フロー（ガードトーン長 tone_ms が 0 より大きい場合）:
+// 再生フロー（ガードトーン長 tone_ms が 0 より大きい場合）：
 //   ガードトーン（リードイン） → 通知音（チャイム）→ ガードトーン（リードアウト）
 // g_wavCache.valid == false（sound.wav なし）の場合は何もしない。
 // WASAPI 共有モードで再生するため、OS のオーディオエンジンがリサンプリングを自動処理する。
@@ -2712,10 +2712,10 @@ static DWORD WINAPI soundThread(LPVOID param) {
 
 // WASAPI で通知音（16bit PCM WAV）を再生する
 //
-// 再生フロー（ガードトーン長 tone_ms が 0 より大きい場合）:
+// 再生フロー（ガードトーン長 tone_ms が 0 より大きい場合）：
 //   ガードトーン（リードイン）→ 通知音（チャイム）→ ガードトーン（リードアウト）
 // g_wavCache.valid == false の場合は音声を再生せずに終了する。（Toast 通知は呼び出し側で別途表示）
-// ダッキング: cfg.duckTargets に指定されたプロセスを再生中ミュートし、全再生完了後に復元する。
+// ダッキング：cfg.duckTargets に指定されたプロセスを再生中ミュートし、全再生完了後に復元する。
 static void launchSound(const Config& cfg) {
     if (!g_wavCache.valid) {
         writeLog("launchSound: sound.wav not loaded, skipping sound");
@@ -2850,8 +2850,8 @@ static void dispatchToastXml(std::wstring xml, const std::wstring& permalink,
 //
 // OS に通知を登録して即 return する。（コールバック待機なし）
 // アプリアイコン（exe 同フォルダの app.ico）と「チケットを開く」ボタンを含む通知を表示する。
-// silent=true（デフォルト）: OS 通知音を無効化する。（アプリ側で sound.wav を鳴らすため）
-// silent=false: <audio> タグを省略し OS 標準通知音を鳴らす。
+// silent=true（デフォルト）：OS 通知音を無効化する。（アプリ側で sound.wav を鳴らすため）
+// silent=false：<audio> タグを省略し OS 標準通知音を鳴らす。
 static void showToast(const std::wstring& line1, const std::wstring& line2,
                       const std::wstring& permalink, bool silent = true)
 {
@@ -4913,7 +4913,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         PostQuitMessage(0);
         return 0;
     }
-    // スリープ復帰・ロック解除: 即時ポーリングをトリガー
+    // スリープ復帰・ロック解除：即時ポーリングをトリガー
     if ((msg == WM_POWERBROADCAST && wParam == PBT_APMRESUMEAUTOMATIC) ||
         (msg == WM_WTSSESSION_CHANGE && wParam == WTS_SESSION_UNLOCK)) {
         g_forcePoll.store(true);
