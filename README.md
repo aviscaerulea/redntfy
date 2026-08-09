@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/github/license/aviscaerulea/redntfy)](LICENSE)
 [![Build](https://github.com/aviscaerulea/redntfy/actions/workflows/release.yml/badge.svg)](https://github.com/aviscaerulea/redntfy/actions/workflows/release.yml)
 
-Redmine の更新チケットを Windows の通知で知らせ、未処理チケットをタスクトレイから一覧できる軽量常駐アプリです。
+タスクトレイから Redmine チケットの通知と一覧表示を行う軽量常駐アプリです。
 
 主な機能は、チケットの新着や更新を知らせる通知と、トレイアイコンから開く未処理チケット一覧の表示です。
 通知と一覧の対象は、Redmine のカスタムクエリで自由に絞り込めます。

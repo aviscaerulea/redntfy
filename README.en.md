@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/github/license/aviscaerulea/redntfy)](LICENSE)
 [![Build](https://github.com/aviscaerulea/redntfy/actions/workflows/release.yml/badge.svg)](https://github.com/aviscaerulea/redntfy/actions/workflows/release.yml)
 
-A lightweight resident app that notifies you of Redmine ticket updates via Windows notifications and lets you browse your open tickets from the system tray.
+A lightweight resident app that delivers Redmine ticket notifications and an issue list from the system tray.
 
 Its main features are notifications for new or updated tickets and the open-ticket list opened from the tray icon.
 Which tickets are notified and listed can be narrowed freely with Redmine custom queries.
