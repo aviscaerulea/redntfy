@@ -642,7 +642,7 @@ static std::string nowUtcIso() {
 }
 
 // Toast XML の特殊文字をエスケープし、XML 1.0 が禁じる C0 制御文字を除去する
-// 除去対象は 0x00〜0x1F のうち tab (0x09)・LF (0x0A)・CR (0x0D) を除く文字。
+// 除去対象は 0x00〜0x1F のうち tab（0x09）・LF（0x0A）・CR（0x0D）を除く文字。
 // 混入すると Toast XML パース失敗で通知全体が出なくなるため、ここで無音で落とす。
 static std::wstring escapeXml(const std::wstring& s) {
     std::wstring r;
