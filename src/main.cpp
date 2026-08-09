@@ -4530,7 +4530,14 @@ static void showListPopup(HWND trayWnd) {
         : INT_MAX;
 
     // 行レイアウトの構築と全体サイズの計測
+    // GetDC 失敗（GDI ハンドル枯渇）時は一覧を出さずに諦める。以降の計測が全滅し、
+    // パディングの下駄だけが残った幅 20px・行高 6px の判読不能な極小ウィンドウが出るためだ。
+    // 次のホバー・左クリックで再試行するので操作は失われない。
     HDC hdc = GetDC(hWnd);
+    if (!hdc) {
+        writeLog("list: GetDC failed; popup skipped");
+        return;
+    }
     int width = 0;
     int y     = 0;
     auto pushRow = [&](ListRowKind kind, int h, size_t index) {
