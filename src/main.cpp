@@ -2868,7 +2868,7 @@ static void showToast(const std::wstring& line1, const std::wstring& line2,
     dispatchToastXml(std::move(xml), permalink);
 }
 
-// 3 行 Toast 通知を表示する（更新チェックの新版通知、「今すぐ更新」の完了通知、無効モードの案内用）
+// 3 行 Toast 通知を表示する（更新チェックの新版通知、無効モードの案内用）
 //
 // line1 を title スタイル（太字大）で表示する。
 // silent=true（デフォルト false）で OS 通知音を無効化する。
@@ -5290,18 +5290,15 @@ static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
 
 // 「今すぐ更新」の完了 Toast
 //
-// 明示のユーザ操作に対し、再取得が終わった時点を知らせる。（完了が分からない問題への対処）
+// 明示のユーザ操作に対し、新しい更新がなかったことだけを 1 行で知らせる。
+// 「更新が完了しました」等の正常終了文言や未処理件数は出さない。
+// （件数は一覧フッタが担うため、Toast に出すと二重表示になる）
 // 更新を検知した回は通知 Toast 自体が完了の合図になるため、呼び出し側で出し分ける。
 // 通知音は鳴らさない。（チケットの更新通知と違い、ユーザが待っている場面での応答のため）
 static void showPollDoneToast()
 {
-    // 件数は tooltip と同じ根拠にするため buildListRows から得る。（行そのものは使わない）
-    int visible = 0;
-    buildListRows(visible);
     try {
-        showToast3(L"更新が完了しました", L"新しい更新はありません",
-                   L"未処理 " + std::to_wstring(visible) + L" 件",
-                   L"", true);
+        showToast(L"新しい更新はありません", L"", L"", true);
     }
     catch (winrt::hresult_error const& e) {
         writeLog("poll done toast failed: " + winrt::to_string(e.message()));
