@@ -4413,12 +4413,16 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         if (hit < 0) return 0;
         const auto& row = g_listLayout[hit];
         if (row.kind == ListRowKind::Issue && row.index < g_issueItems.size()) {
-            const auto& item = g_issueItems[row.index];
+            // 参照はメッセージポンプ越しに持ち越さない。ShellExecuteW と markIssueRead は
+            // 内部でポンプを回し得るため、実行中に g_issueItems が差し替わると
+            // 参照が dangling になる。id と URL を値でコピーしてから呼ぶ。
+            const int          id  = g_issueItems[row.index].id;
+            const std::wstring url = g_issueItems[row.index].url;
             // URL 検証を通った行だけ開いて既読化する（誤既読の防止。旧メニュー実装と同じ契約）
-            if (isHttpUrl(item.url)) {
-                ShellExecuteW(nullptr, L"open", item.url.c_str(),
+            if (isHttpUrl(url)) {
+                ShellExecuteW(nullptr, L"open", url.c_str(),
                               nullptr, nullptr, SW_SHOWNORMAL);
-                markIssueRead(item.id);
+                markIssueRead(id);
             }
         }
         else {
