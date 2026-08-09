@@ -569,7 +569,7 @@ static int todayJstYmd() {
 // 期限日の表示情報
 struct DueDateView {
     std::wstring text;            // 今年は "7/28"、他年は "2025/6/30"（期限なし・解釈不能なら空）
-    bool         overdue = false; // 期限 ≦ 今日（JST）＝日付部分を赤で描く
+    bool         overdue = false; // 期限 ≦ 今日（JST）＝期日と件名を赤で描く
 };
 
 // Redmine の due_date（"YYYY-MM-DD"、期限なしは空）を表示情報へ変換する
@@ -3331,7 +3331,7 @@ static void initMenuFonts() {
     if (!g_hMenuFontSemiBold) g_hMenuFontSemiBold = g_hMenuFontBold;
 }
 
-// 注意を促す文字色（期限切れの日付とバグマーカー。更新通知メニューの新バージョン表示と同じ赤）
+// 注意を促す文字色（期限切れの期日と件名、バグマーカー。更新通知メニューの新バージョン表示と同じ赤）
 static constexpr COLORREF ALERT_TEXT_COLOR = RGB(220, 0, 0);
 
 // ラベル内で文字色とウェイトを変える範囲（オフセットと長さは UTF-16 コードユニット単位）
@@ -3538,7 +3538,8 @@ static constexpr wchar_t BUG_MARK[] = L"💥 ";
 //   空に展開された要素（期限なし・更新者不明など）は、直後のリテラル先頭空白を
 //   出力末尾が空白または行頭なら取り除いて詰める。（従来の「詰めて省く」を再現）
 //   {group}＝"👥 "・{bug}＝"💥 "・{ago}＝"（3 日前）" は装飾込みで展開し、空なら装飾ごと消える。
-//   期限切れの期日とバグマーカーは ALERT_TEXT_COLOR で描くため、位置を ranges に記録する。
+//   期限切れの期日と件名、および常に赤いバグマーカーは ALERT_TEXT_COLOR で描くため、
+//   位置を ranges に記録する。
 //   （ranges はオフセット昇順で並べる契約。展開順の追記がそのまま昇順になる）
 // 引数に ListRow を丸ごと取るのは、同じ型の要素が増えて位置引数では取り違えを防げないため。
 // ピン記号はラベルに含めない。drawIssueRow が IssueItem::pinned を見てマーカー列に描く。
@@ -3584,6 +3585,11 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
             ColorRange range{r.text.size(), val.size(), ALERT_TEXT_COLOR, true};
             if (!due.overdue) range.keepColor = true;
             r.ranges.push_back(range);
+        }
+        if (tk.element == FMT_SUBJECT && due.overdue) {
+            // 期限切れは件名も赤の半太字にする。（期日だけでは行全体の緊急度に気付けない）
+            // 判定は期日と同じ overdue で、{due} を持たない書式では件名だけが赤になる。
+            r.ranges.push_back({r.text.size(), val.size(), ALERT_TEXT_COLOR, true});
         }
         if (tk.element == FMT_BUG) {
             // マーカー自体を赤くする。（絵文字は GDI が現在の文字色で単色描画するため色が乗る）
@@ -4104,7 +4110,8 @@ static void handleTrayCommand(UINT id) {
 //
 // 範囲ごとにフォントを切り替えるため、幅は各セグメントの合算になる。計測と描画で同じ走査を
 // 通すことが要点で、片方だけ「ラベル全体を 1 回計測」に戻すと行幅・取消線と実描画幅が食い違う。
-// セグメント境界は常に空白の位置に来るため、分割による字形整形の差は視認されない。
+// セグメント境界は空白位置に来ることが多いが、期限切れの件名のように本文中で分かれる場合もある。
+// 分割による字形整形の差は数 px にとどまるため受容する。
 // textRect が nullptr なら描画せず幅だけを返す。（measureIssueRow 用）
 // uniformColor=true はホット行用で、範囲の色を無視して textColor 一色で描く。
 // （ハイライト背景上の赤は読みにくい。ウェイトは幅が変わるためホット行でも維持する）

@@ -145,9 +145,10 @@ static void testBuildIssueLabel() {
         auto row = makeRow();
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
         CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 💥 テスト件名（3 日前）");
-        // ranges は期日（半太字・期限切れ赤）と 💥（赤、末尾空白を含まない）の 2 件で昇順
-        CHECK(lbl.ranges.size() == 2);
-        if (lbl.ranges.size() == 2) {
+        // ranges は期日（半太字・期限切れ赤）、💥（赤、末尾空白を含まない）、
+        // 件名（期限切れは半太字の赤）の 3 件で昇順
+        CHECK(lbl.ranges.size() == 3);
+        if (lbl.ranges.size() == 3) {
             CHECK(lbl.ranges[0].offset == 23);  // "#12345  山田  👥 [ロケモニプ] " の直後
             CHECK(lbl.ranges[0].len == 4);      // "7/28"
             CHECK(lbl.ranges[0].bold);
@@ -155,7 +156,13 @@ static void testBuildIssueLabel() {
             CHECK(lbl.ranges[1].offset == 28);  // "7/28 " の直後
             CHECK(lbl.ranges[1].len == 2);      // 💥（サロゲートペア）
             CHECK(lbl.ranges[1].color == ALERT_TEXT_COLOR);
+            CHECK(lbl.ranges[2].offset == 31);  // "💥 " の直後
+            CHECK(lbl.ranges[2].len == 5);      // "テスト件名"
+            CHECK(lbl.ranges[2].bold);
+            CHECK(!lbl.ranges[2].keepColor);
+            CHECK(lbl.ranges[2].color == ALERT_TEXT_COLOR);
             CHECK(lbl.ranges[0].offset < lbl.ranges[1].offset);
+            CHECK(lbl.ranges[1].offset < lbl.ranges[2].offset);
         }
     }
 
@@ -202,6 +209,22 @@ static void testBuildIssueLabel() {
         row.subject = "あいうえおかきく";
         auto lbl = buildIssueLabel(row, makeDueDateView("", todayYmd), today);
         CHECK_WSTR(lbl.text, L"あいうえお…");
+    }
+
+    // 期限切れ＋件名の切り詰め：範囲長は「…」を含む切り詰め後の長さ
+    g_currentConfig.listFormat = parseListFormat(L"{due} {subject:5}");
+    {
+        auto row = makeRow();
+        row.subject = "あいうえおかきく";
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"7/28 あいうえお…");
+        CHECK(lbl.ranges.size() == 2);
+        if (lbl.ranges.size() == 2) {
+            CHECK(lbl.ranges[1].offset == 5);  // "7/28 " の直後
+            CHECK(lbl.ranges[1].len == 6);     // "あいうえお…"
+            CHECK(lbl.ranges[1].bold);
+            CHECK(!lbl.ranges[1].keepColor);
+        }
     }
 
     // 行末のリテラル空白は残らない。（{id} は番号のみで「#」はリテラル側の責務）
