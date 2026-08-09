@@ -9,8 +9,11 @@
 A lightweight resident app that notifies you of Redmine ticket updates via Windows notifications and lets you browse your open tickets from the system tray.
 
 Its main features are notifications for new or updated tickets and the open-ticket list opened from the tray icon.
+Which tickets are notified and listed can be narrowed freely with Redmine custom queries.
 
 Measured physical memory usage is about 7 MB.
+
+A sister tool, [gcalntfy](https://github.com/aviscaerulea/gcalntfy), notifies you of Google Calendar events the same way.
 
 ## Features
 
@@ -20,8 +23,8 @@ Measured physical memory usage is about 7 MB.
   - Pins: keep important tickets in the list (they stay even after being closed)
   - Hiding: excludes tickets you do not need to watch from notifications and the pending count
   - Browser display: clicking a row or the footer opens it in the browser
-- Tracking scope: notification targets are adjustable via Redmine custom queries (query_ids)
-- Zero-configuration start: tracks tickets assigned to you and your groups with just a URL and an API key
+- Narrowing the target: Redmine custom queries (query_ids) select which tickets are notified and listed
+- Zero-configuration start: targets tickets assigned to you and your groups with just a URL and an API access key
 
 ### System tray
 
@@ -68,60 +71,56 @@ A step-by-step guide with screenshots is available in the [setup guide](https://
 
 3. Launch `redntfy.exe`
 
-It is fine to launch without `redntfy.local.toml`. The app generates a template automatically, opens the configuration file, and guides you to the page where the key can be obtained.
-
-That is all it takes — the app starts tracking open tickets assigned to you (and your groups).
-If you want to tune the tracking scope yourself, create custom queries in Redmine and set `query_ids`.
-
-1. In Redmine, filter the issue list **without specifying a project** and save it as a custom query
-   - Queries saved under a specific project cannot be referenced via the API, so they must be created as global custom queries
-2. Take note of `N` in the resulting URL `/issues?query_id=N` (one per query if you track multiple)
-3. Add `query_ids = [12, 34]` to `redntfy.local.toml`
-4. Restart `redntfy.exe`
+That is all it takes — the app starts notifying you of updates to open tickets assigned to you (and your groups).
+If you want to narrow the target yourself, save a global custom query in Redmine.  
+Then set the id of that query in `query_ids`.  
+See the setup guide for the detailed steps.
 
 ## Configuration
 
 Runtime settings live in `redntfy.toml` next to `redntfy.exe`.
-Placing `redntfy.local.toml` overrides values on a per-key basis, which is useful for separating connection settings or per-environment differences.
-Detected state is saved to `state.json`, pins to `pins.json`, and hidden tickets to `hidden.json`; all persist across restarts.
+Placing `redntfy.local.toml` overrides values of the same keys on a per-key basis.
+That is useful for separating connection settings or per-environment differences.
 
-The main configuration keys are listed below. See the comments in `redntfy.toml` for details.
+Configurable items are the connection settings, the custom queries to target, the number of polls per hour for each hour of the day, the row count and row format of the list, the hover behavior, loudness normalization for the notification sound, and the update check at startup.
+See the comments in `redntfy.toml` for the meaning and default value of each key.
 
-| Section | Key | Description |
-| --- | --- | --- |
-| `[app]` | `schedule` | Polls per hour for each hour of the day (array of 24 values; 0 pauses polling) |
-| `[app]` | `list_limit` | Number of rows in the list (default 20) |
-| `[app]` | `list_format` | Row format of the list (placeholder based) |
-| `[app]` | `hover_delay_ms` | Delay before the list appears on hover (milliseconds, 0-5000; default 100, 0 for immediate) |
-| `[app]` | `hover_click_guard_ms` | Grace period after a hover-triggered display during which a left click does not close the list (milliseconds, 0-5000; default 300, 0 to disable) |
-| `[app]` | `bug_trackers` | Tracker-name patterns that get a 💥 icon |
-| `[app]` | `duck_targets` | Other apps' process names to mute while the notification sound plays |
-| `[redmine]` | `url`, `api_key` | Connection settings (required) |
-| `[redmine]` | `query_ids` | Custom-query ids to track (if omitted, tracks tickets assigned to you) |
-| `[loudness]` | `enabled`, `target` | Loudness normalization for the notification sound |
-| `[update]` | `enabled` | Update check at startup |
+### With and without `query_ids`
 
-### With and without query_ids
-
-`query_ids` is optional. Tracking behaves as follows depending on whether it is set.
+`query_ids` is optional. Which tickets are notified and listed changes as follows depending on whether it is set.
 
 | Aspect | Set | Not set |
 | --- | --- | --- |
-| Tracked tickets | Union of the specified custom queries | Open tickets assigned to you (and your groups) |
+| Target tickets | Union of the specified custom queries | Open tickets assigned to you (and your groups) |
 | Preparation | Requires creating custom queries in Redmine | Works with just `url` and `api_key` |
-| Scope tuning | Freely adjustable via query filters | Fixed (no filtering) |
+| Narrowing the target | Freely adjustable via query filters | Fixed (no filtering) |
 | Redmine screen opened from notifications/list | The first query's issue list | The issue list filtered by assignee = me |
 
-A good way to start is without `query_ids`, then create custom queries and set it once you want to tune the tracking scope.
+An example with `query_ids` set.  
+To go without it, omit the `query_ids` line.
+
+```toml
+[redmine]
+url     = "https://redmine.example.com"
+api_key = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# Ids of global saved queries, saved without specifying a project.
+# When several ids are given, the union of all queries is tracked.
+# The first id is used for the query screen opened from multi-issue notifications and the list footer.
+query_ids = [12, 34]
+```
+
+A good way is to start without `query_ids`.
+Once you want to narrow the target, create custom queries and set it.
 Switching the setting does not flood you with notifications.
 
 ## Limitations
 
-- Only Redmine global custom queries are supported (queries under a specific project cannot be referenced via the API)
-- Group-assignee detection covers all groups only with admin privileges; otherwise it only checks your own groups
+- `query_ids` accepts global custom queries only (queries saved under a specific project cannot be referenced via the API)
+- With insufficient Redmine permissions, the group-assignee mark appears only for your own groups
 - An icon in the hidden-icons overflow area cannot be opened by hover (left-click still works)
 - The configuration file is not hot-reloaded; a restart is required to apply changes
-- If the configuration is incomplete, the app stays resident in a guidance mode without notifications (follow the tray icon and its tooltip, fix the settings, and restart)
+- If the connection settings are incomplete, the app stays resident with notifications turned off (the tray icon shows how to fix it)
 
 ## License
 
