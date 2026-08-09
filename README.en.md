@@ -70,7 +70,7 @@ If you want to tune the tracking scope yourself, create custom queries in Redmin
 Everyday operations:
 
 - Rest the cursor on the tray icon (0.1 s by default) or left-click it to show the open-ticket list
-- Hover display can be turned off via "Show list on hover" in the menu (left-clicking always opens the list)
+- Hover auto-display can be turned off via "マウスホバーで一覧を自動表示" (Auto-show list on hover) in the menu (left-clicking always opens the list)
 - The list closes automatically when the cursor leaves both the icon and the list (left-clicking the icon also closes it, except within 0.3 s right after a hover-triggered display)
 - The pending count is shown in the list footer, and the red badge on the icon indicates unread tickets
 - Left-click a row to open the ticket in the browser and mark it as read; right-click to cycle pin → hidden → normal
