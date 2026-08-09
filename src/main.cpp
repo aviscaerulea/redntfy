@@ -161,7 +161,7 @@ static constexpr DWORD LIST_WATCH_POLL_MS = 200;
 // カーソルがアイコン・ポップアップの外に連続でこの tick 数（約 400ms）観測されたら閉じる
 static constexpr int   LIST_LEAVE_TICKS   = 2;
 
-// 即時ポーリングの抑制間隔（前回ポーリングからこの時間内は即時ポーリングをスキップ）
+// 即時ポーリングの抑制間隔（前回のポーリング試行から、成否を問わずこの時間内は即時ポーリングを延期する）
 static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
 
 // 通知音のデフォルトファイル名（exe 同フォルダに配置）
@@ -273,7 +273,8 @@ static std::atomic<bool> g_forcePoll{false};
 // 明示のユーザ操作のため、g_forcePoll と違い休止時間帯・クールダウンの抑止を受けない
 static std::atomic<bool> g_manualPoll{false};
 
-// 前回ポーリング実行時刻（GetTickCount64、連続ポーリング抑制・stale 判定用）
+// 前回ポーリング成功時刻（GetTickCount64、stale 判定専用。取得成功時のみ更新する）
+// 即時ポーリングのクールダウンには使わない。そちらは試行時刻（g_lastPollAttemptTick）が基準。
 static std::atomic<ULONGLONG> g_lastPollTick{0};
 
 // 前回ポーリング試行時刻（GetTickCount64、即時ポーリングのクールダウン判定用。0 = 未試行）
@@ -401,9 +402,9 @@ struct Config {
     // 空のときはフォールバックモードとして、自分（と所属グループ）が担当のチケットを追跡する。
     std::vector<int> queryIds;
 
-    std::vector<int>          schedule;         // 24 要素（0 時〜23 時の 1 時間あたりポーリング回数、0 で休止）
     // 添字は JST（UTC+9）固定の時。OS のタイムゾーン設定に依存しない。
     // 待機時間の計算とログ表示はローカル時刻基準。
+    std::vector<int>          schedule;         // 24 要素（0 時〜23 時の 1 時間あたりポーリング回数、0 で休止）
     int                       listLimit;        // 一覧の非ピン表示件数（デフォルト 20。ピンと非表示は本値の予算外）
     // 一覧の行フォーマット（解析済みトークン列。既定は従来の固定並びと同一）
     std::vector<FormatToken>  listFormat;
@@ -1324,7 +1325,7 @@ static std::optional<toml::table> loadToml(const std::wstring& path) {
 
 // schedule 配列を TOML テーブルから読み込む（なければ nullopt）
 // 各要素は [0, 60] にクランプする。（0 = その時間帯は休止）
-// 戻り値は常に 24 要素（超過分は切り捨て、不足分は 1 で補完、非整数要素は 1 扱い）。
+// 戻り値は常に 24 要素とする。（超過分は切り捨て、不足分は 1 で補完、非整数要素は 1 扱い）
 // 呼び出し側は時をそのまま添字に使い範囲検査をしないため、この要素数が前提になる。
 static std::optional<std::vector<int>> readSchedule(const std::optional<toml::table>& tbl) {
     if (!tbl) return std::nullopt;
@@ -5743,8 +5744,8 @@ int wmain() {
 
         // 更新チェックスレッド起動（起動時に 1 回のみ実行）
         // detach しない。プロセス終了時の静的破棄と競合しないよう、シャットダウン時に join する。
-        // （HTTP タイムアウトは接続 15 秒＋受信 30 秒で最大約 45 秒のため、起動直後に
-        // 即終了した場合のみ join が待つ）
+        // （HTTP がブロック中なら join はそのタイムアウト分だけ待つため、起動直後に
+        // 即終了した場合のみ待ちが目に見える）
         if (cfg.updateCheckEnabled) {
             try {
                 updateThread = std::thread(checkForUpdates);
@@ -5802,7 +5803,7 @@ int wmain() {
         g_hWnd = nullptr;  // 破棄済みハンドルの再利用を防ぐ（catch の後始末ガードが誤発火しないため）
 
         // 更新チェックスレッドの完了を待つ（未起動・起動失敗時は joinable が false）
-        // HTTP がブロック中だと最大タイムアウト（約 45 秒）まで待ち得るため、
+        // HTTP がブロック中だとそのタイムアウト分だけ待ち得るため、
         // トレイアイコン削除より後に置き、ユーザから見た終了は即座に完了させる
         if (updateThread.joinable()) updateThread.join();
 
@@ -5811,7 +5812,7 @@ int wmain() {
         writeLog("shutdown");
     }
     catch (...) {
-        // 原因ログを最初に残す。後続の join（最大 45 秒）や waitSoundThreadOrExit の
+        // 原因ログを最初に残す。後続の join（HTTP のタイムアウト分だけ待ち得る）や waitSoundThreadOrExit の
         // ExitProcess で、終了コード 2 の理由がログに残らないまま終わるのを防ぐ
         writeLog("unexpected initialization error");
         // joinable なスレッドを残したまま return すると静的破棄と競合するため、
