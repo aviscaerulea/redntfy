@@ -28,9 +28,7 @@ A sister tool, [gcalntfy](https://github.com/aviscaerulea/gcalntfy), notifies yo
 
 ### System tray
 
-The tray icon shows a red badge in the bottom-right corner when there are unread tickets. Keeping the cursor on the icon opens the same open-ticket list as a left click. Hover display can be toggled with "マウスホバーで一覧を自動表示" (Auto-show list on hover) in the tray menu.
-
-The open-ticket list never takes focus, so it does not interrupt typing in the window you were using. It closes automatically when the cursor leaves both the icon and the list, and a left click toggles it open or closed. The list is mouse-only and cannot be operated with the keyboard.
+The tray icon shows a red badge in the bottom-right corner when there are unread tickets.
 
 Each row of the list shows the due date, assignee, project, and time since the last update, with icons. Unread tickets are shown in bold, and the pending count appears in the footer. Clicking a row opens the ticket in the browser and marks it as read, and right-clicking a row cycles through pinned, hidden, and normal.
 
@@ -82,22 +80,13 @@ Runtime settings live in `redntfy.toml` next to `redntfy.exe`.
 Placing `redntfy.local.toml` overrides values of the same keys on a per-key basis.
 That is useful for separating connection settings or per-environment differences.
 
-Configurable items are the connection settings, the custom queries to target, the number of polls per hour for each hour of the day, the row count and row format of the list, the hover behavior, loudness normalization for the notification sound, and the update check at startup.
+Configurable items are the connection settings, the custom queries to target, the number of polls per hour for each hour of the day, the row count and row format of the list, loudness normalization for the notification sound, and the update check at startup.
 See the comments in `redntfy.toml` for the meaning and default value of each key.
 
-### With and without `query_ids`
+### Example of `query_ids`
 
-`query_ids` is optional. Which tickets are notified and listed changes as follows depending on whether it is set.
-
-| Aspect | Set | Not set |
-| --- | --- | --- |
-| Target tickets | Union of the specified custom queries | Open tickets assigned to you (and your groups) |
-| Preparation | Requires creating custom queries in Redmine | Works with just `url` and `api_key` |
-| Narrowing the target | Freely adjustable via query filters | Fixed (no filtering) |
-| Redmine screen opened from notifications/list | The first query's issue list | The issue list filtered by assignee = me |
-
-An example with `query_ids` set.  
-To go without it, omit the `query_ids` line.
+`query_ids` is optional.  
+Omit it and the app targets open tickets assigned to you (and your groups).
 
 ```toml
 [redmine]
@@ -118,7 +107,6 @@ Switching the setting does not flood you with notifications.
 
 - `query_ids` accepts global custom queries only (queries saved under a specific project cannot be referenced via the API)
 - With insufficient Redmine permissions, the group-assignee mark appears only for your own groups
-- An icon in the hidden-icons overflow area cannot be opened by hover (left-click still works)
 - The configuration file is not hot-reloaded; a restart is required to apply changes
 - If the connection settings are incomplete, the app stays resident with notifications turned off (the tray icon shows how to fix it)
 
