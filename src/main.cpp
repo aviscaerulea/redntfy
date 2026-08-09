@@ -2171,6 +2171,7 @@ static std::wstring readRegString(const wchar_t* valueName) {
 }
 
 // レジストリ REG_SZ 値の書き込み
+// キー REG_KEY_PATH が存在しない場合は RegCreateKeyExW が自動作成する。
 static void writeRegString(const wchar_t* valueName, const std::wstring& value) {
     HKEY hKey = nullptr;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, nullptr,
@@ -3663,6 +3664,7 @@ static bool parseVersion(const std::wstring& ver, int& major, int& minor, int& p
 }
 
 // a が b より新しいバージョンなら true を返す
+// どちらかが解釈不能なら false（新しくない側）へ倒す。（更新誤検知を防ぐ安全側）
 static bool isNewerVersion(const std::wstring& a, const std::wstring& b) {
     int aMaj, aMin, aPat, bMaj, bMin, bPat;
     if (!parseVersion(a, aMaj, aMin, aPat)) return false;
@@ -3758,6 +3760,7 @@ static void checkForUpdates() {
 }
 
 // 更新通知メニュー項目のサイズを計算する
+// GetDC 失敗時は既定サイズ（200×20）を返し、項目自体は必ず描かせる。
 static BOOL measureVersionMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
     std::wstring prefix = std::wstring(L"redntfy v") + APP_VERSION + L" → ";
     std::wstring latest;
