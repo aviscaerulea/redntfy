@@ -109,15 +109,6 @@ Switching the setting does not flood you with notifications.
 - The configuration file is not hot-reloaded; a restart is required to apply changes
 - If the configuration is incomplete, the app stays resident in a guidance mode without notifications (follow the tray icon and its tooltip, fix the settings, and restart)
 
-## Build
-
-Visual Studio Build Tools, vcpkg, go-task, PowerShell 7, and git are required.
-
-```powershell
-task build      # Standard build (out/redntfy.exe)
-task release    # Release build with zip packaging
-```
-
 ## License
 
 The application icon uses the official Redmine logo.

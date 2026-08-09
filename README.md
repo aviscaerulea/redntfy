@@ -108,15 +108,6 @@ zip から手動で導入するときは、[Releases](https://github.com/aviscae
 - 設定ファイルはホットリロード非対応で、変更反映には再起動が必要
 - 設定に不備があるときは通知を止めて案内モードで常駐する（トレイのアイコンと説明に従い、設定を直したら再起動）
 
-## ビルド
-
-Visual Studio Build Tools、vcpkg、go-task、PowerShell 7、git が必要です。
-
-```powershell
-task build      # 通常ビルド（out/redntfy.exe）
-task release    # リリースビルドと zip 作成
-```
-
 ## ライセンス
 
 アプリケーションアイコンには Redmine 公式ロゴを使用しています。
