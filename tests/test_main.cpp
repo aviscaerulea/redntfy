@@ -146,9 +146,9 @@ static void testBuildIssueLabel() {
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
         CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 💥 テスト件名（3 日前）");
         // ranges は期日（半太字・期限切れ赤）、💥（赤、末尾空白を含まない）、
-        // 件名（期限切れは半太字の赤）の 3 件で昇順
-        CHECK(lbl.ranges.size() == 3);
-        if (lbl.ranges.size() == 3) {
+        // 件名と経過日数（期限切れは半太字の赤）の 4 件で昇順
+        CHECK(lbl.ranges.size() == 4);
+        if (lbl.ranges.size() == 4) {
             CHECK(lbl.ranges[0].offset == 23);  // "#12345  山田  👥 [ロケモニプ] " の直後
             CHECK(lbl.ranges[0].len == 4);      // "7/28"
             CHECK(lbl.ranges[0].bold);
@@ -161,8 +161,14 @@ static void testBuildIssueLabel() {
             CHECK(lbl.ranges[2].bold);
             CHECK(!lbl.ranges[2].keepColor);
             CHECK(lbl.ranges[2].color == ALERT_TEXT_COLOR);
+            CHECK(lbl.ranges[3].offset == 36);  // "テスト件名" の直後
+            CHECK(lbl.ranges[3].len == 6);      // "（3 日前）"
+            CHECK(lbl.ranges[3].bold);
+            CHECK(!lbl.ranges[3].keepColor);
+            CHECK(lbl.ranges[3].color == ALERT_TEXT_COLOR);
             CHECK(lbl.ranges[0].offset < lbl.ranges[1].offset);
             CHECK(lbl.ranges[1].offset < lbl.ranges[2].offset);
+            CHECK(lbl.ranges[2].offset < lbl.ranges[3].offset);
         }
     }
 

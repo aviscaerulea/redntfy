@@ -569,7 +569,7 @@ static int todayJstYmd() {
 // 期限日の表示情報
 struct DueDateView {
     std::wstring text;            // 今年は "7/28"、他年は "2025/6/30"（期限なし・解釈不能なら空）
-    bool         overdue = false; // 期限 ≦ 今日（JST）＝期日と件名を赤で描く
+    bool         overdue = false; // 期限 ≦ 今日（JST）＝期日、件名、経過日数を赤で描く
 };
 
 // Redmine の due_date（"YYYY-MM-DD"、期限なしは空）を表示情報へ変換する
@@ -3302,8 +3302,8 @@ static void initMenuFonts() {
     LOGFONTW lfBold = ncm.lfMenuFont;
     lfBold.lfWeight = FW_BOLD;
     g_hMenuFontBold = CreateFontIndirectW(&lfBold);
-    // ラベル内の一部だけ強調する用（期限切れの日付）。未読行の太字より控えめなウェイトにして、
-    // 行全体の太字（未読）と部分強調を見分けられるようにする。
+    // ラベル内の一部だけ強調する用（期日と、期限切れの件名、経過日数）。未読行の太字より控えめな
+    // ウェイトにして、行全体の太字（未読）と部分強調を見分けられるようにする。
     // 半太字は「<フェイス> Semibold」という別ファミリで、ウェイト値だけ FW_SEMIBOLD にしても
     // GDI は同一ファミリ内の近いウェイト＝太字へ丸める。（実測：Yu Gothic UI・Segoe UI とも 600 → 700）
     // そのためフェイス名で指定し、得られたウェイトとフェイスを検証して駄目なら太字へ落とす。
@@ -3331,7 +3331,7 @@ static void initMenuFonts() {
     if (!g_hMenuFontSemiBold) g_hMenuFontSemiBold = g_hMenuFontBold;
 }
 
-// 注意を促す文字色（期限切れの期日と件名、バグマーカー。更新通知メニューの新バージョン表示と同じ赤）
+// 注意を促す文字色（期限切れの期日、件名、経過日数と、バグマーカー。更新通知メニューの新バージョン表示と同じ赤）
 static constexpr COLORREF ALERT_TEXT_COLOR = RGB(220, 0, 0);
 
 // ラベル内で文字色とウェイトを変える範囲（オフセットと長さは UTF-16 コードユニット単位）
@@ -3538,7 +3538,7 @@ static constexpr wchar_t BUG_MARK[] = L"💥 ";
 //   空に展開された要素（期限なし・更新者不明など）は、直後のリテラル先頭空白を
 //   出力末尾が空白または行頭なら取り除いて詰める。（従来の「詰めて省く」を再現）
 //   {group}＝"👥 "・{bug}＝"💥 "・{ago}＝"（3 日前）" は装飾込みで展開し、空なら装飾ごと消える。
-//   期限切れの期日と件名、および常に赤いバグマーカーは ALERT_TEXT_COLOR で描くため、
+//   期限切れの期日、件名、経過日数と、常に赤いバグマーカーは ALERT_TEXT_COLOR で描くため、
 //   位置を ranges に記録する。
 //   （ranges はオフセット昇順で並べる契約。展開順の追記がそのまま昇順になる）
 // 引数に ListRow を丸ごと取るのは、同じ型の要素が増えて位置引数では取り違えを防げないため。
@@ -3586,9 +3586,10 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
             if (!due.overdue) range.keepColor = true;
             r.ranges.push_back(range);
         }
-        if (tk.element == FMT_SUBJECT && due.overdue) {
-            // 期限切れは件名も赤の半太字にする。（期日だけでは行全体の緊急度に気付けない）
-            // 判定は期日と同じ overdue で、{due} を持たない書式では件名だけが赤になる。
+        if ((tk.element == FMT_SUBJECT || tk.element == FMT_AGO) && due.overdue) {
+            // 期限切れは件名と経過日数も赤の半太字にする。（期日だけでは行全体の緊急度に気付けない）
+            // 判定は期日と同じ overdue を使う。
+            // {due} を持たない書式では、件名と経過日数だけが赤になる。
             r.ranges.push_back({r.text.size(), val.size(), ALERT_TEXT_COLOR, true});
         }
         if (tk.element == FMT_BUG) {
