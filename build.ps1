@@ -4,9 +4,9 @@
 param([string]$Version = "0.0.0", [switch]$Release, [switch]$Test)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-# 先頭の v を除去する。呼び出し元の Taskfile は既に剥がしているが、手動実行やタグ名の直渡しに
-# 備える。v が残ると後段の major.minor.patch 抽出が不成立で VERSIONINFO が 0,0,0,0 に落ち、
-# UI 側が前置する v と二重化する。
+# 先頭の v を除去する。呼び出し元の Taskfile は既に剥がしているが、手動実行やタグ名の直渡しへの保険。
+# v が残ると version.rc.h の major.minor.patch 抽出が不成立になり、VERSIONINFO が 0,0,0,0 に落ちる。
+# また version.h の APP_VERSION に v が残り、UI 側が前置する v と二重化する。
 $Version = $Version -replace '^v', ''
 
 # vcpkg パス設定（VCPKG_INSTALLATION_ROOT 環境変数 → Scoop シムの優先順）
