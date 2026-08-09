@@ -276,6 +276,13 @@ static std::atomic<bool> g_manualPoll{false};
 // 前回ポーリング実行時刻（GetTickCount64、連続ポーリング抑制・stale 判定用）
 static std::atomic<ULONGLONG> g_lastPollTick{0};
 
+// 前回ポーリング試行時刻（GetTickCount64、即時ポーリングのクールダウン判定用。0 = 未試行）
+// 成功時刻（g_lastPollTick）と分ける理由は、初回成功前でも NIC 変化の連発を抑止するため。
+// 成功時刻を基準にすると、初回が失敗し続ける間はクールダウンが一度も成立しない。
+// GetTickCount64 はシステム起動からの経過時間のため、0 との減算は意味を持たない。
+// 未試行（0）はクールダウン対象外として扱う。
+static std::atomic<ULONGLONG> g_lastPollAttemptTick{0};
+
 // 前回エラー Toast 表示時刻（GetTickCount64、スパム防止用。0 = 未表示）
 // GetTickCount64 はシステム起動からの経過時間のため、初期値 0 との減算比較は
 // 「起動後 30 分間はすべて抑制」という誤動作になる。0 は必ずセンチネルとして特別扱いする。
@@ -5470,17 +5477,20 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             // 即時ポーリング判定。（forcePoll フラグ or 1 時間以上未ポーリング）
             // 前回ポーリングからクールダウン以内の即時要求は、残り時間を待ってから取得し直す
             // （NIC 変化の連発による連続ポーリングの抑止。トリガー自体は消費してよい）
+            // stale は「最後に取得できてから」の経過で判定し、クールダウンは成否を問わない
+            // 「最後に試行してから」の経過で判定する。（初回成功前も抑止を効かせる）
             bool forceTriggered = g_forcePoll.exchange(false);
             ULONGLONG tickNow   = GetTickCount64();
             ULONGLONG lastTick  = g_lastPollTick.load();
+            ULONGLONG lastAttempt = g_lastPollAttemptTick.load();
             bool stale = (lastTick > 0) && (tickNow - lastTick >= STALE_POLL_THRESHOLD_MS);
 
-            if (!manualTriggered && (forceTriggered || stale) && !startupPoll && lastTick > 0
-                && (tickNow - lastTick < FORCE_POLL_COOLDOWN_MS)) {
+            if (!manualTriggered && (forceTriggered || stale) && !startupPoll && lastAttempt > 0
+                && (tickNow - lastAttempt < FORCE_POLL_COOLDOWN_MS)) {
                 writeLog("force poll deferred (cooldown)");
                 // クールダウンの残り時間は forcePoll を無視して待つ。
                 // 手動更新はクールダウンの対象外なので waitIgnoringForcePoll が監視して即座に抜ける
-                waitIgnoringForcePoll(FORCE_POLL_COOLDOWN_MS - (tickNow - lastTick));
+                waitIgnoringForcePoll(FORCE_POLL_COOLDOWN_MS - (tickNow - lastAttempt));
                 continue;
             }
             if (manualTriggered) writeLog("manual poll triggered");
@@ -5492,6 +5502,8 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             ULONGLONG t0    = GetTickCount64();
             bool authError  = false;
             bool queryError = false;
+            // 取得の成否によらずクールダウンの起点を進める。（失敗の連発も抑止対象とする）
+            g_lastPollAttemptTick.store(t0);
             bool ok = fetchIssues(cfg, issues, &authError, &queryError);
             ULONGLONG elapsed = GetTickCount64() - t0;
 
