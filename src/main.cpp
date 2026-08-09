@@ -2113,7 +2113,7 @@ static void unduckAudioSessions(std::vector<winrt::com_ptr<ISimpleAudioVolume>>&
 
 // ==================== レジストリ設定 ====================
 
-// レジストリパス（ユーザー設定の永続化先）
+// レジストリパス（ユーザ設定の永続化先）
 static constexpr const wchar_t* REG_KEY_PATH        = L"SOFTWARE\\redntfy";
 static constexpr const wchar_t* REG_SOUND_ENABLED     = L"SoundEnabled";
 static constexpr const wchar_t* REG_MUTE_IN_MEETING   = L"MuteInMeeting";
