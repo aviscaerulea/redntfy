@@ -106,7 +106,8 @@ static const wchar_t* APP_AUMID = L"com.redntfy";
 // エラー時のリトライ待機時間（ミリ秒）
 static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 
-// ホバーで一覧を表示するまでの遅延（ms）。0 は即時表示
+// ホバーで一覧を表示するまでの追加遅延（ms）。0 はホバー検出と同時に表示
+// OS がホバー検出（NIN_POPUPOPEN）した時点から数え、OS 自体のホバー判定時間に上乗せする
 static constexpr long long DEFAULT_HOVER_DELAY_MS = 100;
 static constexpr long long MIN_HOVER_DELAY_MS     = 0;
 static constexpr long long MAX_HOVER_DELAY_MS     = 5000;
@@ -154,12 +155,19 @@ static constexpr wchar_t GITHUB_API_RELEASES_LATEST[] = L"https://api.github.com
 static constexpr UINT LIST_ROW_MAX = 50;
 
 // ホバー表示のワンショット遅延タイマーと、一覧ポップアップの監視用ポーリングタイマー
-// IDT_LIST_WATCH は表示中の離脱検出と、明示クローズ後のホバー再アーム保留の解除を兼ねる
+// IDT_HOVER_TRIGGER は NIN_POPUPOPEN 受信から hover_delay_ms 経過後の表示を担う。
+// NIN_POPUPCLOSE（カーソルのアイコン離脱）の受信処理がこのタイマーを取り消す。
+// IDT_LIST_WATCH は表示中の離脱検出を担う。
 static constexpr UINT  IDT_HOVER_TRIGGER  = 1;
 static constexpr UINT  IDT_LIST_WATCH     = 2;
 static constexpr DWORD LIST_WATCH_POLL_MS = 200;
 // カーソルがアイコン・ポップアップの外に連続でこの tick 数（約 400ms）観測されたら閉じる
 static constexpr int   LIST_LEAVE_TICKS   = 2;
+// 表示直後に離脱カウントを据え置く tick 数（約 1 秒）
+// 高 DPI 環境で、OS のホバー通知が届く前の左クリックで一覧を開いた場合の防御。
+// アイコン上の判定材料（g_iconHovered とアイコン矩形）が両方とも未成立でも、
+// この据え置きの間に NIN_POPUPOPEN が届けば閉じずに済む
+static constexpr int   LIST_SHOW_GRACE_TICKS = 5;
 
 // 即時ポーリングの抑制間隔（前回のポーリング試行から、成否を問わずこの時間内は即時ポーリングを延期する）
 static constexpr DWORD FORCE_POLL_COOLDOWN_MS = 60'000;
@@ -256,15 +264,23 @@ static std::atomic<DWORD> g_hoverClickGuardMs{static_cast<DWORD>(DEFAULT_HOVER_C
 
 // 一覧ポップアップの開閉制御。トレイ WndProc スレッドのみが読み書きするため atomic 不要
 // g_listOutsideTicks：カーソルがアイコン・ポップアップ矩形の外に居た連続 tick 数
-// g_hoverRearmPending：明示クローズ後、カーソルがアイコンから離れるまでホバー再表示を
-//   保留するフラグ。（閉じてもカーソルが乗ったままだと、わずかな動きで即座に開き直るため。
-//   IDT_LIST_WATCH の監視でアイコン離脱を検出したら解除する）
 // g_hoverShownAt：ホバーで自動表示した時刻（GetTickCount64）。左クリック表示とクローズで
 //   0 に戻す。（不変条件：非 0 はホバー起点の一覧が表示中のときだけ）
 //   ホバー自動表示直後の左クリックを「閉じる」と解釈しないための判定に使う
+// g_iconHovered：カーソルがアイコン上に留まっていると OS が通知中か。NIN_POPUPOPEN で
+//   立て、NIN_POPUPCLOSE で下ろす。離脱監視の「アイコン上」判定に使う。（DPI 非対応
+//   プロセスではカーソル座標とアイコン矩形の突き合わせが高 DPI で成立しないため、
+//   OS の判定を正とする）
+// g_hoverSuppressed：明示クローズ後、カーソルがアイコンを離れる（NIN_POPUPCLOSE）まで
+//   ホバー再表示を抑止するフラグ。（NIN_POPUPOPEN の再送条件は文書化されておらず、
+//   閉じた直後の微動で再送されても開き直さないための備え）
+// g_trayV4：NIM_SETVERSION(NOTIFYICON_VERSION_4) の成否。失敗時は旧方式（生マウス
+//   メッセージ）のコールバックが届くため、右クリック・左クリックの判定を旧方式へ切り替える
 static int       g_listOutsideTicks  = 0;
-static bool      g_hoverRearmPending = false;
 static ULONGLONG g_hoverShownAt      = 0;
+static bool      g_iconHovered       = false;
+static bool      g_hoverSuppressed   = false;
+static bool      g_trayV4            = false;
 
 // スリープ復帰・ロック解除時の即時ポーリングフラグ
 static std::atomic<bool> g_forcePoll{false};
@@ -1475,7 +1491,8 @@ static Config loadConfig(const std::wstring& exeDir) {
     // バージョン欄判定情報の再取得間隔（時間）
     cfg.versionMetaRefreshHours = readAppInt("version_meta_refresh_hours", 24, 1, 168);
 
-    // ホバーで一覧を表示するまでの遅延（ms 単位。デフォルト 100、0〜5000 にクランプ、0 で即時）
+    // hover_delay_ms（OS のホバー検出から一覧を表示するまでの追加遅延、ms 単位。
+    // デフォルト 100、0〜5000 にクランプ、0 でホバー検出と同時に表示）
     cfg.hoverDelayMs = readAppInt("hover_delay_ms",
         static_cast<int>(DEFAULT_HOVER_DELAY_MS),
         static_cast<int>(MIN_HOVER_DELAY_MS),
@@ -2968,21 +2985,47 @@ static NOTIFYICONDATAW makeTrayNid(HWND hWnd) {
 }
 
 // トレイアイコンの登録
+// NOTIFYICON_VERSION_4 を宣言する。これによりコールバックの lParam は生のマウスメッセージ
+// でなくイベント通知（LOWORD が NIN_SELECT / NIN_POPUPOPEN / WM_CONTEXTMENU 等）になる。
+// ホバーの開始・終了は OS が NIN_POPUPOPEN / NIN_POPUPCLOSE で明示的に通知してくる。
+// これによりアプリ側でのカーソル座標とアイコン矩形の突き合わせが不要になる。
+// （DPI 非対応プロセスではアイコン矩形が実ピクセル座標、カーソルが仮想化座標となる。
+// 表示スケール 100% 超で突き合わせが成立しないため、座標判定に依存しない方式を採る）
+//
+// v4 では OS が標準ツールチップを既定で抑止する。szTip の「読み込み中...」は、
+// NIF_SHOWTIP を付ける無効モードと旧方式フォールバック時に見える。
+// 標準ツールチップの表示指定（NIF_SHOWTIP）は無効モードの案内にだけ付ける。（NIN_POPUPOPEN は本来ツールチップの代替 UI を出すための通知で、
+// NIF_SHOWTIP との併用時の挙動は文書化されていない。表示指定は一覧ポップアップを出さない
+// 無効モードに限定し、両者の衝突を避ける。updateTrayTooltip を参照）
 static void addTrayIcon(HWND hWnd) {
     // 無効モードなら最初から無効アイコンで登録する（後からの差し替えによるチラつき防止）
     // TaskbarCreated（エクスプローラ再起動）の再登録でも同じ経路を通り状態が一致する
-    g_trayIconStyle = isDisabled() ? TrayIconStyle::Disabled : TrayIconStyle::Normal;
+    g_trayIconStyle   = isDisabled() ? TrayIconStyle::Disabled : TrayIconStyle::Normal;
+    g_iconHovered     = false;  // ホバー状態は再登録で初期化する（通知の取りこぼし対策）
+    g_hoverSuppressed = false;
+    KillTimer(hWnd, IDT_HOVER_TRIGGER);  // 旧アイコン由来の表示予約は再登録で無効
     auto nid = makeTrayNid(hWnd);
     nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
     // 件数ツールチップは全廃のため、通常時は初期 tooltip も出さない。（一覧はホバーで出る）
     // 無効モードのみ表示し、直後の案内 tooltip 更新に引き継ぐ
-    if (isDisabled())
+    if (isDisabled()) {
         wcscpy_s(nid.szTip, L"読み込み中...");
+        nid.uFlags |= NIF_SHOWTIP;
+    }
     UINT iconId = isDisabled() ? IDI_APP_ICON_DISABLE : IDI_APP_ICON;
     nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(iconId));
     Shell_NotifyIconW(NIM_ADD, &nid);
     if (nid.hIcon) DestroyIcon(nid.hIcon);
+    nid.uVersion = NOTIFYICON_VERSION_4;
+    g_trayV4 = Shell_NotifyIconW(NIM_SETVERSION, &nid) != FALSE;
+    if (!g_trayV4) {
+        // 失敗すると旧方式（生マウスメッセージ）のままとなり、ホバー通知が届かない。
+        // クリック判定はメッセージ処理側が g_trayV4 を見て旧方式（WM_LBUTTONUP /
+        // WM_RBUTTONUP）へ切り替えるため、一覧表示とメニュー（終了操作を含む）は維持する。
+        // Windows 7 以降で v4 が失敗する状況は想定外のため、記録に留めて続行する
+        writeLog("tray: NIM_SETVERSION(NOTIFYICON_VERSION_4) failed");
+    }
 }
 
 // バッジ付きトレイアイコンの生成
@@ -3099,7 +3142,10 @@ static void updateTrayIcon(HWND hWnd, bool hasUnread) {
     if (style == g_trayIconStyle) return;
 
     auto nid   = makeTrayNid(hWnd);
-    nid.uFlags = NIF_ICON;
+    // NIF_SHOWTIP（NOTIFYICON_VERSION_4 の標準ツールチップ表示指定）は無効モードにだけ付ける。
+    // シェルが表示指定を呼び出しごとの状態と解釈しても、案内のツールチップを消さないため。
+    // 付与条件は updateTrayTooltip の無効モード分岐と一致させること
+    nid.uFlags = NIF_ICON | (isDisabled() ? NIF_SHOWTIP : 0u);
     switch (style) {
     case TrayIconStyle::Disabled:
         nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON_DISABLE));
@@ -3276,6 +3322,8 @@ static void updateTrayTooltip(HWND hWnd) {
     g_tooltipUpdating = true;
 
     // 無効モード：件数の代わりに設定確認の案内を出す（一覧は開けないため件数計算も不要）
+    // NIF_SHOWTIP は、v4 で OS が抑止する標準ツールチップの表示指定。無効モードはホバーの
+    // 一覧ポップアップを出さないため、NIN_POPUPOPEN との衝突なくツールチップを表示できる
     if (isDisabled()) {
         std::wstring dtip;
         switch (disabledReason()) {
@@ -3284,7 +3332,7 @@ static void updateTrayTooltip(HWND hWnd) {
         default:                              dtip = L"設定ファイルの query_ids を確認してください"; break;
         }
         auto dnid = makeTrayNid(hWnd);
-        dnid.uFlags = NIF_TIP;
+        dnid.uFlags = NIF_TIP | NIF_SHOWTIP;
         wcscpy_s(dnid.szTip, dtip.c_str());
         Shell_NotifyIconW(NIM_MODIFY, &dnid);
         updateTrayIcon(hWnd, false);
@@ -3299,7 +3347,8 @@ static void updateTrayTooltip(HWND hWnd) {
         if (r.unread) ++unread;
     }
 
-    // szTip は makeTrayNid のゼロ初期化で空文字列のまま送る。（tooltip なしを維持する）
+    // szTip は makeTrayNid のゼロ初期化で空文字列のまま送る。（tooltip なしを維持する。
+    // NIF_SHOWTIP は付けず、通常時は標準ツールチップを抑止したままにする）
     auto nid = makeTrayNid(hWnd);
     nid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &nid);
@@ -3667,7 +3716,10 @@ static TrayPopupPos computeTrayPopupPos(const POINT& cursor) {
 }
 
 // トレイアイコンの画面矩形を取得する
-// 失敗（アイコン未登録・過渡状態）は false を返し、呼び出し側は判定を保守的に扱う。
+// 失敗（アイコン未登録・過渡状態）は false を返し、呼び出し側は g_iconHovered の判定に委ねる。
+// 注意：返す矩形は実ピクセル座標であり、DPI 非対応の本プロセスでは表示スケール 100% 超の
+// 環境で GetCursorPos（仮想化座標）との突き合わせが成立しない。高 DPI では OS のホバー状態
+// （g_iconHovered）を正とし、本矩形は 100% 環境と旧方式フォールバックの補完に使う
 static bool getTrayIconRect(HWND hWnd, RECT& rcOut) {
     NOTIFYICONIDENTIFIER nii = { sizeof(nii) };
     nii.hWnd = hWnd;
@@ -3944,20 +3996,19 @@ static void showTrayContextMenu(HWND hWnd) {
 
 // トレイアイコンホバー時のチケット一覧表示
 // 契約：IDT_HOVER_TRIGGER の発火（または hover_delay_ms = 0 の即時経路）からのみ呼ばれる。
-// 無効モード・トグル OFF（「マウスホバーで一覧を自動表示」）・表示中・再アーム保留中（明示クローズ後、
-// カーソルがアイコンを離れるまで）は無反応。発火時点でカーソルがアイコン矩形内に留まって
-// いるかを再確認してから表示する。（遅延中の離脱で発火した空タイマー対策）
+// 無効モード・トグル OFF（「マウスホバーで一覧を自動表示」）・表示中・再表示抑止中・
+// 非ホバー状態は無反応。
+// カーソルがアイコン上にあることは OS のホバー状態（g_iconHovered）で確認する。
+// 遅延中にアイコンを離れたケースは NIN_POPUPCLOSE がタイマーを取り消すため通常はここへ来ない。
+// 取り消しの取りこぼし（タスクバー再生成等）に備えて g_iconHovered も見る。
+// （カーソル座標とアイコン矩形の突き合わせは、DPI 非対応プロセスでは表示スケール 100% 超の
+// 環境で座標系が食い違い成立しないため行わない）
 static void handleTrayHover(HWND hWnd) {
     if (isDisabled())                 return;
     if (!g_hoverPopupEnabled.load())  return;
     if (g_popupShowing.load())        return;
-    if (g_hoverRearmPending)          return;
-
-    RECT icon;
-    if (!getTrayIconRect(hWnd, icon)) return;
-    POINT pt;
-    GetCursorPos(&pt);
-    if (!PtInRect(&icon, pt)) return;
+    if (g_hoverSuppressed)            return;
+    if (!g_iconHovered)               return;
 
     showListPopup(hWnd);
     // ホバー起点の時刻を記録する。（左クリックの「閉じる」猶予判定用）
@@ -4085,7 +4136,7 @@ static void handleTrayCommand(UINT id) {
         return;
     }
     if (id == IDM_HOVER_POPUP) {
-        // ホバー発火のゲート 2 箇所（trayWndProc の WM_MOUSEMOVE のアーム条件と
+        // ホバー発火のゲート 2 箇所（trayWndProc の NIN_POPUPOPEN のアーム条件と
         // handleTrayHover の先頭ガード）に効く。KillTimer は投函済み WM_TIMER を
         // 除去しないが、遅れて発火しても先頭ガードが止めるため OFF は直ちに効く。
         g_hoverPopupEnabled.store(!g_hoverPopupEnabled.load());
@@ -4294,7 +4345,8 @@ static void drawIssueRow(HDC hdc, const RECT& rcItem, const IssueItem& item, boo
 // 自前ポップアップ（WS_EX_NOACTIVATE）で一覧を表示する。
 // 非モーダルのため、フォーカス復元・EndMenu・クローズ直後のクリック猶予といった
 // モーダルメニュー時代の補正処理は存在しない。キー入力は受けないマウス専用の UI。
-// 開く：ホバー（IDT_HOVER_TRIGGER 経由）またはアイコン左クリック（即時）。
+// 開く：ホバー（OS の NIN_POPUPOPEN 通知から hover_delay_ms 後）または
+// アイコン左クリック（NIN_SELECT、即時）。
 // 閉じる：アイコンとポップアップ両方からの離脱（IDT_LIST_WATCH が監視）・
 // アイコン左クリックのトグル・行クリックでチケットを開いたとき。起点によらず同一ルール。
 // 唯一の例外として、ホバー自動表示から hover_click_guard_ms 以内のアイコン左クリックは
@@ -4650,7 +4702,8 @@ static void showListPopup(HWND trayWnd) {
     InvalidateRect(hWnd, nullptr, FALSE);
 
     g_popupShowing.store(true);
-    g_listOutsideTicks = 0;
+    // 負値から数え始め、表示直後の約 1 秒は離脱と数えない（LIST_SHOW_GRACE_TICKS を参照）
+    g_listOutsideTicks = -LIST_SHOW_GRACE_TICKS;
     // 離脱監視の開始。失敗時は表示を諦めて閉じる。（閉じる手段が離脱かクリックしかなく、
     // 監視なしでは出しっぱなしになるため）
     if (!SetTimer(trayWnd, IDT_LIST_WATCH, LIST_WATCH_POLL_MS, nullptr)) {
@@ -4661,11 +4714,9 @@ static void showListPopup(HWND trayWnd) {
 }
 
 // 一覧ポップアップを閉じる（離脱・トグル・行クリックの共通経路）
-// カーソルがまだアイコン上にあるときはホバー再アームを保留し、IDT_LIST_WATCH を
-// 保留解除の監視に転用する。（閉じた直後の微動で即座に開き直るのを防ぐ。
-// アイコンから離れたら監視側が保留を解除してタイマーを止める）
-// SetTimer は既存タイマーの張り直しとして常に呼ぶ。（失敗すると保留が解除不能になるため、
-// 失敗時は保留しない）
+// カーソルがまだアイコン上にある閉じ操作では、ホバー再表示を抑止する
+// （g_hoverSuppressed。NIN_POPUPCLOSE で解除）。閉じた直後の微動で NIN_POPUPOPEN が
+// 再送されても開き直さないための備えだ。（再送条件は文書化されていない）
 static void hideListPopup(HWND trayWnd) {
     if (g_listWnd) ShowWindow(g_listWnd, SW_HIDE);
     g_popupShowing.store(false);
@@ -4673,18 +4724,8 @@ static void hideListPopup(HWND trayWnd) {
     // ホバー起点の記録を破棄する。（クリック猶予は表示中の一覧にだけ効かせる。
     // 残すと右クリックメニュー表示中など後続の g_popupShowing = true で猶予が誤発動する）
     g_hoverShownAt = 0;
-
-    POINT pt;
-    GetCursorPos(&pt);
-    RECT icon;
-    if (getTrayIconRect(trayWnd, icon) && PtInRect(&icon, pt)) {
-        g_hoverRearmPending =
-            SetTimer(trayWnd, IDT_LIST_WATCH, LIST_WATCH_POLL_MS, nullptr) != 0;
-    }
-    else {
-        g_hoverRearmPending = false;
-        KillTimer(trayWnd, IDT_LIST_WATCH);
-    }
+    g_hoverSuppressed = g_iconHovered;
+    KillTimer(trayWnd, IDT_LIST_WATCH);
     // バッジ（未読の有無）を最新化する
     updateTrayTooltip(trayWnd);
 }
@@ -4863,22 +4904,35 @@ static void enterDisabledMode(HWND hWnd, DisabledReason reason,
 // スリープ復帰・ロック解除の即時ポーリング、エクスプローラ再起動時のアイコン再登録を振り分ける。
 static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAYICON) {
-        if (lParam == WM_RBUTTONUP || lParam == WM_CONTEXTMENU) {
+        // NOTIFYICON_VERSION_4 のコールバック形式：LOWORD(lParam) がイベント種別、
+        // HIWORD(lParam) がアイコン ID（単一アイコンのため未使用）、wParam がアンカー座標。
+        // v4 では OS が WM_LBUTTONUP を NIN_SELECT に、WM_RBUTTONUP を WM_CONTEXTMENU に
+        // 置き換えて送る。（置き換え対象外の WM_MOUSEMOVE 等は生のまま届くが使わない）
+        // NIM_SETVERSION 失敗時（g_trayV4 = false）は置き換えのない旧方式となるため、
+        // クリック判定を WM_LBUTTONUP / WM_RBUTTONUP へ切り替える。ホバー通知は届かず、
+        // 一覧は左クリックでのみ開ける。
+        // WM_CONTEXTMENU は旧方式でもキーボード操作（アプリケーションキー等）で届くため、
+        // 方式によらず受ける。（メニュー位置がカーソル基準になる点は旧来からの挙動）
+        // キーボード選択（NIN_KEYSELECT）は扱わない。（一覧の表示位置と離脱監視がカーソル
+        // 位置基準のため、カーソルがトレイ外にあるキーボード操作では正しく機能しない。
+        // 旧方式でも無反応であり、挙動を維持する）
+        const UINT event = LOWORD(lParam);
+        if (event == WM_CONTEXTMENU || (!g_trayV4 && event == WM_RBUTTONUP)) {
             KillTimer(hWnd, IDT_HOVER_TRIGGER);  // 保留中のホバートリガーを取消（クリック優先）
             showTrayContextMenu(hWnd);
         }
-        else if (lParam == WM_LBUTTONUP) {
+        else if (g_trayV4 ? (event == NIN_SELECT) : (event == WM_LBUTTONUP)) {
             KillTimer(hWnd, IDT_HOVER_TRIGGER);  // 同上
             handleTrayLeftClick(hWnd);
         }
-        else if (lParam == WM_MOUSEMOVE) {
-            // ホバー検出のデバウンス：静止中は WM_MOUSEMOVE が来ないため、動くたびに
-            // ワンショットタイマーを張り直せば「delay 時間静止したら表示」を判定できる。
-            // hover_delay_ms = 0 は即時表示。（デバウンスなし）
-            // トグル OFF・表示中・再アーム保留中（明示クローズ後、アイコン離脱まで）は
-            // アームしない
+        else if (event == NIN_POPUPOPEN) {
+            // OS のホバー検出。カーソルがアイコン上に留まったと OS が判定した時点で届く。
+            // hover_delay_ms はここからの追加遅延として効かせる。
+            // 抑止判定（無効モード・トグル OFF・表示中・再表示抑止）は handleTrayHover が
+            // 行うため、ここでは該当時にタイマーを張らないだけの早期判定とする
+            g_iconHovered = true;
             if (!isDisabled() && g_hoverPopupEnabled.load()
-                && !g_popupShowing.load() && !g_hoverRearmPending) {
+                && !g_popupShowing.load() && !g_hoverSuppressed) {
                 DWORD delay = g_hoverDelayMs.load();
                 if (delay == 0) {
                     KillTimer(hWnd, IDT_HOVER_TRIGGER);
@@ -4888,6 +4942,14 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                     SetTimer(hWnd, IDT_HOVER_TRIGGER, delay, nullptr);
                 }
             }
+        }
+        else if (event == NIN_POPUPCLOSE) {
+            // カーソルがアイコンを離れた。遅延中の表示予約と明示クローズ後の再表示抑止を
+            // 解除する。表示済みの一覧はここでは閉じない。（アイコンから一覧へカーソルを
+            // 移す途中でも届くため、閉じ判定は IDT_LIST_WATCH の離脱監視に任せる）
+            g_iconHovered     = false;
+            g_hoverSuppressed = false;
+            KillTimer(hWnd, IDT_HOVER_TRIGGER);
         }
         return 0;
     }
@@ -4902,30 +4964,27 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         GetCursorPos(&pt);
         if (g_listWnd && IsWindowVisible(g_listWnd)) {
             // 表示中：アイコンとポップアップの両方から離れた状態が連続したら閉じる。
-            // アイコン矩形の取得失敗（過渡状態）は場外と数えず今回の判定を見送る。
-            // getTrayIconRect の契約どおり保守的＝閉じない側に倒し、次の tick で再判定する
+            // アイコン上の判定は多層防御とする。OS のホバー状態（g_iconHovered。高 DPI でも
+            // 正しい）と、アイコン矩形との突き合わせ（100% 環境と旧方式フォールバックで正しい）
+            // のどちらかが成立すればアイコン上とみなす。片方の弱点をもう片方が補う。
+            // ポップアップ矩形は自プロセスの座標系（GetWindowRect と GetCursorPos が同じ空間）
+            // のため、突き合わせで常に正しく判定できる
+            bool onIcon = g_iconHovered;
             RECT icon = {};
-            if (!getTrayIconRect(hWnd, icon)) return 0;
+            if (!onIcon && getTrayIconRect(hWnd, icon) && PtInRect(&icon, pt)) {
+                onIcon = true;
+            }
             RECT wnd = {};
             GetWindowRect(g_listWnd, &wnd);
-            if (PtInRect(&icon, pt) || PtInRect(&wnd, pt)) {
+            if (onIcon || PtInRect(&wnd, pt)) {
                 g_listOutsideTicks = 0;
             }
             else if (++g_listOutsideTicks >= LIST_LEAVE_TICKS) {
                 hideListPopup(hWnd);
             }
         }
-        else if (g_hoverRearmPending) {
-            // 明示クローズ後の再アーム保留：カーソルがアイコンから離れたら解除して止める。
-            // 矩形の取得失敗は離脱扱いにする。（保留に倒し続けるとホバーが復帰不能になるため）
-            RECT icon = {};
-            if (!getTrayIconRect(hWnd, icon) || !PtInRect(&icon, pt)) {
-                g_hoverRearmPending = false;
-                KillTimer(hWnd, IDT_LIST_WATCH);
-            }
-        }
         else {
-            KillTimer(hWnd, IDT_LIST_WATCH);  // 非表示かつ保留なしの迷子タイマーは止める
+            KillTimer(hWnd, IDT_LIST_WATCH);  // 非表示の迷子タイマーは止める
         }
         return 0;
     }
