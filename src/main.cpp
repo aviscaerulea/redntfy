@@ -15,7 +15,7 @@
  * 未処理チケットの一覧を表示し、行の右クリックで 通常 → ピン留め → 非表示 → 通常 の順に
  * 状態を切り替えられる。（ピンの件数に上限はない）
  * ピンは pins.json に永続化し、保存クエリの集合から外れたチケットも一覧に表示し続ける。
- * 非表示チケットは hidden.json に永続化し、グレー表示・通知と件数から除外・
+ * 非表示チケットは hidden.json に永続化し、グレー＋取消線で表示・通知と件数から除外・
  * 「非表示チケットを除外」トグル ON で一覧からも出さない。
  *
  * 終了コード：
@@ -142,7 +142,7 @@ static constexpr UINT IDM_SORT_BY_DUE         = 40013; // 一覧を期日昇順�
 static constexpr UINT IDM_EXCLUDE_NO_VERSION  = 40014; // バージョン未指定を一覧・tooltip・通知から除外するトグル（期日ありは例外的に残す）
 static constexpr UINT IDM_MUTE_OWN_CHANGES    = 40015; // 自分の操作による起票・更新を通知抑止するトグル（一覧・tooltip は変更しない）
 static constexpr UINT IDM_OPEN_GUIDE          = 40016; // セットアップガイド（GitHub Pages）を開く
-static constexpr UINT IDM_EXCLUDE_HIDDEN      = 40017; // 非表示チケットを一覧から除外するトグル（OFF はグレーで表示）
+static constexpr UINT IDM_EXCLUDE_HIDDEN      = 40017; // 非表示チケットを一覧から除外するトグル（OFF はグレー＋取消線で表示）
 static constexpr UINT IDM_HOVER_POPUP         = 40018; // ホバーで一覧を自動表示するトグル（OFF でも左クリックでは開ける）
 
 static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/redntfy";
@@ -231,8 +231,8 @@ static std::atomic<bool> g_sortByDue{false};
 // 対価として、ON 中に抑止した更新は state.json に記録済みのため OFF に戻しても再通知されない。
 static std::atomic<bool> g_excludeNoVersion{false};
 
-// 非表示チケットを一覧から除外するトグル（レジストリ永続化。既定 OFF ＝グレーで表示）
-// ON で g_hiddenIds のチケットを一覧に出さない。OFF では非活性色（グレー）で参考表示する。
+// 非表示チケットを一覧から除外するトグル（レジストリ永続化。既定 OFF ＝グレー＋取消線で表示）
+// ON で g_hiddenIds のチケットを一覧に出さない。OFF では非活性色（グレー）＋取消線で参考表示する。
 // 未処理件数・未読件数・通知は本トグルと無関係に常に非表示チケットを除外する。
 // （「見なくて良いもの」の意思表示は id 単位の g_hiddenIds 側が持ち、本トグルは見え方だけを変える）
 static std::atomic<bool> g_excludeHidden{false};
@@ -3187,7 +3187,7 @@ struct ListRow {
     bool        assignedToGroup = false;
     bool        isBugTracker    = false;
     bool        pinned          = false;
-    bool        hidden          = false;  // 非表示チケット（グレー描画。件数・未読に数えない）
+    bool        hidden          = false;  // 非表示チケット（グレー＋取消線描画。件数・未読に数えない）
     bool        closed          = false;
     bool        unread          = false;
 };
@@ -3201,7 +3201,7 @@ struct ListRow {
 //      期日なしは末尾。ピンも同じ規則で本来の位置に置く）
 //   4. 先頭 list_limit 件へ絞る（ピン留めと非表示チケットは上限適用外で常に残す）
 // 非表示チケット（g_hiddenIds）は「非表示チケットを除外」トグル ON なら行に出さず、
-// OFF なら hidden フラグ付きで通す。（グレー参考表示。フィルタは通常行と同じく適用するが、
+// OFF なら hidden フラグ付きで通す。（グレー＋取消線の参考表示。フィルタは通常行と同じく適用するが、
 // list_limit の予算には数えない。枠を消費させると更新の多い非表示チケットが上位に浮上して
 // 未読の通常行を窓外へ押し出し、バッジ・未読件数から消してしまうため）
 // visible には表示フィルタを通った未処理件数（絞り込み前）を返す。フィルタを通ったピンは
@@ -3235,7 +3235,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
     std::unordered_set<int> shown;
     visible = 0;
     for (const auto& is : issues) {
-        // 非表示チケットはトグル ON なら行ごと出さず、OFF ならグレー参考表示で通す。
+        // 非表示チケットはトグル ON なら行ごと出さず、OFF ならグレー＋取消線の参考表示で通す。
         // どちらでも未処理件数（visible）には数えない。（ピンと違いフィルタは免除しない）
         bool hidden = hiddenIds.count(is.id) != 0;
         if (hidden && g_excludeHidden.load()) continue;
@@ -3427,7 +3427,7 @@ struct IssueItem {
     std::vector<ColorRange> ranges;
     bool         unread     = false; // 未読（まだ一覧から開いていない）＝太字で描く
     bool         pinned = false; // ピン留め中（マーカー列の描画条件。右クリック遷移時にもその場で更新する）
-    bool         hidden = false; // 非表示（グレー描画の条件。右クリック遷移時にもその場で更新する）
+    bool         hidden = false; // 非表示（グレー＋取消線描画の条件。右クリック遷移時にもその場で更新する）
     bool         closed = false; // クローズ済（打ち消し線の描画条件）
 };
 static std::vector<IssueItem> g_issueItems;
@@ -3950,7 +3950,7 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_STRING | (g_excludeNoVersion ? MF_CHECKED : MF_UNCHECKED),
         IDM_EXCLUDE_NO_VERSION, L"バージョン未指定のチケットを除外");
 
-    // 非表示チケットの除外（レジストリ永続化。OFF はグレーで参考表示）
+    // 非表示チケットの除外（レジストリ永続化。OFF はグレー＋取消線で参考表示）
     AppendMenuW(hMenu, MF_STRING | (g_excludeHidden ? MF_CHECKED : MF_UNCHECKED),
         IDM_EXCLUDE_HIDDEN, L"非表示チケットを除外");
 
@@ -4265,8 +4265,9 @@ static SIZE measureIssueRow(HDC hdc, const IssueItem& item) {
 }
 
 // 一覧行の描画
-// hot（カーソルが乗っている行）に応じた背景色・テキスト色を切り替え、closed フラグが
-// 立つ項目には DrawTextW 後に 2 px の取消線を手動で重ね描画する。
+// hot（カーソルが乗っている行）に応じた背景色・テキスト色を切り替え、closed または hidden
+// フラグが立つ項目には DrawTextW 後に 2 px の取消線を手動で重ね描画する。
+// （非表示はグレー一色だけでは通常行との差が分かりにくいため、取消線で「除外済」を示す）
 // IssueLabel::ranges に色付け範囲がある行は、範囲ごとに文字色を変えて分割描画する。
 // hidden フラグが立つ項目は非活性の慣例に合わせて全体を COLOR_GRAYTEXT 一色で描く。
 // （期日超過などの範囲色より優先する）ホット時はハイライト背景に GRAYTEXT が沈んで
@@ -4319,7 +4320,7 @@ static void drawIssueRow(HDC hdc, const RECT& rcItem, const IssueItem& item, boo
     int labelWidth = walkIssueLabel(hdc, item, &textRect, textColor,
                                    baseFont, emphFont, hot || item.hidden);
     SetTextColor(hdc, textColor);  // 打ち消し線が textColor を使うため戻す
-    if (item.closed) {
+    if (item.closed || item.hidden) {
         constexpr int STRIKE_THICKNESS = 2;
         // 中央から 1 px だけ下寄せにして視認性を上げる
         constexpr int STRIKE_Y_OFFSET  = 1;
