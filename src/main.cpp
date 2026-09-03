@@ -940,9 +940,10 @@ static std::string redmineGet(const std::wstring& url, const std::wstring& apiKe
 
 // JSON 文字列をアトミックにファイルへ書き出す（一時ファイル経由で MoveFileEx 置換）
 // 電源断・クラッシュで本体ファイルが壊れる可能性を避ける。
-// 一時ファイル名にはスレッド id を含める。pins.json はメインスレッド（cycleIssueState）と
-// ポーリングスレッド（refreshPins）から並行して保存され得るため、固定名 ".tmp" だと
-// 片方の書き込み途中をもう片方が切り詰め、壊れた JSON が本体へ公開される窓がある。
+// 一時ファイル名にはスレッド id を含める。同一ファイルへの並行書き込みは呼び出し側が
+// 防ぐ（state はポーリングスレッド専用、pins・hidden は g_saveMtx で直列化）。
+// 固定名 ".tmp" はこの呼び出し規約が崩れた瞬間に、片方の書き込み途中をもう片方が
+// 切り詰めて壊れた JSON を本体へ公開する。tmp 名の一意性で衝突を構造的に排除する。
 // logTag はエラー出力用の識別子（"state" / "pins" 等）。成功時 true、失敗時 false。
 static bool atomicWriteJson(const std::wstring& path, const std::string& json,
     const char* logTag)
