@@ -2681,13 +2681,19 @@ static bool playWavToWasapi(const Config& cfg) {
         }
 
         // WAV PCM 供給ループ（メモリバッファから読み込み）
+        // GetCurrentPadding / GetBuffer の失敗（BLE ヘッドホン切断等のデバイス無効化。
+        // AUDCLNT_E_DEVICE_INVALIDATED は恒久エラーで自然回復しない）は中断して抜ける。
+        // 放置すると本ループが無限ループし、ダッキング解除が永久に行われない。
         UINT32 sentFrames = 0;
         bool   eof        = false;
         client->Start();
         while (!eof && !g_shutdownRequested) {
             WaitForSingleObject(hEvent, 200);
             UINT32 padding = 0;
-            client->GetCurrentPadding(&padding);
+            if (FAILED(client->GetCurrentPadding(&padding))) {
+                writeLog("playWavToWasapi: GetCurrentPadding failed, aborting playback");
+                break;
+            }
             UINT32 avail = bufFrames - padding;
             if (avail == 0) continue;
 
@@ -2705,13 +2711,16 @@ static bool playWavToWasapi(const Config& cfg) {
                 break;
             }
 
-            BYTE* buf = nullptr;
-            if (SUCCEEDED(render->GetBuffer(frames, &buf))) {
-                memcpy(buf, pcmData + sentFrames * wavFmt.nChannels,
-                       frames * wavFmt.nBlockAlign);
-                render->ReleaseBuffer(frames, 0);
-                sentFrames += frames;
+            BYTE*   buf   = nullptr;
+            HRESULT hrBuf = render->GetBuffer(frames, &buf);
+            if (FAILED(hrBuf)) {
+                writeLog("playWavToWasapi: GetBuffer failed, aborting playback");
+                break;
             }
+            memcpy(buf, pcmData + sentFrames * wavFmt.nChannels,
+                   frames * wavFmt.nBlockAlign);
+            render->ReleaseBuffer(frames, 0);
+            sentFrames += frames;
         }
 
         // 末尾ガードトーン（BLE ヘッドホン対処：省電力移行防止、ダッキング解除前の緩衝）
