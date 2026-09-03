@@ -1141,10 +1141,18 @@ static bool saveState(const std::wstring& dir, const Config& cfg, const std::vec
     }
 }
 
+// pins.json / hidden.json の保存直列化用 mutex（1 つを共有）
+// スナップショット取得から atomicWriteJson 完了までを直列化し、メインスレッドと
+// ポーリングスレッドの並行保存で古いスナップショットが後から rename される
+// ロスト・アップデートを防ぐ。ロック順は g_saveMtx → g_mtx の一方向のみ。
+static std::mutex g_saveMtx;
+
 // ピン留めの保存
 // トグル操作とポーリング時の鮮度更新のたびに g_pins を上書き保存する。g_mtx ロック外で呼ぶこと。
+// g_saveMtx で保存全体（スナップショット→書き込み）を直列化する。
 static void savePins(const std::wstring& dir) {
     using namespace winrt::Windows::Data::Json;
+    std::lock_guard<std::mutex> saveLk(g_saveMtx);
     try {
         JsonArray arr;
         {
@@ -1221,8 +1229,10 @@ static void loadPins(const std::wstring& dir) {
 // 非表示チケットの保存
 // 右クリックの状態遷移とポーリング時の自動削除（pruneHidden）のたびに g_hiddenIds を
 // id の JSON 配列で上書き保存する。g_mtx ロック外で呼ぶこと。
+// g_saveMtx で保存全体（スナップショット→書き込み）を直列化する。
 static void saveHidden(const std::wstring& dir) {
     using namespace winrt::Windows::Data::Json;
+    std::lock_guard<std::mutex> saveLk(g_saveMtx);
     try {
         JsonArray arr;
         {
