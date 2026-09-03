@@ -43,14 +43,25 @@ Google カレンダーの予定を同じ仕組みで通知する姉妹ツール 
 
 ### 手順
 
-Scoop での導入手順です。
+#### リリースの ZIP から
+
+[Releases](https://github.com/aviscaerulea/redntfy/releases/latest) から ZIP をダウンロードしてください。次に任意のフォルダへ展開します。最後に `redntfy.exe` を実行します。
+
+#### Scoop から
 
 ```powershell
 scoop bucket add aviscaerulea https://github.com/aviscaerulea/scoop-bucket
 scoop install redntfy
 ```
 
-zip から手動で導入するときは、[Releases](https://github.com/aviscaerulea/redntfy/releases/latest) から zip をダウンロードしてください。次に任意のフォルダへ展開します。最後に `redntfy.exe` を実行します。
+#### アンインストール
+
+アンインストールしても、以下の 2 つが残ります。不要であれば手動で削除してください。
+
+- レジストリキー `HKEY_CURRENT_USER\SOFTWARE\redntfy`（トレイメニューで変更した設定）
+- スタートメニューのショートカット `redntfy.lnk`（Windows 通知の表示に必要）
+
+Windows へのスタートアップ登録は、削除の前にトレイメニューで解除してください。
 
 ## 使い方
 

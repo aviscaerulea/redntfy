@@ -43,14 +43,25 @@ Right-clicking the tray icon opens the tray menu, which provides various setting
 
 ### Steps
 
-Using Scoop.
+#### From the release ZIP
+
+Download the zip from [Releases](https://github.com/aviscaerulea/redntfy/releases/latest), extract it to any folder, and run `redntfy.exe`.
+
+#### From Scoop
 
 ```powershell
 scoop bucket add aviscaerulea https://github.com/aviscaerulea/scoop-bucket
 scoop install redntfy
 ```
 
-To install manually from a zip archive, download the zip from [Releases](https://github.com/aviscaerulea/redntfy/releases/latest), extract it to any folder, and run `redntfy.exe`.
+#### Uninstallation
+
+Uninstalling leaves the following two behind. Delete them manually if you no longer need them.
+
+- The registry key `HKEY_CURRENT_USER\SOFTWARE\redntfy` (settings changed from the tray menu)
+- The Start menu shortcut `redntfy.lnk` (required to display Windows notifications)
+
+If you registered the app to start with Windows, turn that off from the tray menu before deleting them.
 
 ## Usage
 
