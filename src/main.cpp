@@ -2510,7 +2510,12 @@ static void loadWavAndNormalize(const std::wstring& exeDir, const Config& cfg) {
                 // 奇数サイズの WAV で ReadFile がバッファ境界外を要求しないよう int16_t に整列
                 DWORD totalBytes = chunkSize & ~1u;
                 samples.resize(totalBytes / sizeof(int16_t));
-                ReadFile(hFile, samples.data(), totalBytes, &nRead, nullptr);
+                // 短読みは破損 WAV の許容範囲として実測バイト数を採るが、
+                // ReadFile 自体の失敗は無音再生になるため打ち切る
+                if (!ReadFile(hFile, samples.data(), totalBytes, &nRead, nullptr)) {
+                    writeLog("loadWavAndNormalize: failed to read data chunk");
+                    goto cleanup;
+                }
                 samples.resize(nRead / sizeof(int16_t));
                 hasData = true;
             }
