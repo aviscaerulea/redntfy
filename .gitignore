@@ -1,12 +1,31 @@
-# ビルド成果物
-out/
+# デフォルト全除外
+*
 
-# ユーザ環境固有ファイル（*.local.* は環境依存のため全て除外）
-.env
+# 管理対象ファイル
+!/.gitignore
+!/CLAUDE.md
+!/LICENSE
+!/README.md
+!/README.en.md
+!/Taskfile.yml
+!/build.ps1
+!/redntfy.toml
+
+# 管理対象ディレクトリ
+!/.github/
+!/.github/**
+!/docs/
+!/docs/**
+!/src/
+!/src/**
+!/tests/
+!/tests/**
+
+# 管理対象内の除外
 *.local.*
-**/*.local.*
+.env
 
-# git ワークツリー
-.worktrees/
-# Added by code-review-graph
-.code-review-graph/
+# GitHub Pages（Jekyll）のローカルビルド成果物
+/docs/_site/
+/docs/.jekyll-cache/
+/docs/.sass-cache/
