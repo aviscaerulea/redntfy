@@ -124,4 +124,4 @@ query_ids = [12, 34]
 ## ライセンス
 
 アプリケーションアイコンには Redmine 公式ロゴを使用しています。
-ロゴは Martin Herr 氏の著作物で、[CC BY-SA 2.5](https://creativecommons.org/licenses/by-sa/2.5/) でライセンスされています。
+ロゴは Martin Herr 氏の著作物で、ライセンスは [CC BY-SA 2.5](https://creativecommons.org/licenses/by-sa/2.5/) です。
