@@ -510,18 +510,25 @@ static void testSelectNotifyTargets() {
         auto r = selectNotifyTargets(issues, prev, true, ME);
         CHECK(r && r->size() == 1 && (*r)[0].updaterName == "起票者");
     }
-    // 自分の起票・自分の直近更新による流入は抑止し、抑止 OFF なら通知する
+    // 自分の起票・自分の直近更新による流入・自分による既知チケットの更新は抑止し、
+    // 抑止件数を mutedOwn に書き戻す。抑止 OFF なら通知して抑止件数は 0
     {
         auto prev = makePrevState();
+        prev.issues[112] = {"2026-08-01T12:00:00Z", {1}, true};
         auto mine = makeIssue(103);
         mine.authorId = ME;
         auto updatedByMe = makeIssue(104);
         updatedByMe.updaterId = ME;
-        std::vector<Issue> issues{mine, updatedByMe};
-        auto r = selectNotifyTargets(issues, prev, true, ME);
+        auto knownUpdatedByMe = makeIssue(112, "2026-08-02T00:00:00Z");
+        knownUpdatedByMe.updaterId = ME;
+        std::vector<Issue> issues{mine, updatedByMe, knownUpdatedByMe};
+        int muted = -1;
+        auto r = selectNotifyTargets(issues, prev, true, ME, {}, &muted);
         CHECK(r && r->empty());
-        r = selectNotifyTargets(issues, prev, false, ME);
-        CHECK(r && r->size() == 2);
+        CHECK(muted == 3);
+        r = selectNotifyTargets(issues, prev, false, ME, {}, &muted);
+        CHECK(r && r->size() == 3);
+        CHECK(muted == 0);
     }
     // 前回追跡していないクエリだけに属する新規は黙って採用する（通知しない）
     {

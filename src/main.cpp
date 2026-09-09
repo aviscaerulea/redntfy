@@ -242,9 +242,9 @@ static std::atomic<bool> g_excludeHidden{false};
 static std::atomic<bool> g_hoverPopupEnabled{true};
 
 // 自分の操作による起票・更新を通知抑止するトグル（レジストリ永続化。既定 ON）
-// deliverPollResults の 3 か所の判定（新規流入の起票者、新規流入の直近更新者、既存更新の更新者）を
+// selectNotifyTargets の 3 か所の判定（新規流入の起票者、新規流入の直近更新者、既存更新の更新者）を
 // 一括で ON/OFF する。抑止対象になったチケットも state.json には全件記録するため、
-// OFF に戻したときに再通知は起きない。
+// OFF に戻したときに再通知は起きない。抑止した件数は「今すぐ更新」の応答 Toast に出す。
 // 一覧・tooltip・バッジ・並び順は本トグルの影響を受けない。（表示ではなく通知のみを制御する）
 static std::atomic<bool> g_muteOwnChanges{true};
 
@@ -5235,15 +5235,20 @@ static bool hasNewQueryEntry(const std::vector<int>& now, const std::vector<int>
 // hiddenIds（非表示チケット）は「見なくて良い」の意思表示のため無条件に除外する。
 // （state.json への記録は呼び出し側が全件で行うので、非表示解除時に溜まった更新が
 // 一斉通知される「通知の嵐」は起きない）
+// mutedOwn（任意）には自分の操作として抑止した件数を書き戻す。「今すぐ更新」の応答 Toast が
+// 「更新はあったが自分の操作だった」と「更新がなかった」を出し分けるために使う。
+// フィルタ・非表示による除外は数えない。（それらは「見なくて良い」の意思表示で、更新の
+// 有無を知らせる対象ではない）
 // issues の最終更新者は resolveUpdaters が確定済みであることを前提とする。
 // 戻り値の NotifyTarget::issue は issues の要素を指す。（issues より長く保持しない）
 // 終了要求による中断は nullopt を返す。（呼び出し側は state.json を書かずに抜ける）
 static std::optional<std::vector<NotifyTarget>> selectNotifyTargets(
     const std::vector<Issue>& issues, const PollState& prev,
     bool muteOwnChanges, int myUserId,
-    const std::unordered_set<int>& hiddenIds = {})
+    const std::unordered_set<int>& hiddenIds = {}, int* mutedOwn = nullptr)
 {
     std::vector<NotifyTarget> targets;
+    int muted = 0;
     for (const auto& is : issues) {
         if (g_shutdownRequested) return std::nullopt;
         // 非表示チケットは通知しない
@@ -5255,7 +5260,10 @@ static std::optional<std::vector<NotifyTarget>> selectNotifyTargets(
         auto it = prev.issues.find(is.id);
         if (it == prev.issues.end()) {
             // 新規流入（自分の起票は通知しない。muteOwnChanges OFF なら通知に倒す）
-            if (muteOwnChanges && myUserId != 0 && is.authorId == myUserId) continue;
+            if (muteOwnChanges && myUserId != 0 && is.authorId == myUserId) {
+                ++muted;
+                continue;
+            }
             // 前回追跡していたクエリのいずれにも属さないチケットは、query_ids へ追加した
             // 直後のクエリ固有の既存チケットなので黙って採用する。（既知チケットの流入抑止と
             // 同じ方針。通知するとサマリ Toast・通知音・未読バッジが件数分跳ね上がる）
@@ -5276,7 +5284,10 @@ static std::optional<std::vector<NotifyTarget>> selectNotifyTargets(
             // 自分でも通知する。（既知チケットのクエリ流入の扱いと揃える）
             // polled_on の無い旧形式 state.json では判定せず通知側に倒す。
             bool recentUpdate = !prev.polledOn.empty() && is.updatedOn > prev.polledOn;
-            if (muteOwnChanges && recentUpdate && myUserId != 0 && is.updaterId == myUserId) continue;
+            if (muteOwnChanges && recentUpdate && myUserId != 0 && is.updaterId == myUserId) {
+                ++muted;
+                continue;
+            }
             // 表示名も同じ基準で選ぶ。直近の更新が原因の流入はその更新者、時間経過の流入は
             // 起票者を出す。（古い最終更新者を「新規：○○」と出すと起票者と誤読される）
             targets.push_back({&is, NotifyKind::New,
@@ -5293,10 +5304,14 @@ static std::optional<std::vector<NotifyTarget>> selectNotifyTargets(
         // 最終更新者は resolveUpdaters が確定済み。
         // updated_on が進んでいない純粋な流入では判定しない：時間経過による流入が典型で
         // 「自分の操作」ではないため。（クエリ流入の Toast は更新者名も出さない）
-        if (muteOwnChanges && updated && myUserId != 0 && is.updaterId == myUserId) continue;
+        if (muteOwnChanges && updated && myUserId != 0 && is.updaterId == myUserId) {
+            ++muted;
+            continue;
+        }
         targets.push_back({&is, updated ? NotifyKind::Updated : NotifyKind::QueryEntered,
                            updated ? is.updaterName : std::string()});
     }
+    if (mutedOwn) *mutedOwn = muted;
     return targets;
 }
 
@@ -5355,9 +5370,14 @@ static void emitNotifications(const Config& cfg, const std::vector<NotifyTarget>
 // 終了要求で選定が中断された場合は state.json を書かずに抜ける。前回のまま残るため、
 // 未通知分は次回ポーリングで再検知される。（通知は失われない）
 // prev は呼び出し側が loadState で読んだ前回状態。（resolveUpdaters のキャッシュと共有するため外で読む）
-// 戻り値：通知対象と判定した件数。（0 は通知なし。「今すぐ更新」の完了通知の出し分けに使う）
-static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
-                              const std::vector<Issue>& issues, const PollState& prev)
+// 戻り値：通知した件数と、自分の操作として抑止した件数。「今すぐ更新」の応答 Toast の出し分けに使う。
+// ベースライン未確立・中断時はどちらも 0。
+struct PollOutcome {
+    int notified = 0;  // 通知対象と判定した件数（0 は通知 Toast なし）
+    int mutedOwn = 0;  // 自分の操作として通知を抑止した件数
+};
+static PollOutcome deliverPollResults(const std::wstring& exeDir, const Config& cfg,
+                                      const std::vector<Issue>& issues, const PollState& prev)
 {
     // 一覧・tooltip 用の共有状態を更新する
     {
@@ -5372,7 +5392,7 @@ static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
             showErrorToast(L"状態保存エラー", L"state.json を書き込めません。展開先の書き込み権限を確認してください");
         if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
         writeLog("baseline established (" + std::to_string(issues.size()) + " issues)");
-        return 0;
+        return {};
     }
 
     // 旧形式からの移行と query_ids への追加分をログに残す。
@@ -5395,9 +5415,10 @@ static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         std::lock_guard<std::mutex> lk(g_mtx);
         hiddenIds = g_hiddenIds;
     }
+    int mutedOwn = 0;
     auto targets = selectNotifyTargets(issues, prev, g_muteOwnChanges.load(), g_myUserId.load(),
-                                       hiddenIds);
-    if (!targets) return 0;  // 終了要求による中断
+                                       hiddenIds, &mutedOwn);
+    if (!targets) return {};  // 終了要求による中断
 
     if (!targets->empty()) emitNotifications(cfg, *targets);
 
@@ -5406,20 +5427,27 @@ static int deliverPollResults(const std::wstring& exeDir, const Config& cfg,
         showErrorToast(L"状態保存エラー", L"state.json を書き込めません。通知が重複する可能性があります");
     if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
 
-    return static_cast<int>(targets->size());
+    return {static_cast<int>(targets->size()), mutedOwn};
 }
 
-// 「今すぐ更新」の完了 Toast
+// 「今すぐ更新」の応答 Toast
 //
-// 明示のユーザ操作に対し、新しい更新がなかったことだけを 1 行で知らせる。
+// 明示のユーザ操作に対し、通知した更新がなかったことを 1 行で知らせる。
+// mutedOwn（自分の操作として抑止した件数）が非 0 なら、その件数を添える。
+// 「新しい更新はありません」だけでは、自分が直前に起票・更新したチケットが取得できたのか
+// 判別できないため。（フィルタ・非表示で除外した分は数えない。selectNotifyTargets を参照）
 // 「更新が完了しました」等の正常終了文言や未処理件数は出さない。
 // （件数は一覧フッタが担うため、Toast に出すと二重表示になる）
-// 更新を検知した回は通知 Toast 自体が完了の合図になるため、呼び出し側で出し分ける。
+// 更新を検知した回は通知 Toast 自体が応答の合図になるため、呼び出し側で出し分ける。
 // 通知音は鳴らさない。（チケットの更新通知と違い、ユーザが待っている場面での応答のため）
-static void showPollDoneToast()
+static void showPollDoneToast(int mutedOwn)
 {
     try {
-        showToast(L"新しい更新はありません", L"", L"", true);
+        if (mutedOwn > 0)
+            showToast(L"自分の操作による更新 " + std::to_wstring(mutedOwn) + L" 件（通知なし）",
+                      L"", L"", true);
+        else
+            showToast(L"新しい更新はありません", L"", L"", true);
     }
     catch (winrt::hresult_error const& e) {
         writeLog("poll done toast failed: " + winrt::to_string(e.message()));
@@ -5628,7 +5656,7 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
                     break;
                 }
                 // 手動更新の失敗はクールダウンを無視して必ず知らせる。無音のままだと
-                // 操作が届いたのか失敗したのか区別できず、完了通知の目的を果たせない
+                // 操作が届いたのか失敗したのか区別できず、応答 Toast の目的を果たせない
                 showErrorToast(L"接続エラー", L"Redmine API に接続できません", manualTriggered);
                 waitInterruptible(RETRY_WAIT_MS);
                 continue;
@@ -5666,13 +5694,13 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             resolveUpdaters(cfg, issues, prevState, session.userNames);
             if (g_shutdownRequested) break;  // resolveUpdaters は HTTP を伴うため中断を確認する
 
-            int notified = deliverPollResults(exeDir, cfg, issues, prevState);
+            PollOutcome outcome = deliverPollResults(exeDir, cfg, issues, prevState);
             refreshPins(exeDir, cfg, issues, session.groupIds, session.groupIdsResolved);
             pruneHidden(exeDir, issues);
 
-            // 「今すぐ更新」の完了通知。更新を検知した回は通知 Toast が出ているため重ねない
-            if (manualTriggered && notified == 0 && !g_shutdownRequested)
-                showPollDoneToast();
+            // 「今すぐ更新」の応答 Toast。更新を検知した回は通知 Toast が出ているため重ねない
+            if (manualTriggered && outcome.notified == 0 && !g_shutdownRequested)
+                showPollDoneToast(outcome.mutedOwn);
 
             g_lastPollTick.store(GetTickCount64());
             waitInterruptible(calcSleepUntilNextPoll(pollsPerHour));
