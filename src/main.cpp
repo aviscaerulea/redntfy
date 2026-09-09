@@ -393,7 +393,7 @@ struct PinEntry {
 enum FormatElement {
     FMT_LITERAL = -1,  // リテラル文字列（未知プレースホルダの原文もこれで保持）
     FMT_ID, FMT_LASTNAME, FMT_FIRSTNAME, FMT_GROUP, FMT_PROJECT,
-    FMT_DUE, FMT_BUG, FMT_SUBJECT, FMT_AGO,
+    FMT_DUE, FMT_NEW, FMT_BUG, FMT_SUBJECT, FMT_AGO,
 };
 
 // list_format の解析済みトークン
@@ -404,9 +404,9 @@ struct FormatToken {
     int          maxChars = 0;         // 最大文字数（0 = 切り詰めなし）
 };
 
-// list_format の既定値（v1.4 までの固定並びと同一の表示になる）
+// list_format の既定値（v1.4 までの固定並びへ新規流入マーカー {new} を件名の直前に加えた並び）
 static constexpr wchar_t LIST_FORMAT_DEFAULT[] =
-    L"#{id}  {lastname}  {group}[{project:5}] {due} {bug}{subject:40}{ago}";
+    L"#{id}  {lastname}  {group}[{project:5}] {due} {new}{bug}{subject:40}{ago}";
 
 // フォールバックモード（query_ids 省略）の擬似クエリ id
 // Redmine のクエリ id は正の整数のため 0 は衝突しない。state.json の queries／
@@ -481,6 +481,16 @@ static Config                  g_currentConfig;
 // 刈り取りはしないので、再び一覧に出た時点で未読として現れる。
 // 永続化しない。
 static std::unordered_set<int> g_unreadIds;
+
+// 新規流入チケットの id 集合（g_mtx で保護。一覧の ✨ マーカーの唯一の根拠）
+// NotifyKind::New で通知した id だけを入れる。自分の起票、query_ids 追加直後の「黙って採用」、
+// ベースライン未確立の回は通知対象にならないため印も付かない。
+// （把握済みのチケットや大量流入の場面で印が溢れるのを防ぐ意図と一致する）
+// g_unreadIds の部分集合として維持する契約：挿入は通知時、削除は行クリックの既読化時に、
+// 未読と必ず同じ箇所で行い、「新規かつ既読」という状態は作らない。
+// 未読と分けるのは概念が別で、未読側の意味（まだ開いていない）を新規の都合で変えないため。
+// 永続化しない。（再起動で消える。未読と同じ扱い）
+static std::unordered_set<int> g_newIds;
 
 // 非表示チケットの id 集合（g_mtx で保護。hidden.json で永続化）
 // 一覧の右クリックループ（通常 → ピン留め → 非表示 → 通常）で出入りする。
@@ -1307,7 +1317,8 @@ static std::vector<FormatToken> parseListFormat(const std::wstring& fmt) {
     static const std::pair<const wchar_t*, int> NAMES[] = {
         { L"id", FMT_ID }, { L"lastname", FMT_LASTNAME }, { L"firstname", FMT_FIRSTNAME },
         { L"group", FMT_GROUP }, { L"project", FMT_PROJECT }, { L"due", FMT_DUE },
-        { L"bug", FMT_BUG }, { L"subject", FMT_SUBJECT }, { L"ago", FMT_AGO },
+        { L"new", FMT_NEW }, { L"bug", FMT_BUG }, { L"subject", FMT_SUBJECT },
+        { L"ago", FMT_AGO },
     };
     std::vector<FormatToken> tokens;
     std::wstring lit;  // 連続するリテラル文字の蓄積（プレースホルダ確定時にトークン化する）
@@ -3243,6 +3254,7 @@ struct ListRow {
     bool        hidden          = false;  // 非表示チケット（グレー＋取消線描画。件数・未読に数えない）
     bool        closed          = false;
     bool        unread          = false;
+    bool        isNew           = false;  // 新規流入（{new} の ✨ マーカー。非表示行は常に false）
 };
 
 // 一覧に出す行を選定し、並べ替えて list_limit 件へ絞る
@@ -3263,17 +3275,19 @@ struct ListRow {
 // 非表示チケットもトグルにかかわらず数えない。（「見なくて良い」の意思表示のため）
 // tooltip の未読件数も本関数の結果から数える。表示と同じ選定を通すことで「未読 N 件」と
 // 画面上の太字行数を一致させる。（一覧に出ない未読は数に出さず、バッジも点けない）
-// 非表示チケットの unread は常に false にする。（太字にも未読件数にも出さない）
+// 非表示チケットの unread・isNew は常に false にする。（太字にも未読件数にも ✨ にも出さない）
 static std::vector<ListRow> buildListRows(int& visible) {
     std::vector<Issue>      issues;
     std::vector<PinEntry>   pins;
     std::unordered_set<int> unread;
+    std::unordered_set<int> newIds;
     std::unordered_set<int> hiddenIds;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         issues    = g_issues;
         pins      = g_pins;
         unread    = g_unreadIds;
+        newIds    = g_newIds;
         hiddenIds = g_hiddenIds;
     }
 
@@ -3308,7 +3322,8 @@ static std::vector<ListRow> buildListRows(int& visible) {
                         .updatedOn = is.updatedOn, .assignedToGroup = is.assignedToGroup,
                         .isBugTracker = is.isBugTracker,
                         .pinned = pinned, .hidden = hidden, .closed = is.closed,
-                        .unread = !hidden && unread.count(is.id) != 0});
+                        .unread = !hidden && unread.count(is.id) != 0,
+                        .isNew = !hidden && newIds.count(is.id) != 0});
         shown.insert(is.id);
     }
     for (const auto& p : pins) {
@@ -3319,7 +3334,8 @@ static std::vector<ListRow> buildListRows(int& visible) {
                         .updatedOn = p.updatedOn, .assignedToGroup = p.assignedToGroup,
                         .isBugTracker = p.isBugTracker,
                         .pinned = true, .closed = p.closed,
-                        .unread = unread.count(p.id) != 0});
+                        .unread = unread.count(p.id) != 0,
+                        .isNew = newIds.count(p.id) != 0});
     }
 
     if (g_sortByDue.load()) {
@@ -3656,15 +3672,23 @@ static constexpr wchar_t GROUP_MARK[] = L"👥 ";
 // 扱いは GROUP_MARK と同じ。（ラベル埋め込みの GDI 単色描画）
 static constexpr wchar_t BUG_MARK[] = L"💥 ";
 
+// 新規流入マーカー（✨ + 半角スペース）
+// 扱いは GROUP_MARK と同じ。（ラベル埋め込みの GDI 単色描画）
+// 色は既定の文字色に据え置く。赤は期限切れと 💥 に予約済みで、緊急度ではない新規に使うと
+// 意味が混ざるためだ。
+static constexpr wchar_t NEW_MARK[] = L"✨ ";
+
 // 一覧行のラベルを組み立てる
 //   並びは list_format（g_currentConfig.listFormat）のトークン列に従う。
-//   既定は「番号、姓、グループ担当マーカー、[プロジェクト名]、期日、バグマーカー、件名、経過日数」
-//   （例："#12345  山田  👥 [ロケモニ] 7/28 💥 件名…（3 日前）"）。
+//   既定は「番号、姓、グループ担当マーカー、[プロジェクト名]、期日、新規流入マーカー、
+//   バグマーカー、件名、経過日数」
+//   （例："#12345  山田  👥 [ロケモニ] 7/28 ✨ 💥 件名…（3 日前）"）。
 //   {要素:N} の最大文字数で切り詰める。「…」は自由文の {subject} のみ付け、
 //   識別子的な要素（プロジェクト名・姓・名など）は横幅を優先して付けない。
 //   空に展開された要素（期限なし・更新者不明など）は、直後のリテラル先頭空白を
 //   出力末尾が空白または行頭なら取り除いて詰める。（従来の「詰めて省く」を再現）
-//   {group}＝"👥 "・{bug}＝"💥 "・{ago}＝"（3 日前）" は装飾込みで展開し、空なら装飾ごと消える。
+//   {group}＝"👥 "・{new}＝"✨ "・{bug}＝"💥 "・{ago}＝"（3 日前）" は装飾込みで展開し、
+//   空なら装飾ごと消える。
 //   期限切れの期日、件名、経過日数と、常に赤いバグマーカーは ALERT_TEXT_COLOR で描くため、
 //   位置を ranges に記録する。
 //   （ranges はオフセット昇順で並べる契約。展開順の追記がそのまま昇順になる）
@@ -3696,6 +3720,7 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
         case FMT_GROUP:     if (row.assignedToGroup) val = GROUP_MARK; break;
         case FMT_PROJECT:   val = toWide(row.projectName); break;
         case FMT_DUE:       val = due.text; break;
+        case FMT_NEW:       if (row.isNew) val = NEW_MARK; break;
         case FMT_BUG:       if (row.isBugTracker) val = BUG_MARK; break;
         case FMT_SUBJECT:   val = toWide(row.subject); break;
         case FMT_AGO:       val = makeUpdatedAgoText(row.updatedOn, todayDays); break;
@@ -4110,15 +4135,18 @@ static std::wstring getCurrentLogTarget() {
     return logExists ? logPath : g_logDir;
 }
 
-// 開いたチケット 1 件を既読にする
+// 開いたチケット 1 件を既読にする（新規流入マーカーも同時に外す）
 // 行クリック時点では一覧ポップアップがまだ可視で、g_popupShowing 中の直接呼びは
 // updateTrayTooltip に捨てられる。PostMessage でキューに積んでおけば、
 // この後の hideListPopup（フラグ解除）を経てから必ず反映される。
+// 再描画の要否は未読の有無だけで判断してよい。g_newIds は g_unreadIds の部分集合のため、
+// 新規側だけが変わることはない。
 static void markIssueRead(int issueId) {
     bool wasUnread;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         wasUnread = g_unreadIds.erase(issueId) != 0;
+        g_newIds.erase(issueId);
     }
     if (wasUnread && g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
 }
@@ -4789,12 +4817,19 @@ static void hideListPopup(HWND trayWnd) {
 // g_pins・g_hiddenIds と item.pinned/hidden を更新し、当該行を再描画する。
 // （マーカー・グレーの描画自体は drawIssueRow が pinned/hidden を参照して行う）
 // 状態は排他で、ピン留め → 非表示の遷移でピンは解除される。ピンの件数に上限はない。
-// 非表示は通知対象外のため、非表示への遷移時は未読からも取り除く。（太字と件数の残留を防ぐ）
+// 非表示への遷移で g_unreadIds・g_newIds には触らない。非表示は「見なくて良い」の意思表示で
+// あって既読（開いた）ではないため、非表示を解除すれば未読の太字と ✨ は戻る。
+// 非表示中に太字・✨・未読件数へ出ないのは buildListRows の hidden 判定が担う。
+// 開いたままの一覧でも同じ見え方にするため、非表示への遷移で item.unread を落とし、
+// 解除では g_unreadIds の現況から復元する。
+// 遷移直後の再描画では、太字は item.unread で即座に切り替わるが、組み立て済みラベルが
+// 保持する ✨ は非表示中も残る。（IssueItem にマーカー用のフラグを持たせていないため。
+// グレー＋取消線の行なので誤読はなく、次に一覧を開けば消えるため許容する）
 static void cycleIssueState(size_t itemIndex) {
     if (itemIndex >= g_issueItems.size()) return;
 
     auto& item = g_issueItems[itemIndex];
-    bool nowPinned, nowHidden;
+    bool nowPinned, nowHidden, nowUnread;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         auto it = std::find_if(g_pins.begin(), g_pins.end(),
@@ -4803,14 +4838,17 @@ static void cycleIssueState(size_t itemIndex) {
             // ピン留め → 非表示
             g_pins.erase(it);
             g_hiddenIds.insert(item.id);
-            g_unreadIds.erase(item.id);
             nowPinned = false;
             nowHidden = true;
+            nowUnread = false;  // 非表示行は太字にしない（buildListRows と同じ扱い）
         }
         else if (g_hiddenIds.erase(item.id) != 0) {
             // 非表示 → 通常
+            // 非表示中も g_unreadIds には残しているため、集合の現況から太字を復元する。
+            // （ここで復元しないと、一覧を開き直すまで未読なのに細字のままになる）
             nowPinned = false;
             nowHidden = false;
+            nowUnread = g_unreadIds.count(item.id) != 0;
         }
         else {
             // 通常 → ピン留め
@@ -4836,12 +4874,13 @@ static void cycleIssueState(size_t itemIndex) {
             g_pins.push_back(std::move(p));
             nowPinned = true;
             nowHidden = false;
+            nowUnread = item.unread;  // ピン留めは未読に影響しない
         }
     }
-    // 描画は drawIssueRow が pinned/hidden を参照するため、フラグ更新と再描画だけで見た目が切り替わる
+    // 描画は drawIssueRow が pinned/hidden/unread を参照するため、フラグ更新と再描画だけで見た目が切り替わる
     item.pinned = nowPinned;
     item.hidden = nowHidden;
-    if (nowHidden) item.unread = false;  // 非表示行は太字にしない（buildListRows と同じ扱い）
+    item.unread = nowUnread;
 
     // 当該行だけを再描画する。（erase は FALSE：行描画が背景ごと塗るため消去は不要で、
     // TRUE だと全面消去→再描画の白フラッシュ（チラつき）が見える）
@@ -5375,9 +5414,14 @@ static void emitNotifications(const Config& cfg, const std::vector<NotifyTarget>
     if (g_soundEnabled.load() && !(g_muteInMeeting.load() && isMeetingActive()))
         launchSound(cfg);
     {
-        // 未読 id を記録する。（一覧の太字と tooltip の未読件数。行クリックで開いた分だけ取り除く）
+        // 未読 id と新規流入 id を記録する。（一覧の太字・未読件数と ✨ マーカー。
+        // どちらも行クリックで開いた分だけ取り除く。g_newIds を g_unreadIds の
+        // 部分集合に保つため、挿入は必ずこの 1 箇所で同時に行う）
         std::lock_guard<std::mutex> lk(g_mtx);
-        for (const auto& t : targets) g_unreadIds.insert(t.issue->id);
+        for (const auto& t : targets) {
+            g_unreadIds.insert(t.issue->id);
+            if (t.kind == NotifyKind::New) g_newIds.insert(t.issue->id);
+        }
     }
     int nNew = 0, nUpd = 0, nEnt = 0;
     for (const auto& t : targets) {

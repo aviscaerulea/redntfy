@@ -59,8 +59,8 @@ static void testParseListFormat() {
     // 既定テンプレートの全トークン（並び・要素・最大文字数）
     {
         auto t = parseListFormat(LIST_FORMAT_DEFAULT);
-        CHECK(t.size() == 14);
-        if (t.size() == 14) {
+        CHECK(t.size() == 15);
+        if (t.size() == 15) {
             CHECK(t[0].element == FMT_LITERAL);   CHECK_WSTR(t[0].literal, L"#");
             CHECK(t[1].element == FMT_ID);        CHECK(t[1].maxChars == 0);
             CHECK(t[2].element == FMT_LITERAL);   CHECK_WSTR(t[2].literal, L"  ");
@@ -72,9 +72,10 @@ static void testParseListFormat() {
             CHECK(t[8].element == FMT_LITERAL);   CHECK_WSTR(t[8].literal, L"] ");
             CHECK(t[9].element == FMT_DUE);
             CHECK(t[10].element == FMT_LITERAL);  CHECK_WSTR(t[10].literal, L" ");
-            CHECK(t[11].element == FMT_BUG);
-            CHECK(t[12].element == FMT_SUBJECT);  CHECK(t[12].maxChars == 40);
-            CHECK(t[13].element == FMT_AGO);      CHECK(t[13].maxChars == 0);
+            CHECK(t[11].element == FMT_NEW);
+            CHECK(t[12].element == FMT_BUG);
+            CHECK(t[13].element == FMT_SUBJECT);  CHECK(t[13].maxChars == 40);
+            CHECK(t[14].element == FMT_AGO);      CHECK(t[14].maxChars == 0);
         }
     }
 
@@ -169,6 +170,19 @@ static void testBuildIssueLabel() {
             CHECK(lbl.ranges[0].offset < lbl.ranges[1].offset);
             CHECK(lbl.ranges[1].offset < lbl.ranges[2].offset);
             CHECK(lbl.ranges[2].offset < lbl.ranges[3].offset);
+        }
+    }
+
+    // 新規流入：件名の直前に ✨ が入り、後続の色範囲がその分だけ後ろへずれる
+    {
+        auto row = makeRow();
+        row.isNew = true;
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 ✨ 💥 テスト件名（3 日前）");
+        CHECK(lbl.ranges.size() == 4);
+        if (lbl.ranges.size() == 4) {
+            CHECK(lbl.ranges[0].offset == 23);  // 期日は ✨ より前のため不変
+            CHECK(lbl.ranges[1].offset == 30);  // 💥。"✨ "（2 コードユニット）分ずれる
         }
     }
 
