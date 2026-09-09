@@ -3494,7 +3494,8 @@ struct IssueItem {
     std::wstring label;          // 描画テキスト（drawIssueRow / measureIssueRow で使用）
     // label 内で文字色とウェイトを変える範囲（空 = 分割描画しない）。buildIssueLabel が組み立てる
     std::vector<ColorRange> ranges;
-    bool         unread     = false; // 未読（まだ一覧から開いていない）＝太字で描く
+    bool         unread     = false; // 未読（まだ一覧から開いていない）。太字の条件の 1 つ（issueRowBold）
+    bool         hasDue     = false; // 期日あり。太字の条件の 1 つ（issueRowBold）。非表示中は効かない
     bool         pinned = false; // ピン留め中（マーカー列の描画条件。右クリック遷移時にもその場で更新する）
     bool         hidden = false; // 非表示（グレー＋取消線描画の条件。右クリック遷移時にもその場で更新する）
     bool         closed = false; // クローズ済（打ち消し線の描画条件）
@@ -4309,11 +4310,20 @@ static int walkIssueLabel(HDC hdc, const IssueItem& item, const RECT* textRect,
     return x;
 }
 
+// 一覧行を行全体太字で描くかを返す
+// 未読行と期日ありの行を太字にする。未読は「まだ読んでいない」、期日ありは「期日が迫りうる」を
+// 示し、どちらも目を止めるべき行として同じ強調にまとめる。
+// 非表示行はグレー＋取消線の参考行なので、期日があっても太字にしない。（未読は buildListRows と
+// cycleIssueState が非表示中は false に落とすため、ここでは hasDue 側だけ hidden を見る）
+static bool issueRowBold(const IssueItem& item) {
+    return item.unread || (item.hasDue && !item.hidden);
+}
+
 // 一覧行のラベルに使うフォントの組を返す
-// 未読行は行全体が太字のため、部分強調にはそれ以上のウェイトが無い。太字のまま据え置く。
-static void issueLabelFonts(bool unread, HFONT& baseFont, HFONT& emphFont) {
-    baseFont = unread ? g_hMenuFontBold : g_hMenuFont;
-    emphFont = unread ? g_hMenuFontBold : g_hMenuFontSemiBold;
+// 太字行は行全体が太字のため、部分強調にはそれ以上のウェイトが無い。太字のまま据え置く。
+static void issueLabelFonts(bool bold, HFONT& baseFont, HFONT& emphFont) {
+    baseFont = bold ? g_hMenuFontBold : g_hMenuFont;
+    emphFont = bold ? g_hMenuFontBold : g_hMenuFontSemiBold;
 }
 
 // 一覧行のサイズ計算
@@ -4322,7 +4332,7 @@ static void issueLabelFonts(bool unread, HFONT& baseFont, HFONT& emphFont) {
 static SIZE measureIssueRow(HDC hdc, const IssueItem& item) {
     HFONT old = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
     HFONT baseFont = nullptr, emphFont = nullptr;
-    issueLabelFonts(item.unread, baseFont, emphFont);
+    issueLabelFonts(issueRowBold(item), baseFont, emphFont);
     SIZE sz = {};
     sz.cx = walkIssueLabel(hdc, item, nullptr, 0, baseFont, emphFont, false);
     // 行の高さはフォント由来でセグメント分割に依存しないため、metrics から直接得る
@@ -4397,7 +4407,7 @@ static void drawIssueRow(HDC hdc, const RECT& rcItem, const IssueItem& item, boo
     // ラベルは色範囲ごとにフォントと色を切り替えて描く。（ピンマーカー列の幅は通常フォント基準）
     // 走査は measureIssueRow と共有するため、描画幅と行幅・取消線が必ず一致する
     HFONT baseFont = nullptr, emphFont = nullptr;
-    issueLabelFonts(item.unread, baseFont, emphFont);
+    issueLabelFonts(issueRowBold(item), baseFont, emphFont);
     int labelWidth = walkIssueLabel(hdc, item, &textRect, textColor,
                                    baseFont, emphFont, hot || item.hidden);
     SetTextColor(hdc, textColor);  // 打ち消し線が textColor を使うため戻す
@@ -4674,6 +4684,7 @@ static void showListPopup(HWND trayWnd) {
         it.label  = std::move(lbl.text);
         it.ranges = std::move(lbl.ranges);
         it.unread = row.unread;
+        it.hasDue = !row.dueDate.empty();
         it.pinned = row.pinned;
         it.hidden = row.hidden;
         it.closed = row.closed;
@@ -4822,8 +4833,8 @@ static void hideListPopup(HWND trayWnd) {
 // 非表示中に太字・✨・未読件数へ出ないのは buildListRows の hidden 判定が担う。
 // 開いたままの一覧でも同じ見え方にするため、非表示への遷移で item.unread を落とし、
 // 解除では g_unreadIds の現況から復元する。
-// 遷移直後の再描画では、太字は item.unread で即座に切り替わるが、組み立て済みラベルが
-// 保持する ✨ は非表示中も残る。（IssueItem にマーカー用のフラグを持たせていないため。
+// 遷移直後の再描画では、太字は item.unread と hidden（issueRowBold）で即座に切り替わるが、
+// 組み立て済みラベルが保持する ✨ は非表示中も残る。（IssueItem にマーカー用のフラグを持たせていないため。
 // グレー＋取消線の行なので誤読はなく、次に一覧を開けば消えるため許容する）
 static void cycleIssueState(size_t itemIndex) {
     if (itemIndex >= g_issueItems.size()) return;
@@ -4877,7 +4888,7 @@ static void cycleIssueState(size_t itemIndex) {
             nowUnread = item.unread;  // ピン留めは未読に影響しない
         }
     }
-    // 描画は drawIssueRow が pinned/hidden/unread を参照するため、フラグ更新と再描画だけで見た目が切り替わる
+    // 描画は drawIssueRow が pinned/hidden/unread（と hasDue）を参照するため、フラグ更新と再描画だけで見た目が切り替わる
     item.pinned = nowPinned;
     item.hidden = nowHidden;
     item.unread = nowUnread;
