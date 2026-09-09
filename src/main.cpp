@@ -404,7 +404,7 @@ struct FormatToken {
     int          maxChars = 0;         // 最大文字数（0 = 切り詰めなし）
 };
 
-// list_format の既定値（v1.4 までの固定並びへ新規流入マーカー {new} を件名の直前に加えた並び）
+// list_format の既定値（v1.4 までの固定並びへ新規流入マーカー {new} を 💥 マーカーの直前に加えた並び）
 static constexpr wchar_t LIST_FORMAT_DEFAULT[] =
     L"#{id}  {lastname}  {group}[{project:5}] {due} {new}{bug}{subject:40}{ago}";
 
