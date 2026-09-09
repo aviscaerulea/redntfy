@@ -56,8 +56,9 @@ scoop install redntfy
 
 #### Uninstallation
 
-Uninstalling leaves the following two behind. Delete them manually if you no longer need them.
+Uninstalling leaves the following three behind. Delete them manually if you no longer need them.
 
+- The data folder `%LOCALAPPDATA%\redntfy` (detected ticket records, pins, hidden tickets, logs)
 - The registry key `HKEY_CURRENT_USER\SOFTWARE\redntfy` (settings changed from the tray menu)
 - The Start menu shortcut `redntfy.lnk` (required to display Windows notifications)
 

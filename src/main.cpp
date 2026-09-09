@@ -3,6 +3,7 @@
  * redntfy - Redmine の更新チケットを Windows Toast 通知で知らせる常駐アプリ
  *
  * exe 同フォルダの redntfy.toml（redntfy.local.toml がキー単位で上書き）から設定を読み込み、
+ * 検知済み状態・ピン留め・非表示・ログは %LOCALAPPDATA%\redntfy に保存する。
  * [redmine] で指定した複数のグローバル保存クエリ（query_ids）を schedule に従ってポーリングし、
  * チケット id で重複排除した和集合を追跡する。
  * query_ids 省略時はフォールバックモードとして、自分（と所属グループ）が担当のオープンチケットを追跡する。
@@ -51,6 +52,7 @@
 #include <shlwapi.h>
 #include <shellapi.h>
 #include <shobjidl_core.h>
+#include <shlobj_core.h>  // SHGetKnownFolderPath（データディレクトリの解決）
 #include <propsys.h>
 #include <propkey.h>
 #include <propvarutil.h>
@@ -196,13 +198,16 @@ static constexpr wchar_t NO_ISSUES[] = L"チケットはありません";
 static constexpr wchar_t CONFIG_FILENAME[]       = L"redntfy.toml";
 static constexpr wchar_t CONFIG_LOCAL_FILENAME[] = L"redntfy.local.toml";
 
-// 検知済み状態の永続化ファイル名（exe 同フォルダに保存）
+// データディレクトリ名（%LOCALAPPDATA% 直下。getDataDir を参照）
+static constexpr wchar_t DATA_DIR_NAME[] = L"redntfy";
+
+// 検知済み状態の永続化ファイル名（データディレクトリに保存）
 static constexpr wchar_t STATE_FILENAME[] = L"state.json";
 
-// ピン留めの永続化ファイル名（exe 同フォルダに保存）
+// ピン留めの永続化ファイル名（データディレクトリに保存）
 static constexpr wchar_t PINS_FILENAME[] = L"pins.json";
 
-// 非表示チケットの永続化ファイル名（exe 同フォルダに保存。チケット id の JSON 配列のみ）
+// 非表示チケットの永続化ファイル名（データディレクトリに保存。チケット id の JSON 配列のみ）
 static constexpr wchar_t HIDDEN_FILENAME[] = L"hidden.json";
 
 // シャットダウンフラグ（メインスレッド・WndProc・ポーリングスレッドから参照）
@@ -530,7 +535,12 @@ static std::wstring        g_latestVersion;   // g_mtx で保護
 static HANDLE g_soundThread = nullptr;
 
 // exe ディレクトリパス（wmain 起動時に確定し、WndProc スレッドからも参照する）
+// 設定ファイル・通知音の置き場。
 static std::wstring g_exeDir;
+
+// データディレクトリパス（wmain 起動時に確定し、WndProc スレッドからも参照する）
+// state.json・pins.json・hidden.json・logs の置き場。内訳は getDataDir を参照。
+static std::wstring g_dataDir;
 
 // 一覧ポップアップのチケット行描画用フォント（initMenuFonts で初期化）
 static HFONT g_hMenuFont     = nullptr;
@@ -554,6 +564,24 @@ static std::wstring getExeDir() {
     GetModuleFileNameW(nullptr, path, MAX_PATH);
     PathRemoveFileSpecW(path);
     return path;
+}
+
+// データディレクトリ（%LOCALAPPDATA%\redntfy）のパスを取得し、無ければ作成する
+// アプリが書き出すファイル（state.json・pins.json・hidden.json・logs）の置き場。
+// exe 同フォルダに置かないのは、Scoop の更新でバージョン別ディレクトリが切り替わっても
+// ピン留め・非表示・ログを引き継ぐためと、Program Files 等の書き込み不可の展開先でも
+// 動かすため。利用者が編集する設定ファイルは Scoop の persist と整合させて exe 同フォルダのまま。
+// 既知フォルダを解決できない、またはディレクトリを作成できなければ空文字を返す。
+// （ログも状態も残せないため呼び出し側は起動を中止する）
+static std::wstring getDataDir() {
+    PWSTR base = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &base)))
+        return {};
+    std::wstring dir = std::wstring(base) + L"\\" + DATA_DIR_NAME;
+    CoTaskMemFree(base);
+    if (!CreateDirectoryW(dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return {};
+    return dir;
 }
 
 // SYSTEMTIME を ULARGE_INTEGER（100 ナノ秒単位）に変換する
@@ -4829,8 +4857,8 @@ static void cycleIssueState(size_t itemIndex) {
     }
     // 遷移で必ずどちらかの集合が変わるが、片側だけの変化を追う分岐より両方の保存の方が単純で、
     // 書き出しはどちらも小さい。（tmp 経由の atomicWriteJson で破損もしない）
-    savePins(g_exeDir);
-    saveHidden(g_exeDir);
+    savePins(g_dataDir);
+    saveHidden(g_dataDir);
     // 非表示への遷移で未読が消えることがあるため、tooltip とバッジを追随させる
     if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
     writeLog("issue state: #" + std::to_string(item.id)
@@ -5098,7 +5126,7 @@ static VOID WINAPI onNetworkChange(PVOID, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION
 // 取得集合に居るピンは集合側の内容で更新し、集合から外れたピン（クローズ・担当変更等）は
 // 個別取得で最新化する。（集合外ピンの件数分の HTTP/ポーリング）個別取得の失敗時（削除済み・
 // 接続エラー）は前回キャッシュの内容のまま表示を継続する。
-static void refreshPins(const std::wstring& exeDir, const Config& cfg,
+static void refreshPins(const std::wstring& dataDir, const Config& cfg,
                         const std::vector<Issue>& issues, const std::vector<int>& groupIds,
                         bool groupIdsResolved)
 {
@@ -5167,7 +5195,7 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
             }
         }
     }
-    savePins(exeDir);
+    savePins(dataDir);
 }
 
 // 非表示チケットの自動削除
@@ -5176,7 +5204,7 @@ static void refreshPins(const std::wstring& exeDir, const Config& cfg,
 // 同じチケットが後日クエリへ戻ったときは通常状態で再出現する。（改めて非表示にすれば良い）
 // fetchIssues は 1 クエリでも失敗すると全体を失敗にするため、成功時の issues は完全な集合で
 // 誤削除は起きない。（本関数は成功パスからのみ呼ぶこと）
-static void pruneHidden(const std::wstring& exeDir, const std::vector<Issue>& issues) {
+static void pruneHidden(const std::wstring& dataDir, const std::vector<Issue>& issues) {
     bool changed = false;
     {
         std::unordered_set<int> current;
@@ -5193,7 +5221,7 @@ static void pruneHidden(const std::wstring& exeDir, const std::vector<Issue>& is
             }
         }
     }
-    if (changed) saveHidden(exeDir);
+    if (changed) saveHidden(dataDir);
 }
 
 // 通知理由（1 件時の Toast 文言切替とログ内訳に使う）
@@ -5376,7 +5404,7 @@ struct PollOutcome {
     int notified = 0;  // 通知対象と判定した件数（0 は通知 Toast なし）
     int mutedOwn = 0;  // 自分の操作として通知を抑止した件数
 };
-static PollOutcome deliverPollResults(const std::wstring& exeDir, const Config& cfg,
+static PollOutcome deliverPollResults(const std::wstring& dataDir, const Config& cfg,
                                       const std::vector<Issue>& issues, const PollState& prev)
 {
     // 一覧・tooltip 用の共有状態を更新する
@@ -5387,9 +5415,9 @@ static PollOutcome deliverPollResults(const std::wstring& exeDir, const Config& 
 
     if (!prev.baseline) {
         // 保存失敗を放置すると baseline が永久に確立せず無言で通知ゼロになるため、Toast で知らせる
-        // （書き込み不可のディレクトリに展開した場合など、ログ自体が残せない環境を想定）
-        if (!saveState(exeDir, cfg, issues))
-            showErrorToast(L"状態保存エラー", L"state.json を書き込めません。展開先の書き込み権限を確認してください");
+        // （データディレクトリが書き込み不可の場合など、ログ自体が残せない環境を想定）
+        if (!saveState(dataDir, cfg, issues))
+            showErrorToast(L"状態保存エラー", L"state.json を書き込めません。%LOCALAPPDATA%\\redntfy の書き込み権限を確認してください");
         if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
         writeLog("baseline established (" + std::to_string(issues.size()) + " issues)");
         return {};
@@ -5423,7 +5451,7 @@ static PollOutcome deliverPollResults(const std::wstring& exeDir, const Config& 
     if (!targets->empty()) emitNotifications(cfg, *targets);
 
     // 保存に失敗すると次回も同じ更新を再検知して通知が重複するため、Toast で知らせる
-    if (!saveState(exeDir, cfg, issues))
+    if (!saveState(dataDir, cfg, issues))
         showErrorToast(L"状態保存エラー", L"state.json を書き込めません。通知が重複する可能性があります");
     if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
 
@@ -5562,7 +5590,7 @@ static void resolvePollMetadata(const Config& cfg, PollSession& s, bool manualTr
 // 応答性をネットワーク状態に依存させないことが目的。
 // 実行内容：保存クエリの全件取得 → 通知判定・Toast・通知音 → 状態保存。
 // 中断は g_shutdownRequested の atomic フラグ経由。（waitInterruptible が 100 ms 単位で監視）
-static void pollThreadFunc(std::wstring exeDir, Config cfg) {
+static void pollThreadFunc(std::wstring dataDir, Config cfg) {
     // WinRT アパートメント初期化
     // 本スレッドは JSON パースと Toast 表示（deliverPollResults / showErrorToast）を持つため、
     // WinRT 呼び出しに先立ってアパートメントを初期化する。
@@ -5690,13 +5718,13 @@ static void pollThreadFunc(std::wstring exeDir, Config cfg) {
             }
 
             // 前回状態はここで 1 回だけ読み、最終更新者の解決と通知判定で共有する
-            PollState prevState = loadState(exeDir);
+            PollState prevState = loadState(dataDir);
             resolveUpdaters(cfg, issues, prevState, session.userNames);
             if (g_shutdownRequested) break;  // resolveUpdaters は HTTP を伴うため中断を確認する
 
-            PollOutcome outcome = deliverPollResults(exeDir, cfg, issues, prevState);
-            refreshPins(exeDir, cfg, issues, session.groupIds, session.groupIdsResolved);
-            pruneHidden(exeDir, issues);
+            PollOutcome outcome = deliverPollResults(dataDir, cfg, issues, prevState);
+            refreshPins(dataDir, cfg, issues, session.groupIds, session.groupIdsResolved);
+            pruneHidden(dataDir, issues);
 
             // 「今すぐ更新」の応答 Toast。更新を検知した回は通知 Toast が出ているため重ねない
             if (manualTriggered && outcome.notified == 0 && !g_shutdownRequested)
@@ -5743,7 +5771,9 @@ int wmain() {
     // ログ初期化（Job Object 処理前に実施してすべてのイベントをログに残す）
     auto exeDir = getExeDir();
     g_exeDir = exeDir;
-    g_logDir = exeDir + L"\\logs";
+    g_dataDir = getDataDir();
+    if (g_dataDir.empty()) return 2;  // ログも状態も残せないため起動しない
+    g_logDir = g_dataDir + L"\\logs";
     CreateDirectoryW(g_logDir.c_str(), nullptr);
 
     // 多重起動制御（新プロセス優先）
@@ -5878,15 +5908,15 @@ int wmain() {
         initMenuFonts();
 
         // ピン留めと非表示チケットを復元する（起動直後のポーリング前でも一覧に反映するため）
-        loadPins(exeDir);
-        loadHidden(exeDir);
+        loadPins(g_dataDir);
+        loadHidden(g_dataDir);
 
         // ポーリングスレッド起動（無効モード時は起動しない：設定はホットリロードしないため
         // 何度試行しても結果が変わらず、案内はトレイ tooltip と Toast が担う）
         // メインスレッドはメッセージループに専念させるため、Redmine API ポーリング（HTTP I/O）を別スレッドへ分離する。
         // これによりネットワーク状態にかかわらずトレイアイコン右クリック等の UI が常時応答する。
         if (initReason == DisabledReason::None) {
-            pollThread = std::thread(pollThreadFunc, exeDir, cfg);
+            pollThread = std::thread(pollThreadFunc, g_dataDir, cfg);
         }
         else {
             enterDisabledMode(g_hWnd, initReason, cfg, exeDir);

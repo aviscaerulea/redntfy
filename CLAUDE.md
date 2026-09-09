@@ -37,7 +37,10 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   - state.json 上は擬似クエリ id 0（`FALLBACK_QUERY_ID`）で表現し、流入検知・黙って採用の既存ロジックにそのまま乗る（query_ids の設定・解除の切替も無通知で移行する）
   - 複数件 Toast・一覧フッタの遷移先は `<url>/issues?set_filter=1&assigned_to_id=me`（Web 側も同じ展開のため表示集合と一致する）
 - ポーリング中の HTTP 401（api_key 無効）と、query_ids 設定時の 404（query_ids 無効）は確定的な設定不備として上記の無効モードへ遷移する（Toast・設定ファイル・ブラウザ誘導は 404 なら `<url>/issues` を開く）。フォールバックモードの 404 は通常の接続エラー扱い。それ以外の接続エラーは従来どおり 60 秒リトライ＋30 分クールダウンの Toast
-- ログは `out/logs/YYYY-MM-DD.log` に出力される
+- ログは `%LOCALAPPDATA%\redntfy\logs\YYYY-MM-DD.log` へ出力する  
+  `out/redntfy.exe` と Scoop 版は同じデータディレクトリを共有する。（置き場は「実装上の注意点」の永続化の項を参照）
+  多重起動制御で先に動いていた方は終了するが、state.json・ピン・非表示・ログはそのまま引き継ぐ。
+  Scoop 版の状態を持ち込みたくない動作確認では、起動前に `%LOCALAPPDATA%\redntfy` を退避する。
 
 ## 実装上の注意点
 
@@ -52,6 +55,9 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   `g_currentConfig` は起動時に 1 回設定した後は不変で、ロック無しで読み取る。
 
 - 永続化は `state.json`（検知済み）、`pins.json`（ピン留め）、`hidden.json`（非表示チケットの id 配列）で、書き出しは `atomicWriteJson`（tmp 経由の置換）  
+  置き場は `%LOCALAPPDATA%\redntfy`（`getDataDir`）で、ログもここに置く。exe 同フォルダにしないのは、
+  Scoop の更新で旧バージョンのディレクトリに取り残されるのと、書き込み不可の展開先で動かないためだ。
+  設定ファイルと通知音だけは exe 同フォルダ。  
   `state.json` は v2（チケット id → updated_on ＋所属クエリ＋最終更新者、ルートに追跡クエリ id と前回ポーリング時刻）。  
   旧形式と `query_ids` への追加分は流入検知を見送り、現在の所属を黙って採用する。（通知の嵐の防止）
 
