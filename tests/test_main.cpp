@@ -173,7 +173,7 @@ static void testBuildIssueLabel() {
         }
     }
 
-    // 新規流入：件名の直前に ✨ が入り、後続の色範囲がその分だけ後ろへずれる
+    // 新規流入：💥 の直前に ✨ が入り、後続の色範囲がその分だけ後ろへずれる
     {
         auto row = makeRow();
         row.isNew = true;
