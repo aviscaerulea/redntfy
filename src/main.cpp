@@ -130,6 +130,10 @@ static constexpr UINT WM_UPDATE_TOOLTIP  = WM_USER + 2;
 // ポーリングスレッドは直接 UI を触らずこのメッセージを投函する
 static constexpr UINT WM_ENTER_DISABLED  = WM_USER + 3;
 
+// ポーリング成功後の一覧組み直し依頼（表示中の一覧だけを同じ位置で組み直す）
+// WM_UPDATE_TOOLTIP は行操作からも投函されるため流用しない。（行の右クリック直後に並びが変わるのを防ぐ）
+static constexpr UINT WM_LIST_REFRESH    = WM_USER + 4;
+
 // コンテキストメニューコマンド ID
 static constexpr UINT IDM_EXIT             = 40002;
 static constexpr UINT IDM_MUTE_IN_MEETING  = 40004;
@@ -3876,7 +3880,7 @@ static bool getTrayIconRect(HWND hWnd, RECT& rcOut) {
 }
 
 // 一覧ポップアップの表示・非表示・可視判定（実装は walkIssueLabel 等の描画基盤の後方にある）
-static void showListPopup(HWND trayWnd);
+static void showListPopup(HWND trayWnd, bool refresh = false);
 static void hideListPopup(HWND trayWnd);
 static bool isListPopupVisible();
 
@@ -4576,6 +4580,7 @@ static HWND g_listWnd = nullptr;                 // 初回表示時に生成し�
 static std::vector<ListRowLayout> g_listLayout;  // トレイ WndProc スレッド専用
 static std::wstring g_listFooterText;            // フッタ行の文言（0 件時は未使用）
 static int g_listHotRow = -1;                    // ホット行（g_listLayout の添字。-1 = なし）
+static POINT g_listAnchor = {};                  // 表示位置の基準（新規表示時のカーソル座標。組み直しで再利用）
 
 // 一覧ポップアップが画面に出ているか（ウィンドウ未生成は非表示扱い）
 static bool isListPopupVisible() {
@@ -4773,7 +4778,10 @@ static HWND ensureListWindow() {
 // 行の左クリックでチケットを開いてその 1 件だけ既読にする。（非表示のグレー行も同様に開ける）
 // フッタの「未処理 N 件」はフィルタを通った件数で、フィルタで外れたピンと非表示チケットは数えない。
 // 表示中は IDT_LIST_WATCH（トレイ側タイマー）が離脱を監視して閉じる。
-static void showListPopup(HWND trayWnd) {
+// refresh は表示中の一覧を最新の状態で組み直す指定だ。
+// 位置は新規表示時のカーソル座標を基準に同じ規則で求め直す。
+// 離脱監視の状態（猶予・タイマー）は引き継ぐ。ホット行は現在のカーソル位置から求め直す。
+static void showListPopup(HWND trayWnd, bool refresh) {
     HWND hWnd = ensureListWindow();
     if (!hWnd) return;
 
@@ -4806,7 +4814,13 @@ static void showListPopup(HWND trayWnd) {
 
     // カーソル位置のモニタ作業領域を先に取得する。（行の打ち切り判定と位置クランプの両方に使う）
     POINT cursor;
-    GetCursorPos(&cursor);
+    if (refresh) {
+        cursor = g_listAnchor;
+    }
+    else {
+        GetCursorPos(&cursor);
+        g_listAnchor = cursor;
+    }
     MONITORINFO mi = { sizeof(mi) };
     const bool haveMi =
         GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &mi) != FALSE;
@@ -4913,6 +4927,18 @@ static void showListPopup(HWND trayWnd) {
     SetWindowPos(hWnd, HWND_TOPMOST, wx, wy, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(hWnd, nullptr, FALSE);
 
+    // 組み直しではホット行をカーソル位置から復元し、離脱監視は引き継ぐ。
+    // （-1 のままだと次のマウス移動までハイライトが消え、猶予を戻すと離脱判定が遅れる）
+    if (refresh) {
+        POINT pt;
+        GetCursorPos(&pt);
+        ScreenToClient(hWnd, &pt);
+        RECT client;
+        GetClientRect(hWnd, &client);
+        g_listHotRow = PtInRect(&client, pt) ? listRowHitTest(pt.y) : -1;
+        return;
+    }
+
     g_popupShowing.store(true);
     // 負値から数え始め、表示直後の約 1 秒は離脱と数えない（LIST_SHOW_GRACE_TICKS を参照）
     g_listOutsideTicks = -LIST_SHOW_GRACE_TICKS;
@@ -4954,7 +4980,7 @@ static void hideListPopup(HWND trayWnd) {
 // 解除では g_unreadIds の現況から復元する。
 // 遷移直後の再描画では、太字は item.unread と hidden（issueRowBold）で即座に切り替わるが、
 // 組み立て済みラベルが保持する ✨ は非表示中も残る。（IssueItem にマーカー用のフラグを持たせていないため。
-// グレー＋取消線の行なので誤読はなく、次に一覧を開けば消えるため許容する）
+// グレー＋取消線の行なので誤読はなく、次に一覧を開くかポーリングで組み直せば消えるため許容する）
 static void cycleIssueState(size_t itemIndex) {
     if (itemIndex >= g_issueItems.size()) return;
 
@@ -5218,6 +5244,11 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     // ポーリングスレッドからの無効モード遷移依頼（Toast・ブラウザ誘導・トレイ更新を実施）
     if (msg == WM_ENTER_DISABLED) {
         enterDisabledMode(hWnd, static_cast<DisabledReason>(wParam), g_currentConfig, g_exeDir);
+        return 0;
+    }
+    // ポーリング成功後の組み直し依頼（閉じている一覧は次に開いた時点で組み立てるため何もしない）
+    if (msg == WM_LIST_REFRESH) {
+        if (isListPopupVisible()) showListPopup(hWnd, true);
         return 0;
     }
     if (msg == WM_COMMAND) {
@@ -5899,6 +5930,8 @@ static void pollThreadFunc(std::wstring dataDir, Config cfg) {
             PollOutcome outcome = deliverPollResults(dataDir, cfg, issues, prevState);
             refreshPins(dataDir, cfg, issues, session.groupIds, session.groupIdsResolved);
             pruneHidden(dataDir, issues);
+            // 一覧が表示中なら最新の状態で組み直させる。（チケット・ピン・非表示がすべて確定した後）
+            if (g_hWnd) PostMessage(g_hWnd, WM_LIST_REFRESH, 0, 0);
 
             // 「今すぐ更新」の応答 Toast。更新を検知した回は通知 Toast が出ているため重ねない
             if (manualTriggered && outcome.notified == 0 && !g_shutdownRequested)
