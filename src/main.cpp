@@ -393,7 +393,7 @@ struct PinEntry {
 enum FormatElement {
     FMT_LITERAL = -1,  // リテラル文字列（未知プレースホルダの原文もこれで保持）
     FMT_ID, FMT_LASTNAME, FMT_FIRSTNAME, FMT_GROUP, FMT_PROJECT,
-    FMT_DUE, FMT_NEW, FMT_BUG, FMT_SUBJECT, FMT_AGO,
+    FMT_DUE, FMT_NEW, FMT_BUG, FMT_SUBJECT, FMT_AGO, FMT_LEFT,
 };
 
 // list_format の解析済みトークン
@@ -402,11 +402,14 @@ struct FormatToken {
     std::wstring literal;              // FMT_LITERAL のときの出力文字列
     int          element = FMT_LITERAL;
     int          maxChars = 0;         // 最大文字数（0 = 切り詰めなし）
+    bool         alert    = false;     // 末尾 "!" 指定。期限切れ行でこの要素を赤の半太字にする
 };
 
-// list_format の既定値（v1.4 までの固定並びへ新規流入マーカー {new} を 💥 マーカーの直前に加えた並び）
+// list_format の既定値
+// v1.4 までの固定並びへ新規流入マーカー {new} を 💥 マーカーの直前に加え、末尾の経過日数 {ago} を
+// 期日の残り日数 {left} に置き換えた並び。期限切れ行で赤にするのは期日と件名だけとする。
 static constexpr wchar_t LIST_FORMAT_DEFAULT[] =
-    L"#{id}  {lastname}  {group}[{project:5}] {due} {new}{bug}{subject:40}{ago}";
+    L"#{id}  {lastname}  {group}[{project:5}] {due!} {new}{bug}{subject:40!}{left}";
 
 // フォールバックモード（query_ids 省略）の擬似クエリ id
 // Redmine のクエリ id は正の整数のため 0 は衝突しない。state.json の queries／
@@ -637,7 +640,7 @@ static int todayJstYmd() {
 // 期限日の表示情報
 struct DueDateView {
     std::wstring text;            // 今年は "7/28"、他年は "2025/6/30"（期限なし・解釈不能なら空）
-    bool         overdue = false; // 期限 ≦ 今日（JST）＝期日、件名、経過日数を赤で描く
+    bool         overdue = false; // 期限 ≦ 今日（JST）＝list_format で "!" を付けた要素を赤で描く
 };
 
 // Redmine の due_date（"YYYY-MM-DD"、期限なしは空）を表示情報へ変換する
@@ -695,6 +698,28 @@ static std::wstring makeUpdatedAgoText(const std::string& updatedOn, long long t
     if (diff <= 0) return L"（今日）";
     if (diff == 1) return L"（昨日）";
     return L"（" + std::to_wstring(diff) + L" 日前）";
+}
+
+// due_date（"YYYY-MM-DD"、期限なしは空）から一覧行の期日残り日数表示を作る
+// JST のカレンダー日付差で、当日は「（今日中）」、未来は「（x 日前）」、過去は「（x 日遅れ）」を返す。
+// 期限なし・解釈不能は空文字列を返し、何も表示しない。
+// due_date は JST の日付そのものを表すため、utcToJst を通さず通算日へ換算して todayDays と比べる。
+static std::wstring makeDueLeftText(const std::string& due, long long todayDays) {
+    int y = 0, m = 0, d = 0;
+    if (sscanf_s(due.c_str(), "%d-%d-%d", &y, &m, &d) != 3) return L"";
+    SYSTEMTIME st = {};
+    st.wYear  = static_cast<WORD>(y);
+    st.wMonth = static_cast<WORD>(m);
+    st.wDay   = static_cast<WORD>(d);
+    // 実在しない日付（2/31 等）は変換失敗で弾く。（makeUpdatedAgoText と同じ理由）
+    FILETIME ft;
+    if (!SystemTimeToFileTime(&st, &ft)) return L"";
+    long long dueDays = static_cast<long long>(
+        ULARGE_INTEGER{ ft.dwLowDateTime, ft.dwHighDateTime }.QuadPart / HNS_PER_DAY);
+    long long diff = dueDays - todayDays;
+    if (diff == 0) return L"（今日中）";
+    if (diff > 0)  return L"（" + std::to_wstring(diff) + L" 日前）";
+    return L"（" + std::to_wstring(-diff) + L" 日遅れ）";
 }
 
 // 現在時刻を Redmine の updated_on と同形式の UTC ISO 8601 文字列で返す
@@ -1311,6 +1336,7 @@ static void loadHidden(const std::wstring& dir) {
 
 // list_format 文字列をトークン列へ解析する
 // {要素名} または {要素名:最大文字数} を認識する。（最大文字数は 1 以上の 10 進整数のみ有効）
+// 閉じ括弧の直前の "!"（{due!}・{subject:40!}）は赤指定で、期限切れ行でその要素を赤の半太字にする。
 // 解釈できない部分（未知の要素名・不正な長さ・閉じ括弧なし）はリテラルとして原文のまま残し、
 // ログに記録する。誤記が一覧にそのまま現れるため、ユーザが確実に気付ける。
 static std::vector<FormatToken> parseListFormat(const std::wstring& fmt) {
@@ -1318,7 +1344,7 @@ static std::vector<FormatToken> parseListFormat(const std::wstring& fmt) {
         { L"id", FMT_ID }, { L"lastname", FMT_LASTNAME }, { L"firstname", FMT_FIRSTNAME },
         { L"group", FMT_GROUP }, { L"project", FMT_PROJECT }, { L"due", FMT_DUE },
         { L"new", FMT_NEW }, { L"bug", FMT_BUG }, { L"subject", FMT_SUBJECT },
-        { L"ago", FMT_AGO },
+        { L"ago", FMT_AGO }, { L"left", FMT_LEFT },
     };
     std::vector<FormatToken> tokens;
     std::wstring lit;  // 連続するリテラル文字の蓄積（プレースホルダ確定時にトークン化する）
@@ -1341,6 +1367,8 @@ static std::vector<FormatToken> parseListFormat(const std::wstring& fmt) {
             break;
         }
         std::wstring inner = fmt.substr(pos + 1, close - pos - 1);
+        bool alert = !inner.empty() && inner.back() == L'!';
+        if (alert) inner.pop_back();
         std::wstring name  = inner;
         int maxChars = 0;
         bool valid   = true;
@@ -1369,7 +1397,7 @@ static std::vector<FormatToken> parseListFormat(const std::wstring& fmt) {
         }
         if (valid) {
             flushLiteral();
-            tokens.push_back({.element = element, .maxChars = maxChars});
+            tokens.push_back({.element = element, .maxChars = maxChars, .alert = alert});
         }
         else {
             std::wstring raw = fmt.substr(pos, close - pos + 1);
@@ -3474,7 +3502,7 @@ static void initMenuFonts() {
     if (!g_hMenuFontSemiBold) g_hMenuFontSemiBold = g_hMenuFontBold;
 }
 
-// 注意を促す文字色（期限切れの期日、件名、経過日数と、バグマーカー。更新通知メニューの新バージョン表示と同じ赤）
+// 注意を促す文字色（期限切れ行で list_format の "!" を付けた要素と、バグマーカー。更新通知メニューの新バージョン表示と同じ赤）
 static constexpr COLORREF ALERT_TEXT_COLOR = RGB(220, 0, 0);
 
 // ラベル内で文字色とウェイトを変える範囲（オフセットと長さは UTF-16 コードユニット単位）
@@ -3682,16 +3710,17 @@ static constexpr wchar_t NEW_MARK[] = L"✨ ";
 // 一覧行のラベルを組み立てる
 //   並びは list_format（g_currentConfig.listFormat）のトークン列に従う。
 //   既定は「番号、姓、グループ担当マーカー、[プロジェクト名]、期日、新規流入マーカー、
-//   バグマーカー、件名、経過日数」
-//   （例："#12345  山田  👥 [ロケモニ] 7/28 ✨ 💥 件名…（3 日前）"）。
+//   バグマーカー、件名、期日の残り日数」
+//   （例："#12345  山田  👥 [ロケモニ] 7/28 ✨ 💥 件名…（6 日遅れ）"）。
 //   {要素:N} の最大文字数で切り詰める。「…」は自由文の {subject} のみ付け、
 //   識別子的な要素（プロジェクト名・姓・名など）は横幅を優先して付けない。
 //   空に展開された要素（期限なし・更新者不明など）は、直後のリテラル先頭空白を
 //   出力末尾が空白または行頭なら取り除いて詰める。（従来の「詰めて省く」を再現）
-//   {group}＝"👥 "・{new}＝"✨ "・{bug}＝"💥 "・{ago}＝"（3 日前）" は装飾込みで展開し、
+//   {group}＝"👥 "・{new}＝"✨ "・{bug}＝"💥 "・{ago}＝"（3 日前）"・{left}＝"（2 日遅れ）" は
+//   装飾込みで展開し、
 //   空なら装飾ごと消える。
-//   期限切れの期日、件名、経過日数と、常に赤いバグマーカーは ALERT_TEXT_COLOR で描くため、
-//   位置を ranges に記録する。
+//   期限切れ行の "!" 指定要素と、常に赤いバグマーカーは ALERT_TEXT_COLOR で描くため、
+//   位置を ranges に記録する。期日は "!" の有無によらず常に半太字の範囲を持つ。
 //   （ranges はオフセット昇順で並べる契約。展開順の追記がそのまま昇順になる）
 // 引数に ListRow を丸ごと取るのは、同じ型の要素が増えて位置引数では取り違えを防げないため。
 // ピン記号はラベルに含めない。drawIssueRow が IssueItem::pinned を見てマーカー列に描く。
@@ -3725,6 +3754,7 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
         case FMT_BUG:       if (row.isBugTracker) val = BUG_MARK; break;
         case FMT_SUBJECT:   val = toWide(row.subject); break;
         case FMT_AGO:       val = makeUpdatedAgoText(row.updatedOn, todayDays); break;
+        case FMT_LEFT:      val = makeDueLeftText(row.dueDate, todayDays); break;
         }
         if (tk.maxChars > 0)
             val = truncateText(val, static_cast<size_t>(tk.maxChars), tk.element == FMT_SUBJECT);
@@ -3732,20 +3762,20 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
             prevEmpty = true;
             continue;
         }
+        bool alertNow = tk.alert && due.overdue;  // "!" 指定かつ期限切れ行
         if (tk.element == FMT_DUE) {
             // 期日は常に半太字で強調する。（一覧の中で期日行を素早く拾えるようにする）
-            // 期限切れは加えて赤にし、期限内は色を据え置く。（範囲外と同じ色で描く）
+            // 赤は "!" 指定の期限切れ行だけで、それ以外は色を据え置く。（範囲外と同じ色で描く）
             ColorRange range{r.text.size(), val.size(), ALERT_TEXT_COLOR, true};
-            if (!due.overdue) range.keepColor = true;
+            if (!alertNow) range.keepColor = true;
             r.ranges.push_back(range);
         }
-        if ((tk.element == FMT_SUBJECT || tk.element == FMT_AGO) && due.overdue) {
-            // 期限切れは件名と経過日数も赤の半太字にする。（期日だけでは行全体の緊急度に気付けない）
-            // 判定は期日と同じ overdue を使う。
-            // {due} を持たない書式では、件名と経過日数だけが赤になる。
+        else if (alertNow) {
+            // "!" 指定の要素は期限切れ行で赤の半太字にする。（期日だけでは行全体の緊急度に気付けない）
+            // 判定は期日と同じ overdue を使うため、{due} を持たない書式でも効く。
             r.ranges.push_back({r.text.size(), val.size(), ALERT_TEXT_COLOR, true});
         }
-        if (tk.element == FMT_BUG) {
+        else if (tk.element == FMT_BUG) {
             // マーカー自体を赤くする。（絵文字は GDI が現在の文字色で単色描画するため色が乗る）
             // 末尾の空白は色を変えても見えないので範囲に含めない
             size_t len = val.size() - (val.back() == L' ' ? 1 : 0);

@@ -62,7 +62,7 @@ static void testParseListFormat() {
         CHECK(t.size() == 15);
         if (t.size() == 15) {
             CHECK(t[0].element == FMT_LITERAL);   CHECK_WSTR(t[0].literal, L"#");
-            CHECK(t[1].element == FMT_ID);        CHECK(t[1].maxChars == 0);
+            CHECK(t[1].element == FMT_ID);        CHECK(t[1].maxChars == 0);  CHECK(!t[1].alert);
             CHECK(t[2].element == FMT_LITERAL);   CHECK_WSTR(t[2].literal, L"  ");
             CHECK(t[3].element == FMT_LASTNAME);
             CHECK(t[4].element == FMT_LITERAL);   CHECK_WSTR(t[4].literal, L"  ");
@@ -70,12 +70,12 @@ static void testParseListFormat() {
             CHECK(t[6].element == FMT_LITERAL);   CHECK_WSTR(t[6].literal, L"[");
             CHECK(t[7].element == FMT_PROJECT);   CHECK(t[7].maxChars == 5);
             CHECK(t[8].element == FMT_LITERAL);   CHECK_WSTR(t[8].literal, L"] ");
-            CHECK(t[9].element == FMT_DUE);
+            CHECK(t[9].element == FMT_DUE);       CHECK(t[9].alert);
             CHECK(t[10].element == FMT_LITERAL);  CHECK_WSTR(t[10].literal, L" ");
             CHECK(t[11].element == FMT_NEW);
             CHECK(t[12].element == FMT_BUG);
-            CHECK(t[13].element == FMT_SUBJECT);  CHECK(t[13].maxChars == 40);
-            CHECK(t[14].element == FMT_AGO);      CHECK(t[14].maxChars == 0);
+            CHECK(t[13].element == FMT_SUBJECT);  CHECK(t[13].maxChars == 40);  CHECK(t[13].alert);
+            CHECK(t[14].element == FMT_LEFT);     CHECK(t[14].maxChars == 0);   CHECK(!t[14].alert);
         }
     }
 
@@ -87,8 +87,26 @@ static void testParseListFormat() {
         CHECK(t[0].maxChars == 40);
     }
 
-    // 不正な長さ指定はトークン全体をリテラル原文として残す
-    for (const wchar_t* bad : { L"{subject:0}", L"{subject:abc}", L"{subject:}", L"{subject:12345}" }) {
+    // 赤指定（閉じ括弧直前の "!"）の正常系
+    {
+        auto t = parseListFormat(L"{subject:40!}");
+        CHECK(t.size() == 1);
+        CHECK(t[0].element == FMT_SUBJECT);
+        CHECK(t[0].maxChars == 40);
+        CHECK(t[0].alert);
+    }
+    {
+        auto t = parseListFormat(L"{due!}{left}");
+        CHECK(t.size() == 2);
+        if (t.size() == 2) {
+            CHECK(t[0].element == FMT_DUE);   CHECK(t[0].maxChars == 0);  CHECK(t[0].alert);
+            CHECK(t[1].element == FMT_LEFT);  CHECK(!t[1].alert);
+        }
+    }
+
+    // 不正な長さ指定・"!" の位置違いはトークン全体をリテラル原文として残す
+    for (const wchar_t* bad : { L"{subject:0}", L"{subject:abc}", L"{subject:}", L"{subject:12345}",
+                                L"{!}", L"{subject!:40}", L"{subject:!}" }) {
         auto t = parseListFormat(bad);
         CHECK(t.size() == 1);
         CHECK(t[0].element == FMT_LITERAL);
@@ -145,11 +163,11 @@ static void testBuildIssueLabel() {
     {
         auto row = makeRow();
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 💥 テスト件名（3 日前）");
-        // ranges は期日（半太字・期限切れ赤）、💥（赤、末尾空白を含まない）、
-        // 件名と経過日数（期限切れは半太字の赤）の 4 件で昇順
-        CHECK(lbl.ranges.size() == 4);
-        if (lbl.ranges.size() == 4) {
+        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 💥 テスト件名（6 日遅れ）");
+        // ranges は期日（半太字・"!" で期限切れ赤）、💥（赤、末尾空白を含まない）、
+        // 件名（"!" で期限切れは半太字の赤）の 3 件で昇順。{left} は "!" なしのため範囲を持たない
+        CHECK(lbl.ranges.size() == 3);
+        if (lbl.ranges.size() == 3) {
             CHECK(lbl.ranges[0].offset == 23);  // "#12345  山田  👥 [ロケモニプ] " の直後
             CHECK(lbl.ranges[0].len == 4);      // "7/28"
             CHECK(lbl.ranges[0].bold);
@@ -162,14 +180,8 @@ static void testBuildIssueLabel() {
             CHECK(lbl.ranges[2].bold);
             CHECK(!lbl.ranges[2].keepColor);
             CHECK(lbl.ranges[2].color == ALERT_TEXT_COLOR);
-            CHECK(lbl.ranges[3].offset == 36);  // "テスト件名" の直後
-            CHECK(lbl.ranges[3].len == 6);      // "（3 日前）"
-            CHECK(lbl.ranges[3].bold);
-            CHECK(!lbl.ranges[3].keepColor);
-            CHECK(lbl.ranges[3].color == ALERT_TEXT_COLOR);
             CHECK(lbl.ranges[0].offset < lbl.ranges[1].offset);
             CHECK(lbl.ranges[1].offset < lbl.ranges[2].offset);
-            CHECK(lbl.ranges[2].offset < lbl.ranges[3].offset);
         }
     }
 
@@ -178,9 +190,9 @@ static void testBuildIssueLabel() {
         auto row = makeRow();
         row.isNew = true;
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 ✨ 💥 テスト件名（3 日前）");
-        CHECK(lbl.ranges.size() == 4);
-        if (lbl.ranges.size() == 4) {
+        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 ✨ 💥 テスト件名（6 日遅れ）");
+        CHECK(lbl.ranges.size() == 3);
+        if (lbl.ranges.size() == 3) {
             CHECK(lbl.ranges[0].offset == 23);  // 期日は ✨ より前のため不変
             CHECK(lbl.ranges[1].offset == 30);  // 💥。"✨ "（2 コードユニット）分ずれる
         }
@@ -191,7 +203,8 @@ static void testBuildIssueLabel() {
         auto row = makeRow();
         row.dueDate.clear();
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 💥 テスト件名（3 日前）");
+        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 💥 テスト件名");
+        CHECK(lbl.ranges.size() == 1);  // 💥 のみ。期限切れでないため件名は赤にならない
     }
 
     // 更新者空：番号の後の空白が二重にならない
@@ -199,15 +212,7 @@ static void testBuildIssueLabel() {
         auto row = makeRow();
         row.updater.clear();
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  👥 [ロケモニプ] 7/28 💥 テスト件名（3 日前）");
-    }
-
-    // updatedOn 空（旧形式ピン相当）：経過日数が付かない
-    {
-        auto row = makeRow();
-        row.updatedOn.clear();
-        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 💥 テスト件名");
+        CHECK_WSTR(lbl.text, L"#12345  👥 [ロケモニプ] 7/28 💥 テスト件名（6 日遅れ）");
     }
 
     // 期日が未来：半太字のまま色は据え置き（keepColor）
@@ -215,6 +220,7 @@ static void testBuildIssueLabel() {
         auto row = makeRow();
         row.dueDate = "2026-08-04";
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 8/4 💥 テスト件名（1 日前）");
         CHECK(lbl.ranges.size() == 2);
         if (!lbl.ranges.empty()) {
             CHECK(lbl.ranges[0].bold);
@@ -231,8 +237,9 @@ static void testBuildIssueLabel() {
         CHECK_WSTR(lbl.text, L"あいうえお…");
     }
 
-    // 期限切れ＋件名の切り詰め：範囲長は「…」を含む切り詰め後の長さ
-    g_currentConfig.listFormat = parseListFormat(L"{due} {subject:5}");
+    // 期限切れ＋件名の切り詰め："!" なしの期日は期限切れでも色据え置き、
+    // "!" 付き件名の範囲長は「…」を含む切り詰め後の長さ
+    g_currentConfig.listFormat = parseListFormat(L"{due} {subject:5!}");
     {
         auto row = makeRow();
         row.subject = "あいうえおかきく";
@@ -240,6 +247,7 @@ static void testBuildIssueLabel() {
         CHECK_WSTR(lbl.text, L"7/28 あいうえお…");
         CHECK(lbl.ranges.size() == 2);
         if (lbl.ranges.size() == 2) {
+            CHECK(lbl.ranges[0].keepColor);
             CHECK(lbl.ranges[1].offset == 5);  // "7/28 " の直後
             CHECK(lbl.ranges[1].len == 6);     // "あいうえお…"
             CHECK(lbl.ranges[1].bold);
@@ -285,6 +293,27 @@ static void testMakeUpdatedAgoText() {
     CHECK_WSTR(makeUpdatedAgoText("", today), L"");
     CHECK_WSTR(makeUpdatedAgoText("garbage", today), L"");
     CHECK_WSTR(makeUpdatedAgoText("2026-02-31T00:00:00Z", today), L"");  // 実在しない日付
+}
+
+// ==================== makeDueLeftText ====================
+
+static void testMakeDueLeftText() {
+    const long long today = dayOfUtc(2026, 8, 3);  // JST 2026-08-03
+
+    // 当日・未来・過去
+    CHECK_WSTR(makeDueLeftText("2026-08-03", today), L"（今日中）");
+    CHECK_WSTR(makeDueLeftText("2026-08-04", today), L"（1 日前）");
+    CHECK_WSTR(makeDueLeftText("2026-08-02", today), L"（1 日遅れ）");
+    CHECK_WSTR(makeDueLeftText("2026-07-28", today), L"（6 日遅れ）");
+
+    // 月・年またぎも日付差で数える
+    CHECK_WSTR(makeDueLeftText("2026-09-01", today), L"（29 日前）");
+    CHECK_WSTR(makeDueLeftText("2025-08-03", today), L"（365 日遅れ）");
+
+    // 期限なし・解釈不能は空（何も表示しない）
+    CHECK_WSTR(makeDueLeftText("", today), L"");
+    CHECK_WSTR(makeDueLeftText("abc", today), L"");
+    CHECK_WSTR(makeDueLeftText("2026-02-31", today), L"");  // 実在しない日付
 }
 
 // ==================== makeDueDateView ====================
@@ -684,6 +713,7 @@ int main() {
     testParseListFormat();
     testBuildIssueLabel();
     testMakeUpdatedAgoText();
+    testMakeDueLeftText();
     testMakeDueDateView();
     testJstDaySerial();
     testTruncateText();

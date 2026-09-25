@@ -30,7 +30,7 @@ A sister tool, [gcalntfy](https://github.com/aviscaerulea/gcalntfy), notifies yo
 
 The tray icon shows a red badge in the bottom-right corner when there are unread tickets.
 
-Each row of the list shows the due date, assignee, project, and time since the last update, with icons. Unread tickets and tickets with a due date are shown in bold. Tickets notified as new are marked with ✨. The pending count appears in the footer. Clicking a row opens the ticket in the browser and marks it as read. Right-clicking a row cycles through pinned, hidden, and normal.
+Each row of the list shows the due date, assignee, project, and days left until the due date, with icons. Unread tickets and tickets with a due date are shown in bold. Tickets notified as new are marked with ✨. The pending count appears in the footer. Clicking a row opens the ticket in the browser and marks it as read. Right-clicking a row cycles through pinned, hidden, and normal.
 
 Right-clicking the tray icon opens the tray menu, which provides various settings.
 
