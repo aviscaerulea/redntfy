@@ -410,9 +410,9 @@ struct FormatToken {
 // list_format の既定値
 // v1.4 までの固定並びへ新規流入マーカー {new} を 💥 マーカーの直前に加え、末尾の経過日数 {ago} を
 // 期日の残り日数 {left} に置き換えた並び。期限切れ行で赤にするのは期日、件名、残り日数とする。
-// 残り日数は件名より目立たせないため 85% に縮める。
+// 残り日数は件名より目立たせないため 90% に縮める。
 static constexpr wchar_t LIST_FORMAT_DEFAULT[] =
-    L"#{id}  {lastname}  {group}[{project:5}] {due!} {new}{bug}{subject:40!}{left@85!}";
+    L"#{id}  {lastname}  {group}[{project:5}] {due!} {new}{bug}{subject:40!}{left@90!}";
 
 // フォールバックモード（query_ids 省略）の擬似クエリ id
 // Redmine のクエリ id は正の整数のため 0 は衝突しない。state.json の queries／

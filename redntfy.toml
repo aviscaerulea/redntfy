@@ -60,7 +60,7 @@ schedule = [ 6,  6,  6,  6,  6,  6,  6,  6, 10, 10, 10, 10, 10, 10, 10, 10, 10, 
 # 空の要素（期日なし等）の周りの余分な空白は自動で詰める。
 # 解釈できないプレースホルダはそのまま表示される。（誤記に気付けるように）
 # デフォルトは以下のとおり。
-# list_format = "#{id}  {lastname}  {group}[{project:5}] {due!} {new}{bug}{subject:40!}{left@85!}"
+# list_format = "#{id}  {lastname}  {group}[{project:5}] {due!} {new}{bug}{subject:40!}{left@90!}"
 
 # 💥 を付けるトラッカー
 # 一覧の件名の直前に 💥 を表示するトラッカー名を配列で指定する。

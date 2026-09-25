@@ -77,7 +77,7 @@ static void testParseListFormat() {
             CHECK(t[12].element == FMT_BUG);
             CHECK(t[13].element == FMT_SUBJECT);  CHECK(t[13].maxChars == 40);  CHECK(t[13].alert);
             CHECK(t[14].element == FMT_LEFT);     CHECK(t[14].maxChars == 0);   CHECK(t[14].alert);
-            CHECK(t[14].sizePct == 85);
+            CHECK(t[14].sizePct == 90);
         }
     }
 
@@ -194,7 +194,7 @@ static void testBuildIssueLabel() {
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
         CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 💥 テスト件名（6 日遅れ）");
         // ranges は期日（半太字・"!" で期限切れ赤）、💥（赤、末尾空白を含まない）、
-        // 件名（"!" で期限切れは半太字の赤）、{left}（"!" で期限切れは半太字の赤、85% 縮小）の
+        // 件名（"!" で期限切れは半太字の赤）、{left}（"!" で期限切れは半太字の赤、90% 縮小）の
         // 4 件で昇順
         CHECK(lbl.ranges.size() == 4);
         if (lbl.ranges.size() == 4) {
@@ -218,7 +218,7 @@ static void testBuildIssueLabel() {
             CHECK(lbl.ranges[3].bold);
             CHECK(!lbl.ranges[3].keepColor);
             CHECK(lbl.ranges[3].color == ALERT_TEXT_COLOR);
-            CHECK(lbl.ranges[3].sizePct == 85);
+            CHECK(lbl.ranges[3].sizePct == 90);
             CHECK(lbl.ranges[0].offset < lbl.ranges[1].offset);
             CHECK(lbl.ranges[1].offset < lbl.ranges[2].offset);
             CHECK(lbl.ranges[2].offset < lbl.ranges[3].offset);
@@ -268,7 +268,7 @@ static void testBuildIssueLabel() {
             CHECK(lbl.ranges[0].keepColor);
             CHECK(!lbl.ranges[2].bold);
             CHECK(lbl.ranges[2].keepColor);
-            CHECK(lbl.ranges[2].sizePct == 85);
+            CHECK(lbl.ranges[2].sizePct == 90);
         }
     }
 
