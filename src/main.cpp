@@ -3793,35 +3793,48 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
 // タスクバーが配置された辺（下・上・左・右）にポップアップを密着させて表示する。
 // タスクバーに沿った軸（水平タスクバーなら X、垂直なら Y）はカーソル位置を起点とする。
 // 画面端超過の扱いは呼び出し側の責務。（右クリックメニューは TrackPopupMenu の自動反転、
-// 一覧ポップアップは showListPopup がモニタ作業領域へクランプする）
+// 一覧ポップアップは showListPopup がタスクバー沿いの軸を画面中央方向へ展開し直したうえで
+// モニタ作業領域へクランプする）
 // SHAppBarMessage 失敗時や uEdge が想定外なら現状挙動（カーソル位置＋左上アライメント）
 // に戻し、必ずポップアップが出るようにする。
 struct TrayPopupPos {
     int  x;
     int  y;
     UINT alignFlags;  // TPM_ アライメントのみ。ボタン系（TPM_LEFTBUTTON 等）は呼び出し側で OR する
+    bool alongX;      // タスクバーに沿った軸が X か（水平タスクバーと失敗時は true、垂直タスクバーは false）
 };
 static TrayPopupPos computeTrayPopupPos(const POINT& cursor) {
     APPBARDATA abd = { sizeof(abd) };
     if (!SHAppBarMessage(ABM_GETTASKBARPOS, &abd)) {
-        return { cursor.x, cursor.y, TPM_LEFTALIGN | TPM_TOPALIGN };
+        return { cursor.x, cursor.y, TPM_LEFTALIGN | TPM_TOPALIGN, true };
     }
     switch (abd.uEdge) {
     case ABE_BOTTOM:
         // 底辺をタスクバー上端に密着、カーソル X から右方向に展開
-        return { cursor.x, abd.rc.top,    TPM_LEFTALIGN  | TPM_BOTTOMALIGN };
+        return { cursor.x, abd.rc.top,    TPM_LEFTALIGN  | TPM_BOTTOMALIGN, true };
     case ABE_TOP:
         // 上辺をタスクバー下端に密着、カーソル X から右方向に展開
-        return { cursor.x, abd.rc.bottom, TPM_LEFTALIGN  | TPM_TOPALIGN };
+        return { cursor.x, abd.rc.bottom, TPM_LEFTALIGN  | TPM_TOPALIGN, true };
     case ABE_LEFT:
         // 左辺をタスクバー右端に密着、カーソル Y から下方向に展開
-        return { abd.rc.right, cursor.y, TPM_LEFTALIGN  | TPM_TOPALIGN };
+        return { abd.rc.right, cursor.y, TPM_LEFTALIGN  | TPM_TOPALIGN, false };
     case ABE_RIGHT:
         // 右辺をタスクバー左端に密着、カーソル Y から下方向に展開
-        return { abd.rc.left,  cursor.y, TPM_RIGHTALIGN | TPM_TOPALIGN };
+        return { abd.rc.left,  cursor.y, TPM_RIGHTALIGN | TPM_TOPALIGN, false };
     default:
-        return { cursor.x, cursor.y, TPM_LEFTALIGN | TPM_TOPALIGN };
+        return { cursor.x, cursor.y, TPM_LEFTALIGN | TPM_TOPALIGN, true };
     }
+}
+
+// 一覧ポップアップのタスクバー沿い軸の始点算出
+// cursor が作業領域 [workLo, workHi) の中央以降にあれば、パネルの奥側の辺を cursor + margin に
+// 合わせて中央方向（手前）へ広げる。中央より手前なら手前側の辺を cursor - margin に合わせて奥へ広げる。
+// margin はアイコンの外側の辺までの距離の上限で、アイコンをパネルの範囲に収めるために足す。
+// （アイコン矩形は DPI 非対応プロセスでカーソル座標と突き合わせられないため、カーソル基準にする）
+// 作業領域外へのはみ出しは呼び出し側がクランプする
+static int alignTowardCenter(int cursor, int size, int workLo, int workHi, int margin) {
+    if (cursor >= workLo + (workHi - workLo) / 2) return cursor + margin - size;
+    return cursor - margin;
 }
 
 // トレイアイコンの画面矩形を取得する
@@ -4806,14 +4819,24 @@ static void showListPopup(HWND trayWnd) {
     const int h = wr.bottom - wr.top;
 
     // 位置はタスクバーの辺に密着させる。computeTrayPopupPos のアライメント指示
-    // （BOTTOMALIGN＝底辺を y に、RIGHTALIGN＝右辺を x に合わせる）を座標へ翻訳し、
-    // メニューの自動反転の代わりにモニタ作業領域内へクランプして画面外を防ぐ
+    // （BOTTOMALIGN＝底辺を y に、RIGHTALIGN＝右辺を x に合わせる）を座標へ翻訳する。
+    // タスクバー沿いの軸は、アイコンを範囲に収めたまま画面中央方向へ展開し直す。
+    // （トレイは画面端にあり、端方向へ広げると隅に張り付くため）
+    // 最後にメニューの自動反転の代わりにモニタ作業領域内へクランプして画面外を防ぐ
     auto pos = computeTrayPopupPos(cursor);
     int wx = pos.x;
     int wy = pos.y;
     if (pos.alignFlags & TPM_RIGHTALIGN)  wx -= w;
     if (pos.alignFlags & TPM_BOTTOMALIGN) wy -= h;
     if (haveMi) {
+        if (pos.alongX) {
+            wx = alignTowardCenter(cursor.x, w, mi.rcWork.left, mi.rcWork.right,
+                                   GetSystemMetrics(SM_CXSMICON));
+        }
+        else {
+            wy = alignTowardCenter(cursor.y, h, mi.rcWork.top, mi.rcWork.bottom,
+                                   GetSystemMetrics(SM_CYSMICON));
+        }
         wx = (std::max)(static_cast<int>(mi.rcWork.left),
                         (std::min)(wx, static_cast<int>(mi.rcWork.right) - w));
         wy = (std::max)(static_cast<int>(mi.rcWork.top),

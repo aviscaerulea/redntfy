@@ -705,6 +705,19 @@ static void testBuildListRowsHidden() {
     g_currentConfig.listLimit = savedLimit;
 }
 
+// タスクバー沿い軸の中央方向展開
+static void testAlignTowardCenter() {
+    // 右寄りのカーソル：奥側の辺を cursor + margin に合わせて手前へ広げる
+    CHECK(alignTowardCenter(1800, 600, 0, 1920, 16) == 1216);
+    // 左寄りのカーソル：手前側の辺を cursor - margin に合わせて奥へ広げる
+    CHECK(alignTowardCenter(100, 600, 0, 1920, 16) == 84);
+    // 中央ちょうどは奥側扱い
+    CHECK(alignTowardCenter(960, 600, 0, 1920, 16) == 376);
+    // 作業領域の原点が 0 以外（第 2 モニタ）でも中央判定は領域基準（中央は 2880）
+    CHECK(alignTowardCenter(2000, 600, 1920, 3840, 16) == 1984);
+    CHECK(alignTowardCenter(3700, 600, 1920, 3840, 16) == 3116);
+}
+
 // テストの列挙実行と集計出力（失敗ありなら終了コード 1）
 int main() {
     // 失敗診断は日本語（UTF-8）を含むため、コンソールの出力コードページを合わせる
@@ -729,6 +742,7 @@ int main() {
     testPassesVersionFilter();
     testSelectNotifyTargets();
     testBuildListRowsHidden();
+    testAlignTowardCenter();
     printf("checks: %d, failed: %d\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }
