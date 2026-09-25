@@ -63,6 +63,7 @@ static void testParseListFormat() {
         if (t.size() == 15) {
             CHECK(t[0].element == FMT_LITERAL);   CHECK_WSTR(t[0].literal, L"#");
             CHECK(t[1].element == FMT_ID);        CHECK(t[1].maxChars == 0);  CHECK(!t[1].alert);
+            CHECK(t[1].sizePct == 100);
             CHECK(t[2].element == FMT_LITERAL);   CHECK_WSTR(t[2].literal, L"  ");
             CHECK(t[3].element == FMT_LASTNAME);
             CHECK(t[4].element == FMT_LITERAL);   CHECK_WSTR(t[4].literal, L"  ");
@@ -75,7 +76,8 @@ static void testParseListFormat() {
             CHECK(t[11].element == FMT_NEW);
             CHECK(t[12].element == FMT_BUG);
             CHECK(t[13].element == FMT_SUBJECT);  CHECK(t[13].maxChars == 40);  CHECK(t[13].alert);
-            CHECK(t[14].element == FMT_LEFT);     CHECK(t[14].maxChars == 0);   CHECK(!t[14].alert);
+            CHECK(t[14].element == FMT_LEFT);     CHECK(t[14].maxChars == 0);   CHECK(t[14].alert);
+            CHECK(t[14].sizePct == 85);
         }
     }
 
@@ -104,9 +106,36 @@ static void testParseListFormat() {
         }
     }
 
-    // 不正な長さ指定・"!" の位置違いはトークン全体をリテラル原文として残す
+    // サイズ指定（"@" に続く 50〜100 の百分率）の正常系
+    {
+        auto t = parseListFormat(L"{left@85!}");
+        CHECK(t.size() == 1);
+        if (t.size() == 1) {
+            CHECK(t[0].element == FMT_LEFT);  CHECK(t[0].sizePct == 85);  CHECK(t[0].alert);
+        }
+    }
+    {
+        auto t = parseListFormat(L"{subject:40@90!}");
+        CHECK(t.size() == 1);
+        if (t.size() == 1) {
+            CHECK(t[0].element == FMT_SUBJECT);
+            CHECK(t[0].maxChars == 40);  CHECK(t[0].sizePct == 90);  CHECK(t[0].alert);
+        }
+    }
+    {
+        auto t = parseListFormat(L"{left@100}{left@50}");
+        CHECK(t.size() == 2);
+        if (t.size() == 2) {
+            CHECK(t[0].sizePct == 100);  CHECK(!t[0].alert);
+            CHECK(t[1].sizePct == 50);
+        }
+    }
+
+    // 不正な長さ指定・サイズ指定・"!" の位置違いはトークン全体をリテラル原文として残す
     for (const wchar_t* bad : { L"{subject:0}", L"{subject:abc}", L"{subject:}", L"{subject:12345}",
-                                L"{!}", L"{subject!:40}", L"{subject:!}" }) {
+                                L"{!}", L"{subject!:40}", L"{subject:!}",
+                                L"{left@}", L"{left@49}", L"{left@101}", L"{left@abc}",
+                                L"{left@1000}", L"{left@85:5}", L"{left!@85}" }) {
         auto t = parseListFormat(bad);
         CHECK(t.size() == 1);
         CHECK(t[0].element == FMT_LITERAL);
@@ -165,23 +194,34 @@ static void testBuildIssueLabel() {
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
         CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 💥 テスト件名（6 日遅れ）");
         // ranges は期日（半太字・"!" で期限切れ赤）、💥（赤、末尾空白を含まない）、
-        // 件名（"!" で期限切れは半太字の赤）の 3 件で昇順。{left} は "!" なしのため範囲を持たない
-        CHECK(lbl.ranges.size() == 3);
-        if (lbl.ranges.size() == 3) {
+        // 件名（"!" で期限切れは半太字の赤）、{left}（"!" で期限切れは半太字の赤、85% 縮小）の
+        // 4 件で昇順
+        CHECK(lbl.ranges.size() == 4);
+        if (lbl.ranges.size() == 4) {
             CHECK(lbl.ranges[0].offset == 23);  // "#12345  山田  👥 [ロケモニプ] " の直後
             CHECK(lbl.ranges[0].len == 4);      // "7/28"
             CHECK(lbl.ranges[0].bold);
             CHECK(!lbl.ranges[0].keepColor);    // 期限切れ（7/28 ≦ 8/3）は赤
+            CHECK(lbl.ranges[0].sizePct == 100);
             CHECK(lbl.ranges[1].offset == 28);  // "7/28 " の直後
             CHECK(lbl.ranges[1].len == 2);      // 💥（サロゲートペア）
             CHECK(lbl.ranges[1].color == ALERT_TEXT_COLOR);
+            CHECK(lbl.ranges[1].sizePct == 100);
             CHECK(lbl.ranges[2].offset == 31);  // "💥 " の直後
             CHECK(lbl.ranges[2].len == 5);      // "テスト件名"
             CHECK(lbl.ranges[2].bold);
             CHECK(!lbl.ranges[2].keepColor);
             CHECK(lbl.ranges[2].color == ALERT_TEXT_COLOR);
+            CHECK(lbl.ranges[2].sizePct == 100);
+            CHECK(lbl.ranges[3].offset == 36);  // "テスト件名" の直後
+            CHECK(lbl.ranges[3].len == 7);      // "（6 日遅れ）"
+            CHECK(lbl.ranges[3].bold);
+            CHECK(!lbl.ranges[3].keepColor);
+            CHECK(lbl.ranges[3].color == ALERT_TEXT_COLOR);
+            CHECK(lbl.ranges[3].sizePct == 85);
             CHECK(lbl.ranges[0].offset < lbl.ranges[1].offset);
             CHECK(lbl.ranges[1].offset < lbl.ranges[2].offset);
+            CHECK(lbl.ranges[2].offset < lbl.ranges[3].offset);
         }
     }
 
@@ -191,8 +231,8 @@ static void testBuildIssueLabel() {
         row.isNew = true;
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
         CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 ✨ 💥 テスト件名（6 日遅れ）");
-        CHECK(lbl.ranges.size() == 3);
-        if (lbl.ranges.size() == 3) {
+        CHECK(lbl.ranges.size() == 4);
+        if (lbl.ranges.size() == 4) {
             CHECK(lbl.ranges[0].offset == 23);  // 期日は ✨ より前のため不変
             CHECK(lbl.ranges[1].offset == 30);  // 💥。"✨ "（2 コードユニット）分ずれる
         }
@@ -221,10 +261,14 @@ static void testBuildIssueLabel() {
         row.dueDate = "2026-08-04";
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
         CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 8/4 💥 テスト件名（1 日前）");
-        CHECK(lbl.ranges.size() == 2);
-        if (!lbl.ranges.empty()) {
+        // {left} は期限切れでないため色とウェイトを据え置き、縮小だけの範囲を持つ
+        CHECK(lbl.ranges.size() == 3);
+        if (lbl.ranges.size() == 3) {
             CHECK(lbl.ranges[0].bold);
             CHECK(lbl.ranges[0].keepColor);
+            CHECK(!lbl.ranges[2].bold);
+            CHECK(lbl.ranges[2].keepColor);
+            CHECK(lbl.ranges[2].sizePct == 85);
         }
     }
 

@@ -78,6 +78,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <map>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -402,14 +403,16 @@ struct FormatToken {
     std::wstring literal;              // FMT_LITERAL のときの出力文字列
     int          element = FMT_LITERAL;
     int          maxChars = 0;         // 最大文字数（0 = 切り詰めなし）
+    int          sizePct  = 100;       // "@" 指定の文字サイズ（基準フォントに対する百分率。50〜100）
     bool         alert    = false;     // 末尾 "!" 指定。期限切れ行でこの要素を赤の半太字にする
 };
 
 // list_format の既定値
 // v1.4 までの固定並びへ新規流入マーカー {new} を 💥 マーカーの直前に加え、末尾の経過日数 {ago} を
-// 期日の残り日数 {left} に置き換えた並び。期限切れ行で赤にするのは期日と件名だけとする。
+// 期日の残り日数 {left} に置き換えた並び。期限切れ行で赤にするのは期日、件名、残り日数とする。
+// 残り日数は件名より目立たせないため 85% に縮める。
 static constexpr wchar_t LIST_FORMAT_DEFAULT[] =
-    L"#{id}  {lastname}  {group}[{project:5}] {due!} {new}{bug}{subject:40!}{left}";
+    L"#{id}  {lastname}  {group}[{project:5}] {due!} {new}{bug}{subject:40!}{left@85!}";
 
 // フォールバックモード（query_ids 省略）の擬似クエリ id
 // Redmine のクエリ id は正の整数のため 0 は衝突しない。state.json の queries／
@@ -1336,6 +1339,8 @@ static void loadHidden(const std::wstring& dir) {
 
 // list_format 文字列をトークン列へ解析する
 // {要素名} または {要素名:最大文字数} を認識する。（最大文字数は 1 以上の 10 進整数のみ有効）
+// {要素名@百分率} は文字サイズの指定で、基準フォントに対する 50〜100 の整数だけを有効とする。
+// 最大文字数と併用するときは {subject:40@90!} の順に書く。
 // 閉じ括弧の直前の "!"（{due!}・{subject:40!}）は赤指定で、期限切れ行でその要素を赤の半太字にする。
 // 解釈できない部分（未知の要素名・不正な長さ・閉じ括弧なし）はリテラルとして原文のまま残し、
 // ログに記録する。誤記が一覧にそのまま現れるため、ユーザが確実に気付ける。
@@ -1369,10 +1374,23 @@ static std::vector<FormatToken> parseListFormat(const std::wstring& fmt) {
         std::wstring inner = fmt.substr(pos + 1, close - pos - 1);
         bool alert = !inner.empty() && inner.back() == L'!';
         if (alert) inner.pop_back();
+        // "@" 以降は文字サイズの百分率。縮小だけを許す。（拡大すると行の高さの計測まで変わるため）
+        int  sizePct = 100;
+        bool valid   = true;
+        if (auto at = inner.find(L'@'); at != std::wstring::npos) {
+            std::wstring pct = inner.substr(at + 1);
+            inner.erase(at);
+            valid = !pct.empty() && pct.size() <= 3
+                && std::all_of(pct.begin(), pct.end(),
+                               [](wchar_t c) { return c >= L'0' && c <= L'9'; });
+            if (valid) {
+                sizePct = std::stoi(pct);
+                valid = sizePct >= 50 && sizePct <= 100;
+            }
+        }
         std::wstring name  = inner;
         int maxChars = 0;
-        bool valid   = true;
-        if (auto colon = inner.find(L':'); colon != std::wstring::npos) {
+        if (auto colon = inner.find(L':'); valid && colon != std::wstring::npos) {
             name = inner.substr(0, colon);
             std::wstring len = inner.substr(colon + 1);
             // 桁数を 4 桁までに抑えて stoi の桁あふれも防ぐ（実用上は 3 桁で十分）
@@ -1397,7 +1415,8 @@ static std::vector<FormatToken> parseListFormat(const std::wstring& fmt) {
         }
         if (valid) {
             flushLiteral();
-            tokens.push_back({.element = element, .maxChars = maxChars, .alert = alert});
+            tokens.push_back({.element = element, .maxChars = maxChars, .sizePct = sizePct,
+                              .alert = alert});
         }
         else {
             std::wstring raw = fmt.substr(pos, close - pos + 1);
@@ -3505,7 +3524,7 @@ static void initMenuFonts() {
 // 注意を促す文字色（期限切れ行で list_format の "!" を付けた要素と、バグマーカー。更新通知メニューの新バージョン表示と同じ赤）
 static constexpr COLORREF ALERT_TEXT_COLOR = RGB(220, 0, 0);
 
-// ラベル内で文字色とウェイトを変える範囲（オフセットと長さは UTF-16 コードユニット単位）
+// ラベル内で文字色、ウェイト、サイズを変える範囲（オフセットと長さは UTF-16 コードユニット単位）
 // bold と keepColor を組み合わせて「色は据え置き、ウェイトだけ変える」ような部分強調にも使える。
 struct ColorRange {
     size_t   offset    = 0;
@@ -3513,6 +3532,7 @@ struct ColorRange {
     COLORREF color     = 0;
     bool     bold      = false;  // 半太字で描く（範囲外との幅の差は走査側が吸収する）
     bool     keepColor = false;  // true なら color を無視して範囲外と同じ色で描く
+    int      sizePct   = 100;    // 文字サイズの百分率（100 未満は縮小フォントで描く）
 };
 
 // 一覧ポップアップのチケット項目（行レイアウトの index に対応、トレイ WndProc スレッドのみ使用）
@@ -3520,7 +3540,7 @@ struct IssueItem {
     int          id     = 0;
     std::wstring url;            // {redmine.url}/issues/{id}
     std::wstring label;          // 描画テキスト（drawIssueRow / measureIssueRow で使用）
-    // label 内で文字色とウェイトを変える範囲（空 = 分割描画しない）。buildIssueLabel が組み立てる
+    // label 内で文字色、ウェイト、サイズを変える範囲（空 = 分割描画しない）。buildIssueLabel が組み立てる
     std::vector<ColorRange> ranges;
     bool         unread     = false; // 未読（まだ一覧から開いていない）。太字の条件の 1 つ（issueRowBold）
     bool         hasDue     = false; // 期日あり。太字の条件の 1 つ（issueRowBold）。非表示中は効かない
@@ -3683,7 +3703,7 @@ static std::wstring truncateText(const std::wstring& s, size_t maxChars, bool el
     return ellipsis ? s.substr(0, cut) + L"…" : s.substr(0, cut);
 }
 
-// 一覧行のラベル（描画テキストと、その中で色とウェイトを変える範囲）
+// 一覧行のラベル（描画テキストと、その中で色、ウェイト、サイズを変える範囲）
 // セグメント文字列を別々に持つと text 全体との不整合が起き得るため、text を単一の真実とし
 // 位置だけを保持する。幅計測と打ち消し線の長さは walkIssueLabel の走査で求める。
 // ranges はオフセット昇順で重なりなく並べる。（描画側が順に走査する前提）
@@ -3721,6 +3741,7 @@ static constexpr wchar_t NEW_MARK[] = L"✨ ";
 //   空なら装飾ごと消える。
 //   期限切れ行の "!" 指定要素と、常に赤いバグマーカーは ALERT_TEXT_COLOR で描くため、
 //   位置を ranges に記録する。期日は "!" の有無によらず常に半太字の範囲を持つ。
+//   "@" で縮小した要素も、サイズを描画側へ渡すため範囲を持つ。
 //   （ranges はオフセット昇順で並べる契約。展開順の追記がそのまま昇順になる）
 // 引数に ListRow を丸ごと取るのは、同じ型の要素が増えて位置引数では取り違えを防げないため。
 // ピン記号はラベルに含めない。drawIssueRow が IssueItem::pinned を見てマーカー列に描く。
@@ -3763,24 +3784,29 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
             continue;
         }
         bool alertNow = tk.alert && due.overdue;  // "!" 指定かつ期限切れ行
+        ColorRange range{.offset = r.text.size(), .len = val.size(), .color = ALERT_TEXT_COLOR,
+                         .keepColor = true, .sizePct = tk.sizePct};
         if (tk.element == FMT_DUE) {
             // 期日は常に半太字で強調する。（一覧の中で期日行を素早く拾えるようにする）
             // 赤は "!" 指定の期限切れ行だけで、それ以外は色を据え置く。（範囲外と同じ色で描く）
-            ColorRange range{r.text.size(), val.size(), ALERT_TEXT_COLOR, true};
-            if (!alertNow) range.keepColor = true;
-            r.ranges.push_back(range);
+            range.bold      = true;
+            range.keepColor = !alertNow;
         }
         else if (alertNow) {
             // "!" 指定の要素は期限切れ行で赤の半太字にする。（期日だけでは行全体の緊急度に気付けない）
             // 判定は期日と同じ overdue を使うため、{due} を持たない書式でも効く。
-            r.ranges.push_back({r.text.size(), val.size(), ALERT_TEXT_COLOR, true});
+            range.bold      = true;
+            range.keepColor = false;
         }
         else if (tk.element == FMT_BUG) {
             // マーカー自体を赤くする。（絵文字は GDI が現在の文字色で単色描画するため色が乗る）
             // 末尾の空白は色を変えても見えないので範囲に含めない
-            size_t len = val.size() - (val.back() == L' ' ? 1 : 0);
-            if (len > 0) r.ranges.push_back({r.text.size(), len, ALERT_TEXT_COLOR});
+            range.len       = val.size() - (val.back() == L' ' ? 1 : 0);
+            range.keepColor = false;
         }
+        // 色、ウェイト、サイズのいずれも既定のままなら範囲を持たない（範囲外と同じ描画で足りる）。
+        if (range.len > 0 && (range.bold || !range.keepColor || range.sizePct != 100))
+            r.ranges.push_back(range);
         r.text += val;
         prevEmpty = false;
     }
@@ -4308,12 +4334,38 @@ static void handleTrayCommand(UINT id) {
     }
 }
 
+// 縮小フォントの取得
+// src と同じフェイス・ウェイトで、高さを pct% にしたフォントを返す。pct が 100 なら src をそのまま返す。
+// 生成したフォントは (src, pct) ごとにキャッシュし、g_hMenuFont と同じくプロセス終了まで保持する。
+// 百分率は list_format の解析結果で有限個のため、キャッシュは増え続けない。
+// 生成に失敗したら src を返す。（サイズ指定だけが効かず、一覧の表示は続く）
+// 呼び出しはトレイの WndProc スレッドだけのため、ロックは要らない。
+static HFONT scaledFont(HFONT src, int pct) {
+    if (pct == 100) return src;
+    static std::map<std::pair<HFONT, int>, HFONT> cache;
+    auto key = std::make_pair(src, pct);
+    if (auto it = cache.find(key); it != cache.end()) return it->second;
+    LOGFONTW lf = {};
+    if (!GetObjectW(src, sizeof(lf), &lf) || lf.lfHeight == 0) return src;
+    lf.lfHeight = MulDiv(lf.lfHeight, pct, 100);
+    lf.lfWidth  = MulDiv(lf.lfWidth, pct, 100);
+    HFONT f = CreateFontIndirectW(&lf);
+    if (!f) {
+        writeLog("list font: scaled font creation failed (" + std::to_string(pct) + "%)");
+        return src;
+    }
+    cache.emplace(key, f);
+    return f;
+}
+
 // ラベルを色範囲の境界でセグメントに分けて走査し、総幅を返す
 //
 // 範囲ごとにフォントを切り替えるため、幅は各セグメントの合算になる。計測と描画で同じ走査を
 // 通すことが要点で、片方だけ「ラベル全体を 1 回計測」に戻すと行幅・取消線と実描画幅が食い違う。
 // セグメント境界は空白位置に来ることが多いが、期限切れの件名のように本文中で分かれる場合もある。
 // 分割による字形整形の差は数 px にとどまるため受容する。
+// 範囲の sizePct が 100 未満なら縮小フォントで描き、ベースラインを基準フォントに揃える。
+// サイズ 100 のセグメントは従来どおり DT_VCENTER の中央配置のまま。
 // textRect が nullptr なら描画せず幅だけを返す。（measureIssueRow 用）
 // uniformColor=true は範囲の色を無視して textColor 一色で描く。要求元はホット行と非表示行の
 // 両方だ。（ハイライト背景上の赤は読みにくい。ウェイトは幅が変わるためホット行でも維持する）
@@ -4326,10 +4378,15 @@ static int walkIssueLabel(HDC hdc, const IssueItem& item, const RECT* textRect,
     constexpr UINT DT_ROW = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX;
     const wchar_t* base = item.label.c_str();
     int x = 0;
-    auto segment = [&](size_t from, size_t to, COLORREF color, HFONT font) {
+    // 縮小セグメントのベースラインを基準フォントに合わせるため、基準の縦寸法を先に得る
+    TEXTMETRICW baseTm = {};
+    SelectObject(hdc, baseFont);
+    GetTextMetricsW(hdc, &baseTm);
+    auto segment = [&](size_t from, size_t to, COLORREF color, HFONT font, int sizePct) {
         // 範囲の指定を信用せずラベル長で丸める。（境界外読み取りと位置の巻き戻りを防ぐ）
         to = (std::min)(to, item.label.size());
         if (from >= to) return;
+        font = scaledFont(font, sizePct);
         SelectObject(hdc, font);
         int len = static_cast<int>(to - from);
         SIZE sz = {};
@@ -4337,6 +4394,15 @@ static int walkIssueLabel(HDC hdc, const IssueItem& item, const RECT* textRect,
         if (textRect) {
             RECT seg = *textRect;
             seg.left += x;
+            if (sizePct != 100) {
+                // DT_VCENTER は字面の枠を行の中央に置くため、小さいフォントは基準より文字の下端が上がる。
+                // 両者のベースライン（中央配置時の枠上端＋アセント）の差だけ下げて揃える
+                TEXTMETRICW tm = {};
+                GetTextMetricsW(hdc, &tm);
+                int dy = (baseTm.tmAscent - baseTm.tmHeight / 2) - (tm.tmAscent - tm.tmHeight / 2);
+                seg.top    += dy;
+                seg.bottom += dy;
+            }
             SetTextColor(hdc, uniformColor ? textColor : color);
             DrawTextW(hdc, base + from, len, &seg, DT_ROW);
         }
@@ -4344,12 +4410,12 @@ static int walkIssueLabel(HDC hdc, const IssueItem& item, const RECT* textRect,
     };
     size_t done = 0;
     for (const auto& r : item.ranges) {
-        segment(done, r.offset, textColor, baseFont);
+        segment(done, r.offset, textColor, baseFont, 100);
         segment(r.offset, r.offset + r.len,
-                r.keepColor ? textColor : r.color, r.bold ? emphFont : baseFont);
+                r.keepColor ? textColor : r.color, r.bold ? emphFont : baseFont, r.sizePct);
         done = r.offset + r.len;
     }
-    segment(done, item.label.size(), textColor, baseFont);
+    segment(done, item.label.size(), textColor, baseFont, 100);
     return x;
 }
 
