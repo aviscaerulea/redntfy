@@ -3462,7 +3462,8 @@ static std::vector<ListRow> buildListRows(int& visible) {
     }
     // 一覧の行数上限（LIST_ROW_MAX）もここで適用する。（ピン・非表示込み）
     // showListPopup 側で打ち切ると、打ち切られた行の未読がバッジに残りクリックで消せなくなる。
-    // 並べ替え後の先頭から残すため、更新の古い行から落ちる。
+    // 並べ替え後の末尾から落とすため、更新日時降順なら更新の古い行、期日順なら期日の遠い行と
+    // 期日なしの行から落ちる。
     if (rows.size() > LIST_ROW_MAX) rows.resize(LIST_ROW_MAX);
     return rows;
 }
@@ -6107,8 +6108,8 @@ int wmain() {
         // プロセスハンドルを取り、プロセスオブジェクトのシグナルで終了完了を待つ。
         // （プロセスはハンドルテーブルの解放後にシグナル状態になるので、この待ちが名前の解放を
         // 保証する。Job の ActiveProcesses は解放より先に減るため待ちに使えない）
-        // 一覧の領域は 16 件分。Job には自プロセスしか入らないが、SILENT_BREAKAWAY_OK 以前の版が
-        // 起動した子プロセスが残る場合に備える。
+        // PID 一覧のバッファは 16 件分。Job には自プロセスしか入らないが、SILENT_BREAKAWAY_OK
+        // 以前の版が起動した子プロセスが残る場合に備える。
         std::vector<HANDLE> procs;
         {
             struct { JOBOBJECT_BASIC_PROCESS_ID_LIST list; ULONG_PTR more[15]; } buf = {};
