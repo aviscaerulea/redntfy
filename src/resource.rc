@@ -34,7 +34,7 @@ BEGIN
             VALUE "FileDescription",  "redntfy"
             VALUE "FileVersion",      APP_VERSION_STR
             VALUE "InternalName",     "redntfy"
-            VALUE "LegalCopyright",   "Copyright (c) 2026 Nikai,Takayuki"
+            VALUE "LegalCopyright",   "Copyright (c) 2026 nikai"
             VALUE "OriginalFilename", "redntfy.exe"
             VALUE "ProductName",      "redntfy"
             VALUE "ProductVersion",   APP_VERSION_STR
