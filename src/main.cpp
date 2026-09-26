@@ -4254,6 +4254,9 @@ static void handleTrayCommand(UINT id) {
     if (id == IDM_SORT_BY_DUE) {
         g_sortByDue.store(!g_sortByDue.load());
         writeRegDword(REG_SORT_BY_DUE, g_sortByDue.load() ? 1u : 0u);
+        // 並べ替えで list_limit の窓に入る行が入れ替わり未読件数が変わるため、
+        // 他のフィルタ系トグルと同じくバッジを即時更新する。（一覧は次に開いた時点で組み直される）
+        if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
         return;
     }
     if (id == IDM_EXIT) {
