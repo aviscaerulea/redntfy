@@ -771,6 +771,19 @@ static void testBuildListRowsHidden() {
     g_currentConfig.listLimit = savedLimit;
 }
 
+// schedule の回数を 60 の約数へ丸める
+static void testRoundToDivisorOf60() {
+    CHECK(roundToDivisorOf60(0) == 0);    // 休止はそのまま
+    CHECK(roundToDivisorOf60(1) == 1);
+    CHECK(roundToDivisorOf60(7) == 6);
+    CHECK(roundToDivisorOf60(8) == 6);    // 6 と 10 の同差は小さい方
+    CHECK(roundToDivisorOf60(11) == 10);
+    CHECK(roundToDivisorOf60(13) == 12);
+    CHECK(roundToDivisorOf60(45) == 30);  // 30 と 60 の同差は小さい方
+    CHECK(roundToDivisorOf60(59) == 60);
+    CHECK(roundToDivisorOf60(60) == 60);
+}
+
 // タスクバー沿い軸の中央方向展開
 static void testAlignTowardCenter() {
     // 右寄りのカーソル：奥側の辺を cursor + margin に合わせて手前へ広げる
@@ -808,6 +821,7 @@ int main() {
     testPassesVersionFilter();
     testSelectNotifyTargets();
     testBuildListRowsHidden();
+    testRoundToDivisorOf60();
     testAlignTowardCenter();
     printf("checks: %d, failed: %d\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

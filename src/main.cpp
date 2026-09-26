@@ -1457,8 +1457,23 @@ static std::optional<toml::table> loadToml(const std::wstring& path) {
     }
 }
 
+// 1 時間あたりのポーリング回数を 60 の約数へ丸める
+// calcNextPollTime は 60 / N 分の等間隔で正時起点に刻むため、N が 60 の約数でないと
+// 間隔が切り捨てられて回数が設定より増える。（7 → 8 分間隔で 8 回、45 → 1 分間隔で 60 回）
+// 差が同じ 2 つの約数があれば小さい方（回数の少ない方）を採る。0（休止）はそのまま返す。
+static int roundToDivisorOf60(int n) {
+    if (n <= 0) return 0;
+    // 最小の約数から昇順に走査し差が縮んだときだけ更新するため、同差なら先に見つかった小さい方が残る
+    static constexpr int divisors[] = {1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60};
+    int best = divisors[0];
+    for (int d : divisors) {
+        if (std::abs(d - n) < std::abs(best - n)) best = d;
+    }
+    return best;
+}
+
 // schedule 配列を TOML テーブルから読み込む（なければ nullopt）
-// 各要素は [0, 60] にクランプする。（0 = その時間帯は休止）
+// 各要素は [0, 60] にクランプし、60 の約数へ丸める。（0 = その時間帯は休止。丸めはログに残す）
 // 戻り値は常に 24 要素とする。（超過分は切り捨て、不足分は 1 で補完、非整数要素は 1 扱い）
 // 呼び出し側は時をそのまま添字に使い範囲検査をしないため、この要素数が前提になる。
 static std::optional<std::vector<int>> readSchedule(const std::optional<toml::table>& tbl) {
@@ -1468,7 +1483,13 @@ static std::optional<std::vector<int>> readSchedule(const std::optional<toml::ta
     std::vector<int> sched;
     for (const auto& el : *arr) {
         if (sched.size() >= 24) break;
-        sched.push_back((std::min)(60, (std::max)(0, el.value_or(1))));
+        int n = (std::min)(60, (std::max)(0, el.value_or(1)));
+        int r = roundToDivisorOf60(n);
+        if (r != n) {
+            writeLog("schedule[" + std::to_string(sched.size()) + "]: " + std::to_string(n)
+                + " is not a divisor of 60; rounded to " + std::to_string(r));
+        }
+        sched.push_back(r);
     }
     while (sched.size() < 24) sched.push_back(1);
     return sched;
