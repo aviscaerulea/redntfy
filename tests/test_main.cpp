@@ -620,6 +620,25 @@ static void testSelectNotifyTargets() {
         CHECK(r && r->size() == 3);
         CHECK(muted == 0);
     }
+    // 取得開始と同じ秒の更新（updatedOn == prev.polledOn）は「前回以降の更新」に含める。
+    // 自分の更新なら抑止し、他人の更新なら更新者名を添えて通知する
+    {
+        auto prev = makePrevState();
+        auto is   = makeIssue(113, prev.polledOn);
+        is.updaterId   = ME;
+        is.updaterName = "自分";
+        std::vector<Issue> issues{is};
+        int muted = -1;
+        auto r = selectNotifyTargets(issues, prev, true, ME, {}, &muted);
+        CHECK(r && r->empty());
+        CHECK(muted == 1);
+        is.updaterId   = 9;
+        is.updaterName = "更新者";
+        issues = {is};
+        r = selectNotifyTargets(issues, prev, true, ME, {}, &muted);
+        CHECK(r && r->size() == 1 && (*r)[0].updaterName == "更新者");
+        CHECK(muted == 0);
+    }
     // 前回追跡していないクエリだけに属する新規は黙って採用する（通知しない）
     {
         auto prev = makePrevState();

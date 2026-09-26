@@ -5553,7 +5553,10 @@ static std::optional<std::vector<NotifyTarget>> selectNotifyTargets(
             // それより古い更新の流入は時間経過（期日接近等）によるもので、最終更新者が
             // 自分でも通知する。（既知チケットのクエリ流入の扱いと揃える）
             // polled_on の無い旧形式 state.json では判定せず通知側に倒す。
-            bool recentUpdate = !prev.polledOn.empty() && is.updatedOn > prev.polledOn;
+            // 取得開始と同じ秒は「以降」に含める。polled_on と updated_on は共に秒精度で、
+            // 取得開始と同じ秒の自分の更新は次回に同値で現れるため。（同じ秒に取得済みの
+            // チケットは prev.issues にあり、この分岐には来ない）
+            bool recentUpdate = !prev.polledOn.empty() && is.updatedOn >= prev.polledOn;
             if (muteOwnChanges && recentUpdate && myUserId != 0 && is.updaterId == myUserId) {
                 ++muted;
                 continue;
