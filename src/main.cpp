@@ -730,7 +730,9 @@ static std::wstring makeDueLeftText(const std::string& due, long long todayDays)
 }
 
 // 現在時刻を Redmine の updated_on と同形式の UTC ISO 8601 文字列で返す
-// state.json の polled_on に記録し、次回ポーリングで「前回以降の更新か」を辞書順比較で判定する。
+// ポーリングの取得開始時に呼び、state.json の polled_on に記録する。次回ポーリングで
+// 「前回の取得開始以降の更新か」を辞書順比較で判定する。（取得〜保存の間に起きた更新を
+// 次回の判定窓に含めるため、保存時刻ではなく取得開始時刻を記録する）
 // ローカル時計とサーバ時計のずれはそのまま判定窓のずれになるが、秒〜分単位であり実害は無視できる。
 static std::string nowUtcIso() {
     SYSTEMTIME st;
@@ -1106,7 +1108,7 @@ struct PollState {
     bool                                baseline = false; // ベースライン確立済みか
     std::unordered_map<int, StateEntry> issues;
     std::vector<int>                    knownQueries;     // 前回追跡していたクエリ id（昇順）
-    std::string                         polledOn;         // 前回ポーリング時刻（UTC ISO 8601。旧形式は空）
+    std::string                         polledOn;         // 前回ポーリングの取得開始時刻（UTC ISO 8601。旧形式は空）
 };
 
 // 検知済み状態の読み込み
@@ -1180,15 +1182,18 @@ static std::vector<int> trackedQueryIds(const Config& cfg) {
 // baseline フラグを明示するのは、保存クエリが正常に 0 件を返した状態と初回起動を区別するため。
 // version と queries（今回追跡したクエリ id）を持つのは、次回に旧形式からの移行と
 // query_ids へのクエリ追加を検出して通知の嵐を防ぐため。
+// polledOn は今回の取得開始時刻（nowUtcIso 形式）で、polled_on にそのまま書く。保存時刻を
+// 使うと取得〜保存の間の自分の更新が次回に「前回以降の更新」と判定されず新規通知になる。
 // 戻り値は保存成否。書き込み不能環境ではログも残せない可能性があるため、呼び出し側が
 // 失敗を Toast でユーザに知らせる。
-static bool saveState(const std::wstring& dir, const Config& cfg, const std::vector<Issue>& issues) {
+static bool saveState(const std::wstring& dir, const Config& cfg, const std::vector<Issue>& issues,
+                      const std::string& polledOn) {
     using namespace winrt::Windows::Data::Json;
     try {
         JsonObject root;
         root.Insert(L"version",  JsonValue::CreateNumberValue(2));
         root.Insert(L"baseline", JsonValue::CreateBooleanValue(true));
-        root.Insert(L"polled_on", JsonValue::CreateStringValue(winrt::to_hstring(nowUtcIso())));
+        root.Insert(L"polled_on", JsonValue::CreateStringValue(winrt::to_hstring(polledOn)));
         JsonArray qarr;
         for (int q : trackedQueryIds(cfg)) qarr.Append(JsonValue::CreateNumberValue(q));
         root.Insert(L"queries", qarr);
@@ -5544,7 +5549,7 @@ static std::optional<std::vector<NotifyTarget>> selectNotifyTargets(
             if (!inKnown) continue;
             // 自分の更新が原因の流入は通知しない。既存チケットは自分の操作（期日削除等）で
             // 保存クエリの条件に入り直すことがある。起票者チェックだけでは弾けないため、
-            // 前回ポーリング以降に更新されたチケットは最終更新者でも判定する。
+            // 前回ポーリングの取得開始以降に更新されたチケットは最終更新者でも判定する。
             // それより古い更新の流入は時間経過（期日接近等）によるもので、最終更新者が
             // 自分でも通知する。（既知チケットのクエリ流入の扱いと揃える）
             // polled_on の無い旧形式 state.json では判定せず通知側に倒す。
@@ -5640,6 +5645,7 @@ static void emitNotifications(const Config& cfg, const std::vector<NotifyTarget>
 // 終了要求で選定が中断された場合は state.json を書かずに抜ける。前回のまま残るため、
 // 未通知分は次回ポーリングで再検知される。（通知は失われない）
 // prev は呼び出し側が loadState で読んだ前回状態。（resolveUpdaters のキャッシュと共有するため外で読む）
+// polledOn は今回の取得開始時刻で、saveState にそのまま渡す。
 // 戻り値：通知した件数と、自分の操作として抑止した件数。「今すぐ更新」の応答 Toast の出し分けに使う。
 // ベースライン未確立・中断時はどちらも 0。
 struct PollOutcome {
@@ -5647,7 +5653,8 @@ struct PollOutcome {
     int mutedOwn = 0;  // 自分の操作として通知を抑止した件数
 };
 static PollOutcome deliverPollResults(const std::wstring& dataDir, const Config& cfg,
-                                      const std::vector<Issue>& issues, const PollState& prev)
+                                      const std::vector<Issue>& issues, const PollState& prev,
+                                      const std::string& polledOn)
 {
     // 一覧・tooltip 用の共有状態を更新する
     {
@@ -5658,7 +5665,7 @@ static PollOutcome deliverPollResults(const std::wstring& dataDir, const Config&
     if (!prev.baseline) {
         // 保存失敗を放置すると baseline が永久に確立せず無言で通知ゼロになるため、Toast で知らせる
         // （データディレクトリが書き込み不可の場合など、ログ自体が残せない環境を想定）
-        if (!saveState(dataDir, cfg, issues))
+        if (!saveState(dataDir, cfg, issues, polledOn))
             showErrorToast(L"状態保存エラー", L"state.json を書き込めません。%LOCALAPPDATA%\\redntfy の書き込み権限を確認してください");
         if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
         writeLog("baseline established (" + std::to_string(issues.size()) + " issues)");
@@ -5693,7 +5700,7 @@ static PollOutcome deliverPollResults(const std::wstring& dataDir, const Config&
     if (!targets->empty()) emitNotifications(cfg, *targets);
 
     // 保存に失敗すると次回も同じ更新を再検知して通知が重複するため、Toast で知らせる
-    if (!saveState(dataDir, cfg, issues))
+    if (!saveState(dataDir, cfg, issues, polledOn))
         showErrorToast(L"状態保存エラー", L"state.json を書き込めません。通知が重複する可能性があります");
     if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
 
@@ -5901,6 +5908,8 @@ static void pollThreadFunc(std::wstring dataDir, Config cfg) {
             bool queryError = false;
             // 取得の成否によらずクールダウンの起点を進める。（失敗の連発も抑止対象とする）
             g_lastPollAttemptTick.store(t0);
+            // state.json の polled_on に書く取得開始時刻。（保存時刻ではない。saveState のコメントを参照）
+            std::string polledOn = nowUtcIso();
             bool ok = fetchIssues(cfg, issues, &authError, &queryError);
             ULONGLONG elapsed = GetTickCount64() - t0;
 
@@ -5964,7 +5973,7 @@ static void pollThreadFunc(std::wstring dataDir, Config cfg) {
             resolveUpdaters(cfg, issues, prevState, session.userNames);
             if (g_shutdownRequested) break;  // resolveUpdaters は HTTP を伴うため中断を確認する
 
-            PollOutcome outcome = deliverPollResults(dataDir, cfg, issues, prevState);
+            PollOutcome outcome = deliverPollResults(dataDir, cfg, issues, prevState, polledOn);
             refreshPins(dataDir, cfg, issues, session.groupIds, session.groupIdsResolved);
             pruneHidden(dataDir, issues);
             // 一覧が表示中なら最新の状態で組み直させる。（チケット・ピン・非表示がすべて確定した後）
