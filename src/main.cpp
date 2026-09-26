@@ -6032,6 +6032,11 @@ int wmain() {
     // 多重起動制御（新プロセス優先）
     // 名前付き Job Object で旧プロセスをまとめて終了させる。
     // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE により hJob は閉じずプロセス終了まで保持する。
+    // Job に入れるのは自プロセスだけとする。ShellExecuteW で起動したブラウザやエディタが Job を
+    // 継承すると、終了メニュー・次インスタンスの TerminateJobObject・task build の kill で
+    // 道連れに強制終了し未保存の編集を失うため、JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK で
+    // 子プロセスを自動的に Job 外へ出す。（BREAKAWAY_OK は CREATE_BREAKAWAY_FROM_JOB を
+    // 指定した子にしか効かず、ShellExecuteW 経由の子には効かない）
     HANDLE hJob = CreateJobObjectW(nullptr, L"Local\\redntfy_job");
     if (hJob && GetLastError() == ERROR_ALREADY_EXISTS) {
         writeLog("terminating previous instance");
@@ -6050,7 +6055,7 @@ int wmain() {
     if (hJob) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
         jeli.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
         if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) {
             writeLog("warning: failed to set job object limits");
         }
