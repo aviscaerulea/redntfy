@@ -54,7 +54,6 @@ if ($Test) {
         /Foout\ /Feout\redntfy_test.exe `
         tests\test_main.cpp `
         /link /SUBSYSTEM:CONSOLE /ENTRY:mainCRTStartup `
-        windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib gdi32.lib `
         "$vcpkgLib\ebur128.lib"
     if ($LASTEXITCODE) { exit 1 }
     exit 0
@@ -95,7 +94,6 @@ cl /nologo /utf-8 /std:c++20 /EHsc /O2 @clExtra /I out\ /I "$vcpkgInclude" `
     /Foout\ /Feout\redntfy.exe `
     src\main.cpp out\resource.res `
     /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup @linkExtra `
-    windowsapp.lib winhttp.lib shlwapi.lib shell32.lib propsys.lib gdi32.lib `
     "$vcpkgLib\ebur128.lib"
 if ($LASTEXITCODE) { exit 1 }
 
