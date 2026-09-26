@@ -99,6 +99,10 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "propsys.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+// システムライブラリのリンク指定は本ファイルの pragma に集約する。（build.ps1 には書かない）
+// テスト exe は tests/test_main.cpp が本ファイルを include するため、同じ pragma を継承する。
+// vcpkg のパスに依存する ebur128.lib だけは build.ps1 のリンク引数に置く。
 
 #include "resource.h"
 #include "version.h"  // ビルド時生成（APP_VERSION を定義）
@@ -147,7 +151,7 @@ static constexpr UINT IDM_OPEN_LOG            = 40007;
 static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリページを開く
 static constexpr UINT IDM_OPEN_QUERY          = 40009; // Redmine の代表画面（保存クエリ画面、フォールバック時は担当一覧）を開く
 static constexpr UINT IDM_STARTUP             = 40010; // Windows スタートアップ登録トグル
-static constexpr UINT IDM_ASSIGNED_TO_ME      = 40011; // 担当がグループのチケットを一覧・tooltip・通知から除外するトグル
+static constexpr UINT IDM_ASSIGNED_TO_ME      = 40011; // 担当が自分個人以外（グループ・他ユーザ・未割当）のチケットを一覧・tooltip・通知から除外するトグル
 static constexpr UINT IDM_UPDATE_NOW          = 40012; // 休止時間帯・クールダウンを無視した即時ポーリング
 static constexpr UINT IDM_SORT_BY_DUE         = 40013; // 一覧を期日昇順に並べるトグル
 static constexpr UINT IDM_EXCLUDE_NO_VERSION  = 40014; // バージョン未指定を一覧・tooltip・通知から除外するトグル（期日ありは例外的に残す）
@@ -230,7 +234,7 @@ static std::atomic<bool> g_soundEnabled{true};
 static std::atomic<bool> g_muteInMeeting{true};
 
 // 担当者が自分個人のチケットだけを対象とするフラグ（レジストリで永続化、トレイメニュー）
-// グループ担当のチケットを一覧・tooltip・通知から外すためのもの。
+// グループ担当（query_ids 設定時は未割当・他ユーザ担当も）のチケットを一覧・tooltip・通知から外すためのもの。
 // 取得と state.json は常に全件のまま扱い、表示と通知の直前だけで絞る。
 // 追跡集合そのものを絞ると、OFF に戻したとき state.json に無い id が「新規」と誤検知される。
 // 対価として、ON 中に抑止した更新は state.json に記録済みのため OFF に戻しても再通知されない。
@@ -520,6 +524,9 @@ static std::unordered_set<int> g_hiddenIds;
 static std::atomic<int>        g_myUserId{0};
 
 // 一覧・tooltip・通知に出す対象かを判定する（トレイメニューの「担当がグループのチケットを除外」）
+// ON のときは担当者が自分個人のチケットだけを通し、グループ担当・他ユーザ担当・未割当は除外する。
+// メニュー名がグループだけを挙げるのは、既定の取得（assigned_to_id=me）で自分以外に残るのが
+// グループ担当だけだからだ。query_ids で未割当や他ユーザ担当を含むクエリを追跡する場合は、それらも除外される。
 // user id が未取得（0）の間はフィルタを一時的に無効化して全件通す。判定不能を理由に
 // 一覧が空になる方が実害が大きいため、既存の「判定できないものは通知側に倒す」方針と揃える。
 static bool passesAssigneeFilter(const Issue& is) {
@@ -1185,7 +1192,8 @@ static std::vector<int> trackedQueryIds(const Config& cfg) {
 // 検知済み状態の保存
 // ポーリング成功のたびに追跡集合全体で上書きする。（集合から消えた id は自然に落ちる）
 // baseline フラグを明示するのは、保存クエリが正常に 0 件を返した状態と初回起動を区別するため。
-// version と queries（今回追跡したクエリ id）を持つのは、次回に旧形式からの移行と
+// version は形式の目印で、読み込み側は参照しない。（旧形式 v1 からの移行は queries キーの有無で判別する）
+// queries（今回追跡したクエリ id）を持つのは、次回に旧形式からの移行と
 // query_ids へのクエリ追加を検出して通知の嵐を防ぐため。
 // polledOn は今回の取得開始時刻（nowUtcIso 形式）で、polled_on にそのまま書く。保存時刻を
 // 使うと取得〜保存の間の自分の更新が次回に「前回以降の更新」と判定されず新規通知になる。
@@ -2899,12 +2907,16 @@ static DWORD WINAPI soundThread(LPVOID param) {
     return 0;
 }
 
-// WASAPI で通知音（16bit PCM WAV）を再生する
+// 通知音再生スレッドの非同期起動
 //
-// 再生フロー（ガードトーン長 tone_ms が 0 より大きい場合）：
-//   ガードトーン（リードイン）→ 通知音（チャイム）→ ガードトーン（リードアウト）
-// g_wavCache.valid == false の場合は音声を再生せずに終了する。（Toast 通知は呼び出し側で別途表示）
-// ダッキング：cfg.duckTargets に指定されたプロセスを再生中ミュートし、全再生完了後に復元する。
+// soundThread を起動して即時に戻る。（再生・ダッキングの開始と解除は soundThread 内で完結し、
+// 呼び出し元は再生完了を待たない。Toast 表示は呼び出し元が別途行う）
+// g_wavCache.valid == false（sound.wav なし）の場合は起動せずに戻る。
+// 前回の再生スレッドが残っていれば最大 10 秒 join を待つ。（重ねて起動すると旧スレッドの
+// unduck が新スレッドの duck を打ち消すため）待ちきれない場合、シャットダウン要求時、
+// 待機失敗時は今回の再生を見送る。見送りはログのみで呼び出し元へは通知しない。
+// 起動したスレッドのハンドルは g_soundThread に保持し、次回呼び出しかシャットダウン時に join する。
+// g_soundThread を排他なしで触るため、呼び出しは pollThreadFunc からに限る。（g_soundThread の宣言コメント参照）
 static void launchSound(const Config& cfg) {
     if (!g_wavCache.valid) {
         writeLog("launchSound: sound.wav not loaded, skipping sound");
@@ -5560,7 +5572,7 @@ static bool hasNewQueryEntry(const std::vector<int>& now, const std::vector<int>
 // 流入は最終 journal の更新者 id で除外する。（myUserId == 0 のときは除外せず通知側に倒す）
 // この抑止は muteOwnChanges で一括 ON/OFF できる。OFF なら自分の起票・更新も通知する。
 // 担当者フィルタ ON なら、自分が担当でないチケットもあわせて除外する。
-// バージョンフィルタ ON なら、fixed_version 未指定かつ期日なしのチケットもあわせて除外する。
+// バージョンフィルタ ON なら、fixed_version 未指定かつ期日なしのチケットもあわせて除外する。（バージョン欄が無いチケットは除外しない）
 // hiddenIds（非表示チケット）は「見なくて良い」の意思表示のため無条件に除外する。
 // （state.json への記録は呼び出し側が全件で行うので、非表示解除時に溜まった更新が
 // 一斉通知される「通知の嵐」は起きない）
@@ -5584,7 +5596,7 @@ static std::optional<std::vector<NotifyTarget>> selectNotifyTargets(
         if (hiddenIds.count(is.id) != 0) continue;
         // 担当者フィルタで外れたチケットは通知しない
         if (!passesAssigneeFilter(is)) continue;
-        // バージョン未指定は「将来の課題」なので通知しない（期日ありは通す）
+        // バージョン未指定は「将来の課題」なので通知しない（期日あり・バージョン欄なしは通す）
         if (!passesVersionFilter(is)) continue;
         auto it = prev.issues.find(is.id);
         if (it == prev.issues.end()) {
