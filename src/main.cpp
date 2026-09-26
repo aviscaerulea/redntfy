@@ -5047,6 +5047,8 @@ static void hideListPopup(HWND trayWnd) {
 // g_pins・g_hiddenIds と item.pinned/hidden を更新し、当該行を再描画する。
 // （マーカー・グレーの描画自体は drawIssueRow が pinned/hidden を参照して行う）
 // 状態は排他で、ピン留め → 非表示の遷移でピンは解除される。ピンの件数に上限はない。
+// 取得集合外のピン（クローズ・担当変更でクエリから外れた行）はピン留め → 通常へ直接戻し、
+// 集合外の行を通常 → ピン留めにはしない。（理由は各分岐のコメント）
 // 非表示への遷移で g_unreadIds・g_newIds には触らない。非表示は「見なくて良い」の意思表示で
 // あって既読（開いた）ではないため、非表示を解除すれば未読の太字と ✨ は戻る。
 // 非表示中に太字・✨・未読件数へ出ないのは buildListRows の hidden 判定が担う。
@@ -5062,15 +5064,34 @@ static void cycleIssueState(size_t itemIndex) {
     bool nowPinned, nowHidden, nowUnread;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
+        // 取得集合に居るかで遷移先が変わるため先に引く。（一覧行のラベルは省略済みで
+        // 復元できないため、ピンの内容も同じ探索結果から写す）
+        const Issue* cur = nullptr;
+        for (const auto& is : g_issues) {
+            if (is.id == item.id) {
+                cur = &is;
+                break;
+            }
+        }
         auto it = std::find_if(g_pins.begin(), g_pins.end(),
             [&](const PinEntry& p) { return p.id == item.id; });
         if (it != g_pins.end()) {
-            // ピン留め → 非表示
             g_pins.erase(it);
-            g_hiddenIds.insert(item.id);
             nowPinned = false;
-            nowHidden = true;
-            nowUnread = false;  // 非表示行は太字にしない（buildListRows と同じ扱い）
+            if (cur) {
+                // ピン留め → 非表示
+                g_hiddenIds.insert(item.id);
+                nowHidden = true;
+                nowUnread = false;  // 非表示行は太字にしない（buildListRows と同じ扱い）
+            }
+            else {
+                // 集合外のピン留め → 通常（非表示を経ない）
+                // 集合外のチケットは非表示にしても一覧に出ず、pruneHidden が次のポーリングで
+                // 非表示設定ごと消す。非表示は一覧に出るチケットにしか意味がないため、
+                // ピン解除だけを行う。（行は次の組み直しで一覧から消える）
+                nowHidden = false;
+                nowUnread = item.unread;
+            }
         }
         else if (g_hiddenIds.erase(item.id) != 0) {
             // 非表示 → 通常
@@ -5080,27 +5101,27 @@ static void cycleIssueState(size_t itemIndex) {
             nowHidden = false;
             nowUnread = g_unreadIds.count(item.id) != 0;
         }
+        else if (!cur) {
+            // 通常 → ピン留めは取得集合に居る行だけ受け付ける
+            // 一覧表示中にポーリングが g_issues を差し替えると、古い行が集合外になる。
+            // その行をピン留めすると件名・更新日時が空のピンを保存してしまうため、
+            // 何もせず次の組み直し（WM_LIST_REFRESH）に任せる。
+            writeLog("issue state: #" + std::to_string(item.id) + " not in current set; pin skipped");
+            return;
+        }
         else {
             // 通常 → ピン留め
-            // 件名・プロジェクト名・更新日時・期限日は g_issues から引く。
-            // （一覧行のラベルは省略済みで復元できないため）
             PinEntry p;
-            p.id     = item.id;
-            p.closed = item.closed;
-            for (const auto& is : g_issues) {
-                if (is.id == item.id) {
-                    p.subject         = is.subject;
-                    p.projectName     = is.projectName;
-                    p.updatedOn       = is.updatedOn;
-                    p.closed          = is.closed;
-                    p.dueDate         = is.dueDate;
-                    p.assignedToGroup = is.assignedToGroup;
-                    p.isBugTracker    = is.isBugTracker;
-                    p.updaterDisplay  = is.updaterDisplay;
-                    p.updaterFirst    = is.updaterFirstName;
-                    break;
-                }
-            }
+            p.id              = item.id;
+            p.subject         = cur->subject;
+            p.projectName     = cur->projectName;
+            p.updatedOn       = cur->updatedOn;
+            p.closed          = cur->closed;
+            p.dueDate         = cur->dueDate;
+            p.assignedToGroup = cur->assignedToGroup;
+            p.isBugTracker    = cur->isBugTracker;
+            p.updaterDisplay  = cur->updaterDisplay;
+            p.updaterFirst    = cur->updaterFirstName;
             g_pins.push_back(std::move(p));
             nowPinned = true;
             nowHidden = false;
