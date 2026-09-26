@@ -771,6 +771,44 @@ static void testBuildListRowsHidden() {
     g_currentConfig.listLimit = savedLimit;
 }
 
+// LIST_ROW_MAX の打ち切り（ピン込みで 50 行を超えない。バッジの計数と一覧が同じ集合を見る）
+static void testBuildListRowsRowMax() {
+    int savedLimit = g_currentConfig.listLimit;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_issues.clear();
+        g_pins.clear();
+        g_unreadIds.clear();
+        g_hiddenIds.clear();
+        for (int id = 1; id <= 30; ++id) {
+            Issue is;
+            is.id        = id;
+            is.updatedOn = "2026-08-01T00:00:" + std::string(id < 10 ? "0" : "") + std::to_string(id) + "Z";
+            g_issues.push_back(is);
+        }
+        for (int id = 101; id <= 130; ++id) {
+            PinEntry p;
+            p.id        = id;
+            p.updatedOn = "2026-07-01T00:00:00Z";
+            g_pins.push_back(p);
+        }
+    }
+    g_currentConfig.listLimit = 25;
+    g_excludeHidden.store(false);
+    int visible = 0;
+    auto rows = buildListRows(visible);
+    CHECK(rows.size() == LIST_ROW_MAX);  // 通常 25 ＋ピン 30 = 55 を 50 へ打ち切る
+    CHECK(visible == 30);                // 未処理件数は打ち切りの影響を受けない
+
+    // 後始末（他テストへの影響防止）
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_issues.clear();
+        g_pins.clear();
+    }
+    g_currentConfig.listLimit = savedLimit;
+}
+
 // schedule の回数を 60 の約数へ丸める
 static void testRoundToDivisorOf60() {
     CHECK(roundToDivisorOf60(0) == 0);    // 休止はそのまま
@@ -821,6 +859,7 @@ int main() {
     testPassesVersionFilter();
     testSelectNotifyTargets();
     testBuildListRowsHidden();
+    testBuildListRowsRowMax();
     testRoundToDivisorOf60();
     testAlignTowardCenter();
     printf("checks: %d, failed: %d\n", g_checks, g_fails);

@@ -162,7 +162,8 @@ static constexpr wchar_t GUIDE_URL[]                  = L"https://aviscaerulea.g
 static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/aviscaerulea/redntfy/releases";
 static constexpr wchar_t GITHUB_API_RELEASES_LATEST[] = L"https://api.github.com/repos/aviscaerulea/redntfy/releases/latest";
 
-// 一覧ポップアップの最大行数（ピン・非表示込みのハードキャップ。旧メニュー実装の 50 を踏襲）
+// 一覧の最大行数（ピン・非表示込みのハードキャップ。旧メニュー実装の 50 を踏襲）
+// buildListRows が適用し、バッジの計数と一覧が同じ行集合を見る
 static constexpr UINT LIST_ROW_MAX = 50;
 
 // ホバー表示のワンショット遅延タイマーと、一覧ポップアップの監視用ポーリングタイマー
@@ -489,7 +490,7 @@ static Config                  g_currentConfig;
 // 通知対象になった id を入れ、一覧の行クリックでそのチケットを開いた時だけ取り除く。
 // 一覧を開いただけでは既読にしない。（開いたことは読んだことではない）
 // 件数とバッジは buildListRows が返す行、すなわち一覧に出る行だけから数える。
-// そのため list_limit の窓外に落ちた id は数にも太字にも出ない。
+// そのため list_limit の窓外と LIST_ROW_MAX の打ち切りで落ちた id は数にも太字にも出ない。
 // （表示できない行でバッジが消せなくなるのを防ぐため、表示範囲を件数の基準に揃えた）
 // 追跡集合から外れた id も同様に出ないが、ピン留め行は一覧に残るため数に入る。
 // 刈り取りはしないので、再び一覧に出た時点で未読として現れる。
@@ -3348,6 +3349,7 @@ struct ListRow {
 //   3. 全体を並べ替える（既定は updated_on 降順。「期日順に並べる」ON なら期日昇順で
 //      期日なしは末尾。ピンも同じ規則で本来の位置に置く）
 //   4. 先頭 list_limit 件へ絞る（ピン留めと非表示チケットは上限適用外で常に残す）
+//   5. 全体を LIST_ROW_MAX 件へ打ち切る（ピン・非表示も含めた行数上限）
 // 非表示チケット（g_hiddenIds）は「非表示チケットを除外」トグル ON なら行に出さず、
 // OFF なら hidden フラグ付きで通す。（グレー＋取消線の参考表示。フィルタは通常行と同じく適用するが、
 // list_limit の予算には数えない。枠を消費させると更新の多い非表示チケットが上位に浮上して
@@ -3458,6 +3460,10 @@ static std::vector<ListRow> buildListRows(int& visible) {
         }
         rows = std::move(kept);
     }
+    // 一覧の行数上限（LIST_ROW_MAX）もここで適用する。（ピン・非表示込み）
+    // showListPopup 側で打ち切ると、打ち切られた行の未読がバッジに残りクリックで消せなくなる。
+    // 並べ替え後の先頭から残すため、更新の古い行から落ちる。
+    if (rows.size() > LIST_ROW_MAX) rows.resize(LIST_ROW_MAX);
     return rows;
 }
 
@@ -4924,11 +4930,12 @@ static void showListPopup(HWND trayWnd, bool refresh) {
         const int tailHeight = 9 + textRowHeight;
         size_t idx = 0;
         for (const auto& row : rows) {
-            if (idx >= LIST_ROW_MAX) break;
             g_issueItems.push_back(makeItem(row));
             SIZE sz = measureIssueRow(hdc, g_issueItems.back());
             // 作業領域に収まらない行は打ち切る。（スクロールを持たないため、
-            // 画面外へはみ出して操作不能な行を作らない）
+            // 画面外へはみ出して操作不能な行を作らない。この打ち切りだけはバッジの計数と
+            // 揃えられない。表示時のフォントとモニタに依存するためで、既定の list_limit 20 と
+            // 通常の作業領域なら起きない）
             if (y + static_cast<int>(sz.cy) + tailHeight > maxClientH) {
                 g_issueItems.pop_back();
                 break;
