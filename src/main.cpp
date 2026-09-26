@@ -91,6 +91,7 @@
 #include <thread>
 #include <cstdio>
 #include <cmath>
+#include <ctime>
 #include <climits>
 
 #pragma comment(lib, "windowsapp.lib")
@@ -2074,8 +2075,40 @@ static bool fetchIssue(const Config& cfg, int id, Issue& out) {
 }
 
 // 最終更新者（直近 journal の更新者）
+// UTC ISO 8601（YYYY-MM-DDThh:mm:ssZ）を epoch 秒に変換する
+// 解釈不能なら -1 を返す。journal と updated_on の突き合わせに使う。
+static long long isoUtcToEpoch(const std::string& iso) {
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+    if (sscanf_s(iso.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6) return -1;
+    struct tm t = {};
+    t.tm_year = y - 1900;
+    t.tm_mon  = mo - 1;
+    t.tm_mday = d;
+    t.tm_hour = h;
+    t.tm_min  = mi;
+    t.tm_sec  = s;
+    long long e = static_cast<long long>(_mkgmtime(&t));
+    return e < 0 ? -1 : e;
+}
+
+// 最終 journal がチケットの updated_on を作った更新かを判定する
+// Redmine は issue を保存してから journal を保存するため同じ操作でも数秒ずれ得る。
+// 差が JOURNAL_MATCH_TOLERANCE_SEC を超える場合は、journal を作らない更新（子チケットの
+// 変更に伴う親の再計算や、閲覧権限のない private notes など）で updated_on だけが進んだと
+// みなし、最終 journal の作者を最終更新者として扱わない。
+// どちらかが解釈不能なら一致とみなす。（判定不能を理由に既存の挙動を変えない）
+static constexpr long long JOURNAL_MATCH_TOLERANCE_SEC = 5;
+static bool journalMatchesUpdate(const std::string& journalCreatedOn, const std::string& updatedOn) {
+    long long a = isoUtcToEpoch(journalCreatedOn);
+    long long b = isoUtcToEpoch(updatedOn);
+    if (a < 0 || b < 0) return true;
+    long long diff = b - a;
+    return diff <= JOURNAL_MATCH_TOLERANCE_SEC && diff >= -JOURNAL_MATCH_TOLERANCE_SEC;
+}
+
 // ok は journals の取得・解析に成功したか。（journals が空でも成功。通信失敗と区別する）
-// userId 0 は journals 空（journal の無い新規チケット等）または取得失敗を表す。
+// userId 0 は journals 空（journal の無い新規チケット等）、最終 journal が updated_on と
+// 一致しない（journal を伴わない更新）、または取得失敗を表す。
 struct LastUpdater {
     bool        ok     = false;
     int         userId = 0;
@@ -2086,6 +2119,8 @@ struct LastUpdater {
 // journals は作成順（昇順）で返るため末尾要素が最新の更新。
 // 自分の操作の抑止判定（userId 比較）と Toast の更新者表示（userName）で 1 回の取得を共用する。
 // 取得失敗時は userId 0 のまま返し、呼び出し側の抑止判定は通知する側に倒れる。
+// 最終 journal の created_on が updated_on と一致しない（journalMatchesUpdate が false）場合も
+// userId 0 で返す。自分の古い journal を根拠に他人の更新を自分の操作として抑止しないため。
 static LastUpdater fetchLastUpdater(const Config& cfg, int id) {
     LastUpdater lu;
     auto obj = redmineGetJson(cfg, issueUrl(cfg, id) + L".json?include=journals",
@@ -2098,6 +2133,13 @@ static LastUpdater fetchLastUpdater(const Config& cfg, int id) {
         lu.ok = true;  // journals を取得できた（空でも成功。呼び出し側が失敗時の再解決を判断する）
         if (journals.Size() == 0) return lu;
         auto last = journals.GetObjectAt(journals.Size() - 1);
+        auto createdOn = winrt::to_string(last.GetNamedString(L"created_on", L""));
+        auto updatedOn = winrt::to_string(issue.GetNamedString(L"updated_on", L""));
+        if (!journalMatchesUpdate(createdOn, updatedOn)) {
+            writeLog("fetchLastUpdater(" + std::to_string(id)
+                + "): last journal does not match updated_on; updater unknown");
+            return lu;
+        }
         auto user = last.GetNamedObject(L"user", nullptr);
         if (!user) return lu;
         lu.userId   = static_cast<int>(user.GetNamedNumber(L"id", 0));
@@ -2148,7 +2190,8 @@ static UserNames resolveUserNames(const Config& cfg, int userId,
 // 一覧・Toast 用に各チケットの最終更新者を確定する
 // updated_on が前回ポーリングから変わっていないチケットは state.json のキャッシュを使う。
 // 変わったチケットと新規のチケットだけ journals を取得する。（定常時の追加 HTTP は変化分のみ）
-// journal の無いチケットは起票者を最終更新者として扱い、取得失敗は表示名を空のまま残して
+// journal の無いチケットと、最終 journal が updated_on と一致しないチケット（journal を伴わない
+// 更新）は起票者を表示名にし、updaterId は 0 のまま抑止しない。取得失敗は表示名を空のまま残して
 // 次回ポーリングで再解決する。通知抑止（deliverPollResults）もここで確定した updaterId を
 // 使うため、journals の取得は本関数だけで行う。
 static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
@@ -2171,7 +2214,8 @@ static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
         // 取得失敗は表示名を空のまま残し、次回ポーリングのキャッシュミスで再解決する。
         // （誤った名前を state.json に焼き付けない。抑止判定は userId 0 で通知側に倒れる）
         if (!lu.ok) continue;
-        // journal の無いチケットは起票者を最終更新者として扱う
+        // journal の無いチケットと journal を伴わない更新は起票者を表示名にする。
+        // （表示名を空にすると次回もキャッシュミスして毎回 journals を引き直すため）
         int         dispId   = lu.userId != 0 ? lu.userId : is.authorId;
         std::string dispName = lu.userId != 0 ? lu.userName : is.authorName;
         auto names = resolveUserNames(cfg, dispId, nameCache);
@@ -6104,7 +6148,8 @@ int wmain() {
     CreateDirectoryW(g_logDir.c_str(), nullptr);
 
     // 多重起動制御（新プロセス優先）
-    // 名前付き Job Object で旧プロセスをまとめて終了させる。
+    // 名前付き Job Object で旧プロセスを見つけ、終了メニューと同じ経路で正常終了させる。
+    // 応じなければ Job ごと強制終了する。
     // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE により hJob は閉じずプロセス終了まで保持する。
     // 旧インスタンスの終了はプロセスハンドルで待つ。（待ち方の理由は下のブロック内コメント）
     // Job に入れるのは自プロセスだけとする。ShellExecuteW で起動したブラウザやエディタが Job を
@@ -6132,14 +6177,26 @@ int wmain() {
                 }
             }
         }
-        TerminateJobObject(hJob, 0);
-        CloseHandle(hJob);
-        if (!procs.empty()) {
-            DWORD r = WaitForMultipleObjects(static_cast<DWORD>(procs.size()), procs.data(), TRUE,
-                                             PREV_INSTANCE_WAIT_MS);
-            if (r == WAIT_TIMEOUT) writeLog("warning: previous instance did not exit within timeout");
-            for (HANDLE h : procs) CloseHandle(h);
+        // まず旧インスタンスのトレイウィンドウへ「終了」を投函して正常終了を促す。
+        // 強制終了だと通知音再生中のダッキング（他プロセスのミュート）が復元されず、
+        // 対象アプリがミュートのまま残るため。待ちきれない場合だけ TerminateJobObject に切り替える。
+        auto waitProcs = [&]() {
+            if (procs.empty()) return true;
+            return WaitForMultipleObjects(static_cast<DWORD>(procs.size()), procs.data(), TRUE,
+                                          PREV_INSTANCE_WAIT_MS) != WAIT_TIMEOUT;
+        };
+        HWND prevWnd = FindWindowW(L"redntfy_tray", nullptr);
+        bool exited = false;
+        if (prevWnd && PostMessageW(prevWnd, WM_COMMAND, IDM_EXIT, 0)) {
+            exited = waitProcs();
+            if (!exited) writeLog("warning: previous instance ignored exit request; terminating");
         }
+        if (!exited) {
+            TerminateJobObject(hJob, 0);
+            if (!waitProcs()) writeLog("warning: previous instance did not exit within timeout");
+        }
+        CloseHandle(hJob);
+        for (HANDLE h : procs) CloseHandle(h);
         hJob = CreateJobObjectW(nullptr, L"Local\\redntfy_job");
         // 待ちきれなかった場合は Job 外で続行する。（起動不能より多重起動の方が害が小さい。
         // 次の起動は名前の空いた Job を新規作成するため、このインスタンスは終了させられない）

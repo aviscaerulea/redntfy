@@ -809,6 +809,24 @@ static void testBuildListRowsRowMax() {
     g_currentConfig.listLimit = savedLimit;
 }
 
+// 最終 journal と updated_on の突き合わせ（journal を伴わない更新の検出）
+static void testJournalMatchesUpdate() {
+    CHECK(isoUtcToEpoch("1970-01-01T00:00:00Z") == 0);
+    CHECK(isoUtcToEpoch("1970-01-01T00:01:05Z") == 65);
+    CHECK(isoUtcToEpoch("bogus") == -1);
+    CHECK(isoUtcToEpoch("") == -1);
+    // 同時刻と許容差内（issue 保存後に journal 保存で数秒ずれる）
+    CHECK(journalMatchesUpdate("2026-08-01T10:00:00Z", "2026-08-01T10:00:00Z"));
+    CHECK(journalMatchesUpdate("2026-08-01T10:00:00Z", "2026-08-01T10:00:05Z"));
+    CHECK(journalMatchesUpdate("2026-08-01T10:00:05Z", "2026-08-01T10:00:00Z"));
+    // 許容差超過：journal を伴わない更新で updated_on だけが進んだ
+    CHECK(!journalMatchesUpdate("2026-08-01T10:00:00Z", "2026-08-01T10:00:06Z"));
+    CHECK(!journalMatchesUpdate("2026-08-01T10:00:00Z", "2026-08-02T10:00:00Z"));
+    // 解釈不能は一致扱い（既存の挙動を変えない）
+    CHECK(journalMatchesUpdate("", "2026-08-01T10:00:00Z"));
+    CHECK(journalMatchesUpdate("2026-08-01T10:00:00Z", ""));
+}
+
 // schedule の回数を 60 の約数へ丸める
 static void testRoundToDivisorOf60() {
     CHECK(roundToDivisorOf60(0) == 0);    // 休止はそのまま
@@ -861,6 +879,7 @@ int main() {
     testBuildListRowsHidden();
     testBuildListRowsRowMax();
     testRoundToDivisorOf60();
+    testJournalMatchesUpdate();
     testAlignTowardCenter();
     printf("checks: %d, failed: %d\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
