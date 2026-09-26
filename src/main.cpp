@@ -109,6 +109,10 @@ static const wchar_t* APP_AUMID = L"com.redntfy";
 // エラー時のリトライ待機時間（ミリ秒）
 static constexpr DWORD RETRY_WAIT_MS = 60u * 1000u;
 
+// 多重起動制御で旧インスタンスの終了を待つ上限（ms）
+// 旧プロセスの HTTP・WASAPI の後始末が長引くことがあるため 100ms では足りない。
+static constexpr DWORD PREV_INSTANCE_WAIT_MS = 5000;
+
 // ホバーで一覧を表示するまでの追加遅延（ms）。0 はホバー検出と同時に表示
 // OS がホバー検出（NIN_POPUPOPEN）した時点から数え、OS 自体のホバー判定時間に上乗せする
 static constexpr long long DEFAULT_HOVER_DELAY_MS = 100;
@@ -6035,24 +6039,48 @@ int wmain() {
     // 多重起動制御（新プロセス優先）
     // 名前付き Job Object で旧プロセスをまとめて終了させる。
     // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE により hJob は閉じずプロセス終了まで保持する。
+    // 旧インスタンスの終了はプロセスハンドルで待つ。（待ち方の理由は下のブロック内コメント）
     // Job に入れるのは自プロセスだけとする。ShellExecuteW で起動したブラウザやエディタが Job を
     // 継承すると、終了メニュー・次インスタンスの TerminateJobObject・task build の kill で
     // 道連れに強制終了し未保存の編集を失うため、JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK で
     // 子プロセスを自動的に Job 外へ出す。（BREAKAWAY_OK は CREATE_BREAKAWAY_FROM_JOB を
     // 指定した子にしか効かず、ShellExecuteW 経由の子には効かない）
+    bool prevAlive = false;
     HANDLE hJob = CreateJobObjectW(nullptr, L"Local\\redntfy_job");
     if (hJob && GetLastError() == ERROR_ALREADY_EXISTS) {
         writeLog("terminating previous instance");
+        // Job 名は旧プロセスが Job ハンドルを閉じるまで残るため、終了要求の前に Job 内の
+        // プロセスハンドルを取り、プロセスオブジェクトのシグナルで終了完了を待つ。
+        // （プロセスはハンドルテーブルの解放後にシグナル状態になるので、この待ちが名前の解放を
+        // 保証する。Job の ActiveProcesses は解放より先に減るため待ちに使えない）
+        // 一覧の領域は 16 件分。Job には自プロセスしか入らないが、SILENT_BREAKAWAY_OK 以前の版が
+        // 起動した子プロセスが残る場合に備える。
+        std::vector<HANDLE> procs;
+        {
+            struct { JOBOBJECT_BASIC_PROCESS_ID_LIST list; ULONG_PTR more[15]; } buf = {};
+            if (QueryInformationJobObject(hJob, JobObjectBasicProcessIdList, &buf, sizeof(buf), nullptr)) {
+                for (DWORD i = 0; i < buf.list.NumberOfProcessIdsInList; ++i) {
+                    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(buf.list.ProcessIdList[i]));
+                    if (h) procs.push_back(h);
+                }
+            }
+        }
         TerminateJobObject(hJob, 0);
         CloseHandle(hJob);
-        // カーネルが Job Object 名を解放するまで待機
-        Sleep(100);
+        if (!procs.empty()) {
+            DWORD r = WaitForMultipleObjects(static_cast<DWORD>(procs.size()), procs.data(), TRUE,
+                                             PREV_INSTANCE_WAIT_MS);
+            if (r == WAIT_TIMEOUT) writeLog("warning: previous instance did not exit within timeout");
+            for (HANDLE h : procs) CloseHandle(h);
+        }
         hJob = CreateJobObjectW(nullptr, L"Local\\redntfy_job");
-        // 旧プロセスがまだ終了していない場合の競合対策（警告のみで続行）
+        // 待ちきれなかった場合は Job 外で続行する。（起動不能より多重起動の方が害が小さい。
+        // 次の起動は名前の空いた Job を新規作成するため、このインスタンスは終了させられない）
         if (hJob && GetLastError() == ERROR_ALREADY_EXISTS) {
-            writeLog("warning: previous instance still alive");
+            writeLog("warning: previous instance still alive; running outside job");
             CloseHandle(hJob);
             hJob = nullptr;
+            prevAlive = true;
         }
     }
     if (hJob) {
@@ -6066,7 +6094,7 @@ int wmain() {
             writeLog("warning: failed to assign to job object");
         }
     }
-    else {
+    else if (!prevAlive) {
         writeLog("warning: failed to create job object");
     }
 
