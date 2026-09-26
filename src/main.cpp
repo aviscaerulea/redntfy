@@ -3823,8 +3823,8 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
 // タスクバーが配置された辺（下・上・左・右）にポップアップを密着させて表示する。
 // タスクバーに沿った軸（水平タスクバーなら X、垂直なら Y）はカーソル位置を起点とする。
 // 画面端超過の扱いは呼び出し側の責務。（右クリックメニューは TrackPopupMenu の自動反転、
-// 一覧ポップアップは showListPopup がタスクバー沿いの軸を画面中央方向へ展開し直したうえで
-// モニタ作業領域へクランプする）
+// 一覧ポップアップは showListPopup がタスクバー沿いの軸を画面中央方向へ展開し直し
+// （アイコンがフライアウト内ならフライアウトの横へ並べ）たうえでモニタ作業領域へクランプする）
 // SHAppBarMessage 失敗時や uEdge が想定外なら現状挙動（カーソル位置＋左上アライメント）
 // に戻し、必ずポップアップが出るようにする。
 struct TrayPopupPos {
@@ -3865,6 +3865,21 @@ static TrayPopupPos computeTrayPopupPos(const POINT& cursor) {
 static int alignTowardCenter(int cursor, int size, int workLo, int workHi, int margin) {
     if (cursor >= workLo + (workHi - workLo) / 2) return cursor + margin - size;
     return cursor - margin;
+}
+
+// オーバーフロー（隠れているインジケーター）のフライアウト矩形の取得
+// cursor 直下のトップレベルウィンドウがタスクバー（Shell_TrayWnd / Shell_SecondaryTrayWnd）でなければ、
+// アイコンはフライアウト内にあるとみなしてそのウィンドウ矩形を返す。
+// 新規表示時のカーソルはアイコン上にある前提のため、タスクバー以外ならフライアウトと判断できる。
+// フライアウトのクラス名は OS で異なる（Win11 と Win10）ため、タスクバー側のクラスで判定する。
+// cursor と戻り値はともに本プロセスの仮想化座標系で、GetCursorPos と突き合わせてよい
+static bool getOverflowFlyoutRect(const POINT& cursor, RECT& rcOut) {
+    HWND root = GetAncestor(WindowFromPoint(cursor), GA_ROOT);
+    if (!root) return false;
+    wchar_t cls[64] = {};
+    GetClassNameW(root, cls, static_cast<int>(_countof(cls)));
+    if (wcscmp(cls, L"Shell_TrayWnd") == 0 || wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0) return false;
+    return GetWindowRect(root, &rcOut) != FALSE;
 }
 
 // トレイアイコンの画面矩形を取得する
@@ -4581,6 +4596,8 @@ static std::vector<ListRowLayout> g_listLayout;  // トレイ WndProc スレッ�
 static std::wstring g_listFooterText;            // フッタ行の文言（0 件時は未使用）
 static int g_listHotRow = -1;                    // ホット行（g_listLayout の添字。-1 = なし）
 static POINT g_listAnchor = {};                  // 表示位置の基準（新規表示時のカーソル座標。組み直しで再利用）
+static bool  g_listInOverflow = false;           // 新規表示時にアイコンがフライアウト内にあったか（組み直しで再利用）
+static RECT  g_listOverflowRect = {};            // そのときのフライアウト矩形
 
 // 一覧ポップアップが画面に出ているか（ウィンドウ未生成は非表示扱い）
 static bool isListPopupVisible() {
@@ -4820,6 +4837,7 @@ static void showListPopup(HWND trayWnd, bool refresh) {
     else {
         GetCursorPos(&cursor);
         g_listAnchor = cursor;
+        g_listInOverflow = getOverflowFlyoutRect(cursor, g_listOverflowRect);
     }
     MONITORINFO mi = { sizeof(mi) };
     const bool haveMi =
@@ -4902,6 +4920,8 @@ static void showListPopup(HWND trayWnd, bool refresh) {
     // （BOTTOMALIGN＝底辺を y に、RIGHTALIGN＝右辺を x に合わせる）を座標へ翻訳する。
     // タスクバー沿いの軸は、アイコンを範囲に収めたまま画面中央方向へ展開し直す。
     // （トレイは画面端にあり、端方向へ広げると隅に張り付くため）
+    // ただしアイコンがフライアウト内なら、タスクバー沿いの軸はフライアウトの横（画面中央方向）へ並べる。
+    // （従来の位置ではタスクバー際に出るフライアウトを覆い、アイコンのドラッグや右クリックを妨げるため）
     // 最後にメニューの自動反転の代わりにモニタ作業領域内へクランプして画面外を防ぐ
     auto pos = computeTrayPopupPos(cursor);
     int wx = pos.x;
@@ -4909,7 +4929,19 @@ static void showListPopup(HWND trayWnd, bool refresh) {
     if (pos.alignFlags & TPM_RIGHTALIGN)  wx -= w;
     if (pos.alignFlags & TPM_BOTTOMALIGN) wy -= h;
     if (haveMi) {
-        if (pos.alongX) {
+        if (g_listInOverflow) {
+            // フライアウトの中心が作業領域の中央以降なら手前側へ、中央より手前なら奥側へ置く
+            const RECT& fo = g_listOverflowRect;
+            if (pos.alongX) {
+                wx = (fo.left + fo.right) / 2 >= (mi.rcWork.left + mi.rcWork.right) / 2
+                    ? fo.left - w : fo.right;
+            }
+            else {
+                wy = (fo.top + fo.bottom) / 2 >= (mi.rcWork.top + mi.rcWork.bottom) / 2
+                    ? fo.top - h : fo.bottom;
+            }
+        }
+        else if (pos.alongX) {
             wx = alignTowardCenter(cursor.x, w, mi.rcWork.left, mi.rcWork.right,
                                    GetSystemMetrics(SM_CXSMICON));
         }
