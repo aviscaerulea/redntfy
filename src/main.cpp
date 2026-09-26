@@ -4496,12 +4496,17 @@ static void issueLabelFonts(bool bold, HFONT& baseFont, HFONT& emphFont) {
 }
 
 // 一覧行のサイズ計算
-// ラベル幅は描画と同じ走査で求める。（別経路で測ると行幅・取消線が実描画幅と食い違う）
+// ラベル幅は描画と同じ走査を太字フォントで行って求める。（走査を別経路にすると行幅が
+// 実描画幅と食い違う。取消線の長さは drawIssueRow が描画時の走査で求めるため、ここの
+// フォント選択には依存しない）
 // 幅にはピンマーカー列（全行で同幅）と左 4px・右 16px のパディングを含める。
 static SIZE measureIssueRow(HDC hdc, const IssueItem& item) {
     HFONT old = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
     HFONT baseFont = nullptr, emphFont = nullptr;
-    issueLabelFonts(issueRowBold(item), baseFont, emphFont);
+    // 幅は常に太字で測る。右クリックの状態遷移（非表示 → 通常）で細字から太字に変わっても
+    // ウィンドウ幅を超えないようにするため。（当該行だけを再描画する設計を保ち、組み直しで
+    // 並びが変わるのを避ける。細字行の右に太字との差分の余白が付くが数 px で見た目に出ない）
+    issueLabelFonts(true, baseFont, emphFont);
     SIZE sz = {};
     sz.cx = walkIssueLabel(hdc, item, nullptr, 0, baseFont, emphFont, false);
     // 行の高さはフォント由来でセグメント分割に依存しないため、metrics から直接得る
@@ -4574,7 +4579,7 @@ static void drawIssueRow(HDC hdc, const RECT& rcItem, const IssueItem& item, boo
     }
     textRect.left += markSz.cx;
     // ラベルは色範囲ごとにフォントと色を切り替えて描く。（ピンマーカー列の幅は通常フォント基準）
-    // 走査は measureIssueRow と共有するため、描画幅と行幅・取消線が必ず一致する
+    // 走査を measureIssueRow と共有するため、描画幅が行幅を超えない
     HFONT baseFont = nullptr, emphFont = nullptr;
     issueLabelFonts(issueRowBold(item), baseFont, emphFont);
     int labelWidth = walkIssueLabel(hdc, item, &textRect, textColor,
