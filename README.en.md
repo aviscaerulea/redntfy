@@ -89,8 +89,7 @@ See the setup guide for the detailed steps.
 ## Configuration
 
 Runtime settings live in `redntfy.toml` next to `redntfy.exe`.
-Placing `redntfy.local.toml` overrides values of the same keys on a per-key basis.
-That is useful for separating connection settings or per-environment differences.
+Placing `redntfy.local.toml` overrides values of the same keys on a per-key basis, which is useful for separating connection settings or per-environment differences.
 
 Configurable items are the connection settings, the custom queries to target, the number of polls per hour for each hour of the day, the row count and row format of the list, loudness normalization for the notification sound, and the update check at startup.
 See the comments in `redntfy.toml` for the meaning and default value of each key.
