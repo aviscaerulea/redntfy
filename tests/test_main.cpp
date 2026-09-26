@@ -454,6 +454,9 @@ static void testVersionCompare() {
 static void testEscapeXml() {
     CHECK_WSTR(escapeXml(L"a&b<c>d\"e"), L"a&amp;b&lt;c&gt;d&quot;e");
     CHECK_WSTR(escapeXml(L"plain"), L"plain");
+    // XML 1.0 禁止文字の除去。C0 制御文字は tab・LF・CR を残し、非文字 U+FFFE・U+FFFF は落とす
+    CHECK_WSTR(escapeXml(L"a\x01" L"b\t\n\r"), L"ab\t\n\r");
+    CHECK_WSTR(escapeXml(L"a\xFFFE" L"b\xFFFF" L"c"), L"abc");
 }
 
 static void testIsHttpUrl() {
