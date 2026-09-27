@@ -6188,7 +6188,8 @@ int wmain() {
         // 待ちは自分の hJob を閉じてから CreateJobObjectW を再試行し、ERROR_ALREADY_EXISTS の間は
         // 閉じて PREV_INSTANCE_POLL_MS 置く。（Job 内プロセスの列挙で待つ方式は、列挙が失敗すると
         // 待たずに進んで Job 外常駐になるため採らない）
-        // 戻り値 true：Job 名が解放され hJob は自分の新しい Job（作成失敗の nullptr を含む）。
+        // 戻り値 true：待ちを終える。Job 名が解放され hJob が自分の新しい Job になったか、
+        // 作成が ERROR_ALREADY_EXISTS 以外で失敗し hJob が nullptr（待っても解消しないため打ち切る）。
         // 戻り値 false：上限に達し hJob は最後に開いた既存 Job で、TerminateJobObject に使える。
         auto waitJobNameReleased = [&hJob]() {
             ULONGLONG deadline = GetTickCount64() + PREV_INSTANCE_WAIT_MS;
