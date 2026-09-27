@@ -771,7 +771,8 @@ static void testBuildListRowsHidden() {
     g_currentConfig.listLimit = savedLimit;
 }
 
-// LIST_ROW_MAX の打ち切り（ピン込みで 50 行を超えない。バッジの計数と一覧が同じ集合を見る）
+// LIST_ROW_MAX の打ち切り（ピン込みで 50 行を超えない。バッジの計数と一覧が同じ集合を見る。
+// 超過分はピンから落とし、list_limit 内の通常行は残す）
 static void testBuildListRowsRowMax() {
     int savedLimit = g_currentConfig.listLimit;
     {
@@ -789,7 +790,8 @@ static void testBuildListRowsRowMax() {
         for (int id = 101; id <= 130; ++id) {
             PinEntry p;
             p.id        = id;
-            p.updatedOn = "2026-07-01T00:00:00Z";
+            // 通常行より新しくして並べ替えで上位に置く。（末尾一律の打ち切りだと通常行が落ちる配置）
+            p.updatedOn = "2026-09-01T00:00:00Z";
             g_pins.push_back(p);
         }
     }
@@ -799,6 +801,15 @@ static void testBuildListRowsRowMax() {
     auto rows = buildListRows(visible);
     CHECK(rows.size() == LIST_ROW_MAX);  // 通常 25 ＋ピン 30 = 55 を 50 へ打ち切る
     CHECK(visible == 30);                // 未処理件数は打ち切りの影響を受けない
+    int normalRows = 0, pinnedRows = 0;
+    for (const auto& r : rows) {
+        if (r.pinned) ++pinnedRows;
+        else ++normalRows;
+    }
+    CHECK(normalRows == 25);  // list_limit 内の通常行はすべて残る（超過 5 件はピンから落ちる）
+    CHECK(pinnedRows == 25);
+    CHECK(rows.front().pinned);   // 残す行の並び順は保つ（ピンが上位、通常行が下位のまま）
+    CHECK(!rows.back().pinned);
 
     // 後始末（他テストへの影響防止）
     {

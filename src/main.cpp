@@ -14,7 +14,7 @@
  * 検知済み状態は「チケット id → updated_on ＋所属クエリ集合」を state.json（v2）に永続化して重複通知を防ぐ。
  * トレイアイコンのホバーまたは左クリックで、フォーカスを奪わない非アクティブの自前ポップアップに
  * 未処理チケットの一覧を表示し、行の右クリックで 通常 → ピン留め → 非表示 → 通常 の順に
- * 状態を切り替えられる。（ピンの件数に上限はない）
+ * 状態を切り替えられる。（ピンの件数に上限はないが、一覧に出るのは LIST_ROW_MAX 行の範囲内）
  * ピンは pins.json に永続化し、保存クエリの集合から外れたチケットも一覧に表示し続ける。
  * 非表示チケットは hidden.json に永続化し、グレー＋取消線で表示・通知と件数から除外・
  * 「非表示チケットを除外」トグル ON で一覧からも出さない。
@@ -168,7 +168,8 @@ static constexpr wchar_t GITHUB_RELEASES_URL[]        = L"https://github.com/avi
 static constexpr wchar_t GITHUB_API_RELEASES_LATEST[] = L"https://api.github.com/repos/aviscaerulea/redntfy/releases/latest";
 
 // 一覧の最大行数（ピン・非表示込みのハードキャップ。旧メニュー実装の 50 を踏襲）
-// buildListRows が適用し、バッジの計数と一覧が同じ行集合を見る
+// buildListRows が適用し、バッジの計数と一覧が同じ行集合を見る。
+// 超過分は非表示行 → ピン行 → 通常行の順に落とす。（list_limit 内の通常行を優先して残す）
 static constexpr UINT LIST_ROW_MAX = 50;
 
 // ホバー表示のワンショット遅延タイマーと、一覧ポップアップの監視用ポーリングタイマー
@@ -496,6 +497,7 @@ static Config                  g_currentConfig;
 // 一覧を開いただけでは既読にしない。（開いたことは読んだことではない）
 // 件数とバッジは buildListRows が返す行、すなわち一覧に出る行だけから数える。
 // そのため list_limit の窓外と LIST_ROW_MAX の打ち切りで落ちた id は数にも太字にも出ない。
+// （打ち切りは非表示・ピンを先に落とすため、通常行の未読が落ちるのは両者を使い切った後だけ）
 // （表示できない行でバッジが消せなくなるのを防ぐため、表示範囲を件数の基準に揃えた）
 // 追跡集合から外れた id も同様に出ないが、ピン留め行は一覧に残るため数に入る。
 // 刈り取りはしないので、再び一覧に出た時点で未読として現れる。
@@ -3405,7 +3407,8 @@ struct ListRow {
 //   3. 全体を並べ替える（既定は updated_on 降順。「期日順に並べる」ON なら期日昇順で
 //      期日なしは末尾。ピンも同じ規則で本来の位置に置く）
 //   4. 先頭 list_limit 件へ絞る（ピン留めと非表示チケットは上限適用外で常に残す）
-//   5. 全体を LIST_ROW_MAX 件へ打ち切る（ピン・非表示も含めた行数上限）
+//   5. 全体を LIST_ROW_MAX 件へ打ち切る（ピン・非表示も含めた行数上限。超過分は
+//      非表示行 → ピン行 → 通常行の順に、各種別の末尾から落とす）
 // 非表示チケット（g_hiddenIds）は「非表示チケットを除外」トグル ON なら行に出さず、
 // OFF なら hidden フラグ付きで通す。（グレー＋取消線の参考表示。フィルタは通常行と同じく適用するが、
 // list_limit の予算には数えない。枠を消費させると更新の多い非表示チケットが上位に浮上して
@@ -3518,9 +3521,25 @@ static std::vector<ListRow> buildListRows(int& visible) {
     }
     // 一覧の行数上限（LIST_ROW_MAX）もここで適用する。（ピン・非表示込み）
     // showListPopup 側で打ち切ると、打ち切られた行の未読がバッジに残りクリックで消せなくなる。
-    // 並べ替え後の末尾から落とすため、更新日時降順なら更新の古い行、期日順なら期日の遠い行と
-    // 期日なしの行から落ちる。
-    if (rows.size() > LIST_ROW_MAX) rows.resize(LIST_ROW_MAX);
+    // 超過分は非表示行 → ピン行 → 通常行の順に落とし、各種別とも並べ替え順の末尾から落とす。
+    // （list_limit の予算外にした非表示・ピンが、予算内の未読通常行を押し出さないため。
+    // 通常行が落ちるのは非表示とピンをすべて落としてもまだ超過するときだけ）
+    // 末尾から落とすため、更新日時降順なら更新の古い行、期日順なら期日の遠い行と
+    // 期日なしの行から落ちる。残す行の並び順は変えない。
+    if (rows.size() > LIST_ROW_MAX) {
+        size_t excess = rows.size() - LIST_ROW_MAX;
+        auto dropFromTail = [&rows, &excess](auto pred) {
+            for (size_t i = rows.size(); i > 0 && excess > 0; --i) {
+                if (pred(rows[i - 1])) {
+                    rows.erase(rows.begin() + static_cast<ptrdiff_t>(i - 1));
+                    --excess;
+                }
+            }
+        };
+        dropFromTail([](const ListRow& r) { return r.hidden; });
+        dropFromTail([](const ListRow& r) { return r.pinned; });
+        dropFromTail([](const ListRow&) { return true; });
+    }
     return rows;
 }
 
