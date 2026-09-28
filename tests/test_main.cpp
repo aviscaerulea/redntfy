@@ -864,6 +864,28 @@ static void testAlignTowardCenter() {
     CHECK(alignTowardCenter(3700, 600, 1920, 3840, 16) == 3116);
 }
 
+// ==================== 登録欄 ====================
+
+static void testRegisterSubject() {
+    CHECK_WSTR(trimRegisterSubject(L"  abc \t"), L"abc");
+    CHECK_WSTR(trimRegisterSubject(L"　タスク　"), L"タスク");  // 全角空白も除去
+    CHECK(!isRegisterSubjectValid(trimRegisterSubject(L" 　 ")));  // 空白のみ
+    CHECK(!isRegisterSubjectValid(L"ab"));
+    CHECK(isRegisterSubjectValid(L"abc"));
+    CHECK(isRegisterSubjectValid(L"あいう"));
+    CHECK(!isRegisterSubjectValid(L"a\U0001F600"));  // サロゲートペアは 1 文字と数える
+    CHECK(isRegisterSubjectValid(L"a\U0001F600b"));
+}
+
+static void testBuildIssueCreateBody() {
+    CHECK(jsonEscape("a\"b\\c\n\x01") == "a\\\"b\\\\c\\n\\u0001");
+    CHECK(ymdToIsoDate(20260928) == "2026-09-28");
+    const std::string expected = reinterpret_cast<const char*>(
+        u8"{\"issue\":{\"project_id\":\"my-project\",\"subject\":\"件名 \\\"x\\\"\","
+        u8"\"due_date\":\"2026-09-28\",\"assigned_to_id\":3}}");
+    CHECK(buildIssueCreateBody(L"my-project", L"件名 \"x\"", "2026-09-28", 3) == expected);
+}
+
 // テストの列挙実行と集計出力（失敗ありなら終了コード 1）
 int main() {
     // 失敗診断は日本語（UTF-8）を含むため、コンソールの出力コードページを合わせる
@@ -892,6 +914,8 @@ int main() {
     testRoundToDivisorOf60();
     testJournalMatchesUpdate();
     testAlignTowardCenter();
+    testRegisterSubject();
+    testBuildIssueCreateBody();
     printf("checks: %d, failed: %d\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }

@@ -49,7 +49,7 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
 - 設定は `redntfy.toml` を読み、`redntfy.local.toml` が同名キーをキー単位で上書きする  
   ホットリロードはせず、変更反映には再起動が必要。
 
-- スレッド構成：メイン（メッセージループ・トレイ UI）／`pollThreadFunc`（HTTP・Toast・音・状態保存）／`soundThread`（WASAPI 再生）／`checkForUpdates`（起動時 1 回、シャットダウン時に join）
+- スレッド構成：メイン（メッセージループ・トレイ UI）／`pollThreadFunc`（HTTP・Toast・音・状態保存）／`soundThread`（WASAPI 再生）／`checkForUpdates`（起動時 1 回、シャットダウン時に join）／`registerIssueThreadFunc`（登録欄の送信 1 回ごとに起動、シャットダウン時に join）
 
 - 共有状態は `g_mtx`（`g_issues`・`g_pins`・`g_unreadIds`・`g_newIds`・`g_hiddenIds`・`g_latestVersion`）と atomic（`g_myUserId`・`g_assignedToMeOnly` など）で保護する  
   `g_currentConfig` は起動時に 1 回設定した後は不変で、ロック無しで読み取る。
@@ -89,6 +89,7 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
 - schedule の 0（休止時間帯）は force poll・stale 判定より優先される  
   この順序を崩すと深夜に通知が鳴る。起動直後の 1 回だけは休止時間帯でも実行する。
   トレイメニューの「今すぐ更新」（`g_manualPoll`）だけは明示操作として休止時間帯・クールダウンを無視する。
+  登録欄での登録直後の即時ポーリング（`g_registerPoll`）も休止時間帯・クールダウンを無視するが、応答 Toast は出さず、取得失敗時の接続エラー Toast も force にしない。（通常の 30 分クールダウンに従う）
 
 - 「今すぐ更新」は完了時に必ず応答を返す  
   成功時は `deliverPollResults` の戻り値の通知件数が 0 のときだけ応答 Toast（`showPollDoneToast`）を出す。
@@ -127,16 +128,16 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   「読んだ」ではない。非表示中の表示除外は `buildListRows` の hidden 判定が担い、
   解除すれば太字と ✨ は戻る）
 
-- 一覧は `WS_EX_NOACTIVATE` の自前ポップアップ（クラス `redntfy_list`）で、フォーカスを一切奪わない  
+- 一覧は `WS_EX_NOACTIVATE` の自前ポップアップ（クラス `redntfy_list`）で、登録欄のクリック以外ではフォーカスを奪わない  
   モーダルメニューではないため、フォーカス復元・EndMenu・クローズ直後のクリック猶予は存在しない。
-  キー入力は受けないマウス専用 UI。（Esc・矢印キーなし）
+  キー入力は入力モードの登録欄だけが受ける。（Tab・Enter・Esc。チケット行のキー操作はなし）
   開く：ホバー（OS のホバー検出通知 `NIN_POPUPOPEN` からワンショット `IDT_HOVER_TRIGGER` で
   `hover_delay_ms`（デフォルト 100ms、0 で即時）後。トレイメニュー「マウスホバーで一覧を
   自動表示」が OFF なら無効。レジストリ永続化。既定 ON）
   または左クリック（`NIN_SELECT`、即時。トグル OFF でも開ける）。
   閉じる：アイコンとポップアップ両方からの離脱（`IDT_LIST_WATCH` の 200ms ポーリング 2 tick。
-  表示直後の約 1 秒（`LIST_SHOW_GRACE_TICKS`）は離脱と数えない）・
-  表示中の左クリック（トグル）・行クリック。
+  表示直後の約 1 秒（`LIST_SHOW_GRACE_TICKS`）は離脱と数えない。入力モード中も数えない）・
+  表示中の左クリック（トグル）・行クリック・入力モード中の Esc。
   起点によらず同一ルールで、状態は「表示中か否か」「ホバー起点か」（`g_hoverShownAt`）・
   「アイコン上か」（`g_iconHovered`）・「再表示抑止中か」（`g_hoverSuppressed`）の 4 つ。
   唯一の例外：ホバー自動表示から `hover_click_guard_ms`（デフォルト 300ms、0 で無効）以内の
@@ -166,6 +167,15 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   一覧は左クリックでのみ開ける）
   オーバーフロー領域のアイコンは、`v4` 化以前の実装では矩形不一致でホバーが機能しなかった。
   `v4` のホバー通知は座標に依存しないため改善が見込めるが未検証。（左クリックでは開ける）
+
+- 一覧末尾の登録欄（`register_project` 設定時のみ）は件名 Edit・期日 DTP・登録ボタンの子コントロール  
+  登録欄のクリックで入力モードに入り、`WS_EX_NOACTIVATE` を外して一覧をアクティブ化する。
+  入力モード中は離脱で閉じず、他アプリへの切り替えで入力モードだけ抜ける。（以後は離脱監視が閉じる）
+  Esc は一覧を閉じ、Enter は登録ボタンと同じ経路（`IDOK`）になる。（メッセージループの `IsDialogMessageW`）
+  件名は前後の空白（全角を含む）を除いて 3 文字以上を必須とする。期日の既定は JST の当日だ。
+  送信は `POST /issues.json`（担当＝自分、トラッカーはプロジェクト既定）で、成功時は入力を空にして `g_registerPoll` で即時ポーリングする。
+  失敗時は Toast を出して入力を残す。成功の Toast は出さない。（新チケットが一覧に載ることを応答とする）
+  DTP の見た目のため common controls v6 のマニフェストを `build.ps1` の `/MANIFEST:EMBED` で埋め込む。
 
 - Toast には AUMID 付きスタートメニューショートカットが必須（`ensureShortcut` が自動作成）
 

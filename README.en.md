@@ -23,6 +23,7 @@ A sister tool, [gcalntfy](https://github.com/aviscaerulea/gcalntfy), notifies yo
   - Pins: keep important tickets in the list (they stay even after being closed)
   - Hiding: excludes tickets you do not need to watch from notifications and the pending count
   - Browser display: clicking a row or the footer opens it in the browser
+  - Ticket registration: create a ticket assigned to yourself from the list, without opening Redmine
 - Narrowing the target: Redmine custom queries (one or more) freely choose which tickets are notified and listed
 - Zero-configuration start: targets tickets assigned to you and your groups with just a URL and an API access key
 
@@ -31,6 +32,8 @@ A sister tool, [gcalntfy](https://github.com/aviscaerulea/gcalntfy), notifies yo
 The tray icon shows a red badge in the bottom-right corner when there are unread tickets.
 
 Each row of the list shows the due date, assignee, project, and days left until the due date, with icons. Unread tickets and tickets with a due date are shown in bold. Tickets notified as new are marked with ✨. The pending count appears in the footer. Clicking a row opens the ticket in the browser and marks it as read. Right-clicking a row cycles through pinned, hidden, and normal.
+
+When a target project is configured, a subject field, a due date, and a register button appear at the bottom of the list. Enter a subject (at least 3 characters), pick a due date from the calendar, and register it to create a ticket assigned to yourself. The due date defaults to today.
 
 Right-clicking the tray icon opens the tray menu, which provides various settings.
 
@@ -91,7 +94,7 @@ See the setup guide for the detailed steps.
 Runtime settings live in `redntfy.toml` next to `redntfy.exe`.
 Placing `redntfy.local.toml` overrides values of the same keys on a per-key basis, which is useful for separating connection settings or per-environment differences.
 
-Configurable items are the connection settings, the custom queries to target, the number of polls per hour for each hour of the day, the row count and row format of the list, loudness normalization for the notification sound, and the update check at startup.
+Configurable items are the connection settings, the custom queries to target, the project that receives tickets registered from the list (`register_project`), the number of polls per hour for each hour of the day, the row count and row format of the list, loudness normalization for the notification sound, and the update check at startup.
 See the comments in `redntfy.toml` for the meaning and default value of each key.
 
 ### Example of `query_ids`

@@ -90,10 +90,11 @@ if ($LASTEXITCODE) { exit 1 }
 $clExtra   = if ($Release) { @('/DNDEBUG', '/GL', '/Gy') } else { @() }
 $linkExtra = if ($Release) { @('/LTCG', '/OPT:REF', '/OPT:ICF') } else { @() }
 
+# /MANIFEST:EMBED は main.cpp の manifestdependency（common controls v6）を exe へ埋め込むため
 cl /nologo /utf-8 /std:c++20 /EHsc /O2 @clExtra /I out\ /I "$vcpkgInclude" `
     /Foout\ /Feout\redntfy.exe `
     src\main.cpp out\resource.res `
-    /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup @linkExtra `
+    /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup /MANIFEST:EMBED @linkExtra `
     "$vcpkgLib\ebur128.lib"
 if ($LASTEXITCODE) { exit 1 }
 

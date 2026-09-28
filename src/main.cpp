@@ -18,6 +18,8 @@
  * ピンは pins.json に永続化し、保存クエリの集合から外れたチケットも一覧に表示し続ける。
  * 非表示チケットは hidden.json に永続化し、グレー＋取消線で表示・通知と件数から除外・
  * 「非表示チケットを除外」トグル ON で一覧からも出さない。
+ * [redmine] register_project 設定時は、一覧末尾の登録欄から件名と期日を入力して
+ * 自分担当のチケットを登録できる。（登録欄のクリック時だけ一覧をアクティブ化してキー入力を受ける）
  *
  * 終了コード：
  *   0  - 正常終了（トレイメニューの「終了」、または新インスタンス起動時の終了要求による）
@@ -59,6 +61,12 @@
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
 #include <audioclient.h>
+
+// 一覧の登録欄（DateTimePicker・Edit のキューバナー）
+#include <commctrl.h>
+#pragma comment(lib, "comctl32.lib")
+// 登録欄の DateTimePicker と Edit を現行の見た目（visual styles）で描くため v6 を要求する
+#pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #include <wtsapi32.h>
 #pragma comment(lib, "wtsapi32.lib")
@@ -144,6 +152,8 @@ static constexpr UINT WM_ENTER_DISABLED  = WM_USER + 3;
 // ポーリング成功後の一覧組み直し依頼（表示中の一覧だけを同じ位置で組み直す）
 // WM_UPDATE_TOOLTIP は行操作からも投函されるため流用しない。（行の右クリック直後に並びが変わるのを防ぐ）
 static constexpr UINT WM_LIST_REFRESH    = WM_USER + 4;
+// 登録スレッド（registerIssueThreadFunc）→ トレイ WndProc の完了通知（wParam 1 = 成功、0 = 失敗）
+static constexpr UINT WM_REGISTER_DONE   = WM_USER + 5;
 
 // コンテキストメニューコマンド ID
 static constexpr UINT IDM_EXIT             = 40002;
@@ -312,6 +322,11 @@ static std::atomic<bool> g_forcePoll{false};
 // 明示のユーザ操作のため、g_forcePoll と違い休止時間帯・クールダウンの抑止を受けない
 static std::atomic<bool> g_manualPoll{false};
 
+// 登録欄でのチケット登録直後の即時ポーリングフラグ
+// 明示操作の結果を一覧へ反映するため休止時間帯・クールダウンを無視するが、
+// 「今すぐ更新」と違い応答 Toast・エラー Toast の強制・メタ情報の再取得は行わない
+static std::atomic<bool> g_registerPoll{false};
+
 // 前回ポーリング成功時刻（GetTickCount64、stale 判定専用。取得成功時のみ更新する）
 // 即時ポーリングのクールダウンには使わない。そちらは試行時刻（g_lastPollAttemptTick）が基準。
 static std::atomic<ULONGLONG> g_lastPollTick{0};
@@ -445,6 +460,8 @@ struct Config {
     // 先頭要素は「代表クエリ」で、複数件 Toast と一覧フッタから開く URL に使う。
     // 空のときはフォールバックモードとして、自分（と所属グループ）が担当のチケットを追跡する。
     std::vector<int> queryIds;
+    // 一覧の登録欄の登録先プロジェクト（識別子または数値 id）。空なら登録欄を出さない
+    std::wstring registerProject;
 
     // 添字は JST（UTC+9）固定の時。OS のタイムゾーン設定に依存しない。
     // 待機時間の計算とログ表示はローカル時刻基準。
@@ -1024,6 +1041,14 @@ static std::string redmineGet(const std::wstring& url, const std::wstring& apiKe
     DWORD* outStatusCode = nullptr)
 {
     return httpRequest(L"GET", url, "", nullptr,
+                       L"X-Redmine-API-Key: " + apiKey, outStatusCode);
+}
+
+// Redmine API の POST（API キーヘッダ付き、JSON 本文）
+static std::string redminePost(const std::wstring& url, const std::wstring& apiKey,
+    const std::string& jsonBody, DWORD* outStatusCode = nullptr)
+{
+    return httpRequest(L"POST", url, jsonBody, L"application/json; charset=utf-8",
                        L"X-Redmine-API-Key: " + apiKey, outStatusCode);
 }
 
@@ -1609,6 +1634,7 @@ static Config loadConfig(const std::wstring& exeDir) {
     while (!cfg.redmineUrl.empty() && cfg.redmineUrl.back() == L'/')
         cfg.redmineUrl.pop_back();  // 末尾スラッシュを除去して URL 連結を単純化する
     cfg.apiKey  = readRedmineString("api_key");
+    cfg.registerProject = readRedmineString("register_project");
     if (auto q = readRedmineIntArray(local, "query_ids"))     cfg.queryIds = std::move(*q);
     else if (auto q = readRedmineIntArray(base, "query_ids")) cfg.queryIds = std::move(*q);
 
@@ -3170,11 +3196,12 @@ static void showErrorToast(const std::wstring& title, const std::wstring& body,
 // バックグラウンドスレッド用の中断可能 Sleep
 //
 // メッセージは処理しない。（呼び出し元がメインスレッドではないため）
-// g_shutdownRequested・g_forcePoll・g_manualPoll のいずれかが true になった時点で即座にリターンする。
+// g_shutdownRequested・g_forcePoll・g_manualPoll・g_registerPoll のいずれかが true になった時点で即座にリターンする。
 // 100 ms 単位で各フラグをポーリングするため、最大 100 ms の中断遅延が発生する。
 static void waitInterruptible(DWORD ms) {
     ULONGLONG end = GetTickCount64() + ms;
-    while (!g_shutdownRequested && !g_forcePoll.load() && !g_manualPoll.load()) {
+    while (!g_shutdownRequested && !g_forcePoll.load() && !g_manualPoll.load()
+           && !g_registerPoll.load()) {
         ULONGLONG now = GetTickCount64();
         if (end <= now) break;
         ULONGLONG remain = end - now;
@@ -4684,15 +4711,230 @@ static void drawIssueRow(HDC hdc, const RECT& rcItem, const IssueItem& item, boo
     SelectObject(hdc, oldFont);
 }
 
+// ==================== 一覧の登録欄 ====================
+// register_project 設定時に一覧の末尾へ置く「件名 Edit・期日 DTP・登録ボタン」の簡易チケット登録。
+// 送信は POST /issues.json で、担当は自分、トラッカー・ステータス・優先度はプロジェクト既定に任せる。
+// 送信は専用スレッド（registerIssueThreadFunc）で行い、完了を WM_REGISTER_DONE でメインへ返す。
+
+// 件名の最小文字数（前後の空白を除いた文字数。空白だけ・短すぎる件名の誤登録を防ぐ）
+static constexpr size_t REG_SUBJECT_MIN_CHARS = 3;
+// 件名の最大文字数（Redmine の subject の上限。Edit の入力上限に使う）
+static constexpr int    REG_SUBJECT_MAX_CHARS = 255;
+// 登録欄の余白（行の上下と、コントロール同士・左右端の間隔。px）
+static constexpr int    REG_PAD = 4;
+// 件名欄の最小幅（px。一覧の幅がこれより狭いときは一覧側を広げる）
+static constexpr int    REG_EDIT_MIN_WIDTH = 240;
+
+// 登録欄の件名の前後から空白（全角空白を含む）を除去する
+static std::wstring trimRegisterSubject(const std::wstring& s) {
+    static constexpr wchar_t SPACES[] = L" \t\r\n　";
+    const size_t b = s.find_first_not_of(SPACES);
+    if (b == std::wstring::npos) return {};
+    const size_t e = s.find_last_not_of(SPACES);
+    return s.substr(b, e - b + 1);
+}
+
+// 登録欄の件名が登録可能か（trim 済みの件名が REG_SUBJECT_MIN_CHARS 文字以上）
+// 文字数はサロゲートペアを 1 文字と数える。（低位サロゲートを数えない）
+static bool isRegisterSubjectValid(const std::wstring& trimmed) {
+    size_t chars = 0;
+    for (wchar_t c : trimmed) {
+        if (c < 0xDC00 || c > 0xDFFF) ++chars;
+    }
+    return chars >= REG_SUBJECT_MIN_CHARS;
+}
+
+// JSON 文字列値のエスケープ（UTF-8 の入力をそのまま通し、" \ と制御文字だけを変換する）
+static std::string jsonEscape(const std::string& utf8) {
+    std::string out;
+    out.reserve(utf8.size());
+    for (unsigned char c : utf8) {
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b";  break;
+        case '\f': out += "\\f";  break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
+        default:
+            if (c < 0x20) {
+                char buf[8];
+                snprintf(buf, sizeof(buf), "\\u%04x", c);
+                out += buf;
+            }
+            else {
+                out += static_cast<char>(c);
+            }
+        }
+    }
+    return out;
+}
+
+// YYYYMMDD の整数を Redmine の日付形式 "YYYY-MM-DD" へ変換する
+static std::string ymdToIsoDate(int ymd) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", ymd / 10000, ymd / 100 % 100, ymd % 100);
+    return buf;
+}
+
+// チケット作成 API（POST /issues.json）の要求本文
+// project は識別子または数値 id の文字列、dueIso は "YYYY-MM-DD"、assigneeId は担当者（自分）の user id。
+// tracker_id は送らない。（プロジェクトで有効な先頭のトラッカー＝プロジェクト既定に任せる）
+static std::string buildIssueCreateBody(const std::wstring& project, const std::wstring& subject,
+                                        const std::string& dueIso, int assigneeId) {
+    return "{\"issue\":{\"project_id\":\"" + jsonEscape(wideToUtf8(project))
+        + "\",\"subject\":\"" + jsonEscape(wideToUtf8(subject))
+        + "\",\"due_date\":\"" + jsonEscape(dueIso)
+        + "\",\"assigned_to_id\":" + std::to_string(assigneeId) + "}}";
+}
+
+// 登録欄の子コントロール（ensureListWindow が register_project 設定時だけ生成する。未設定なら nullptr）
+static HWND g_regEdit   = nullptr;   // 件名
+static HWND g_regDate   = nullptr;   // 期日（DateTimePicker）
+static HWND g_regButton = nullptr;   // 登録ボタン（id = IDOK。Enter と同じ WM_COMMAND 経路にする）
+static constexpr int IDC_REG_EDIT = 101;
+static constexpr int IDC_REG_DATE = 102;
+static bool g_registerBusy = false;  // 登録要求の送信中（メインスレッド専用。完了通知で戻す）
+// 登録要求の送信スレッド。WM_REGISTER_DONE を投函し得るため、wmain の終了処理で
+// DestroyWindow より前に join する。（joinable のまま静的破棄すると std::terminate になる）
+static std::thread g_registerThread;
+
+// 期日を JST の当日に戻す（登録欄の既定値）
+static void resetRegisterDate() {
+    if (!g_regDate) return;
+    const int ymd = todayJstYmd();
+    SYSTEMTIME st = {};
+    st.wYear  = static_cast<WORD>(ymd / 10000);
+    st.wMonth = static_cast<WORD>(ymd / 100 % 100);
+    st.wDay   = static_cast<WORD>(ymd % 100);
+    DateTime_SetSystemtime(g_regDate, GDT_VALID, &st);
+}
+
+// 件名欄の入力を trim して返す
+static std::wstring getRegisterSubject() {
+    if (!g_regEdit) return {};
+    const int len = GetWindowTextLengthW(g_regEdit);
+    std::wstring s(static_cast<size_t>(len) + 1, L'\0');
+    const int got = GetWindowTextW(g_regEdit, s.data(), len + 1);
+    s.resize(static_cast<size_t>((std::max)(got, 0)));
+    return trimRegisterSubject(s);
+}
+
+// 登録欄の有効・無効を状態に合わせる
+// 送信中は全体を無効にする。（成功時に入力をクリアするため、送信中の編集を受け付けない）
+// 登録ボタンは件名が有効なときだけ有効にする。
+static void updateRegisterControls() {
+    if (!g_regEdit) return;
+    EnableWindow(g_regEdit, !g_registerBusy);
+    EnableWindow(g_regDate, !g_registerBusy);
+    EnableWindow(g_regButton, !g_registerBusy && isRegisterSubjectValid(getRegisterSubject()));
+}
+
+// 登録失敗の Toast 本文（ステータス別の案内。422 は Redmine の検証エラー文言をそのまま示す）
+static std::wstring describeRegisterError(DWORD status, const std::string& resp) {
+    switch (status) {
+    case 0:   return L"Redmine に接続できません";
+    case 403: return L"登録先プロジェクトへの登録権限がありません";
+    case 404: return L"register_project のプロジェクトが見つかりません";
+    case 422:
+        try {
+            auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(resp));
+            std::wstring msg;
+            for (auto e : obj.GetNamedArray(L"errors")) {
+                if (!msg.empty()) msg += L"／";
+                msg += e.GetString().c_str();
+            }
+            if (!msg.empty()) return msg;
+        }
+        catch (...) {}
+        return L"入力内容が受け付けられませんでした";
+    default:
+        return L"HTTP ステータス " + std::to_wstring(status);
+    }
+}
+
+// 登録要求の送信スレッド本体（submitRegistration が 1 回の送信ごとに起動する）
+// 成否はログに残し、失敗時は Toast で知らせる。最後に必ず WM_REGISTER_DONE を投函する。
+// 失敗 Toast は showErrorToast を使わない。（ポーリングの接続エラー Toast の 30 分クールダウンと共有させないため）
+static void registerIssueThreadFunc(std::string body) {
+    WinRtApartment apartment;  // 応答の JSON 解析と Toast のため
+    const Config& cfg = g_currentConfig;
+    DWORD status = 0;
+    const std::string resp = redminePost(cfg.redmineUrl + L"/issues.json", cfg.apiKey, body, &status);
+    const bool ok = (status == 201);
+    if (ok) {
+        int id = 0;
+        if (apartment.ok) {
+            try {
+                auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(resp));
+                id = static_cast<int>(obj.GetNamedObject(L"issue").GetNamedNumber(L"id", 0));
+            }
+            catch (...) {}
+        }
+        writeLog(id > 0 ? "register: created #" + std::to_string(id) : std::string("register: created"));
+    }
+    else {
+        writeLog("register: failed, status=" + std::to_string(status));
+        if (apartment.ok) {
+            try {
+                showToast(L"チケットを登録できません", describeRegisterError(status, resp), L"");
+            }
+            catch (...) {
+                writeLog("register: error toast failed");
+            }
+        }
+    }
+    if (g_hWnd) PostMessage(g_hWnd, WM_REGISTER_DONE, ok ? 1 : 0, 0);
+}
+
+// 登録ボタン・Enter の処理（メインスレッド）
+// 件名が無効・送信中は何もしない。自分の user id が未確定（初回ポーリング前・接続不可）なら
+// 担当を決められないため Toast で知らせて送らない。
+static void submitRegistration() {
+    if (g_registerBusy || !g_regEdit) return;
+    const std::wstring subject = getRegisterSubject();
+    if (!isRegisterSubjectValid(subject)) return;
+    const int me = g_myUserId.load();
+    if (me <= 0) {
+        try {
+            showToast(L"チケットを登録できません", L"ユーザ情報を取得できていません。接続を確認してください", L"");
+        }
+        catch (...) {
+            writeLog("register: user-unknown toast failed");
+        }
+        return;
+    }
+    SYSTEMTIME st = {};
+    if (DateTime_GetSystemtime(g_regDate, &st) != GDT_VALID) return;
+    const std::string body = buildIssueCreateBody(g_currentConfig.registerProject, subject,
+        ymdToIsoDate(st.wYear * 10000 + st.wMonth * 100 + st.wDay), me);
+    // 前回分は完了通知の受信後（busy = false）なので、join は即座に戻る
+    if (g_registerThread.joinable()) g_registerThread.join();
+    try {
+        g_registerThread = std::thread(registerIssueThreadFunc, body);
+    }
+    catch (const std::system_error& e) {
+        writeLog(std::string("register: failed to start thread: ") + e.what());
+        return;
+    }
+    g_registerBusy = true;
+    updateRegisterControls();
+}
+
 // ==================== 一覧ポップアップウィンドウ ====================
-// TrackPopupMenu のモーダルメニューをやめ、フォーカスを一切奪わない非アクティブの
+// TrackPopupMenu のモーダルメニューをやめ、フォーカスを奪わない非アクティブの
 // 自前ポップアップ（WS_EX_NOACTIVATE）で一覧を表示する。
 // 非モーダルのため、フォーカス復元・EndMenu・クローズ直後のクリック猶予といった
-// モーダルメニュー時代の補正処理は存在しない。キー入力は受けないマウス専用の UI。
+// モーダルメニュー時代の補正処理は存在しない。チケット行はマウス専用の UI。
+// 例外は末尾の登録欄（register_project 設定時のみ）で、登録欄のクリックでだけ
+// WS_EX_NOACTIVATE を外して一覧をアクティブ化し、キー入力を受ける。（入力モード）
+// 入力モード中は離脱で閉じず、他アプリへの切り替えで入力モードだけ抜ける。
 // 開く：ホバー（OS の NIN_POPUPOPEN 通知から hover_delay_ms 後）または
 // アイコン左クリック（NIN_SELECT、即時）。
-// 閉じる：アイコンとポップアップ両方からの離脱（IDT_LIST_WATCH が監視）・
-// アイコン左クリックのトグル・行クリックでチケットを開いたとき。起点によらず同一ルール。
+// 閉じる：アイコンとポップアップ両方からの離脱（IDT_LIST_WATCH が監視。入力モード中は除く）・
+// アイコン左クリックのトグル・行クリックでチケットを開いたとき・入力モード中の Esc。
+// 起点によらず同一ルール。
 // 唯一の例外として、ホバー自動表示から hover_click_guard_ms 以内のアイコン左クリックは
 // 無視する。（詳細は handleTrayLeftClick を参照）
 
@@ -4701,14 +4943,17 @@ static constexpr wchar_t LIST_WND_CLASS[] = L"redntfy_list";
 // 一覧ポップアップのウィンドウスタイル（CreateWindowExW と AdjustWindowRectEx で共有する）
 // 3 箇所で食い違うと枠サイズと実ウィンドウのレイアウトがずれるため 1 箇所に集約する。
 // WS_POPUP | WS_BORDER：メニュー相当の枠付きポップアップ。
-// WS_EX_NOACTIVATE：表示・クリックでもフォアグラウンドを奪わない。（本ウィンドウの核）
+// WS_CLIPCHILDREN：全面描画（WM_PAINT の BitBlt）が登録欄の子コントロールを上書きしない。
+// WS_EX_NOACTIVATE：表示・クリックでもフォアグラウンドを奪わない。（本ウィンドウの核。
+// 入力モードの間だけ外す）
 // WS_EX_TOOLWINDOW：タスクバー・Alt+Tab に出さない。
 // WS_EX_TOPMOST：タスクバー近傍でも手前に出す。
-static constexpr DWORD LIST_WND_STYLE   = WS_POPUP | WS_BORDER;
+static constexpr DWORD LIST_WND_STYLE   = WS_POPUP | WS_BORDER | WS_CLIPCHILDREN;
 static constexpr DWORD LIST_WND_EXSTYLE = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
 
 // 一覧の行種別と配置（クライアント座標）。表示のたびに構築する
-enum class ListRowKind { Issue, Separator, Footer, Empty };
+// Register は末尾の登録欄。（描画とクリックは子コントロールが担い、行としてはヒットしない）
+enum class ListRowKind { Issue, Separator, Footer, Empty, Register };
 struct ListRowLayout {
     ListRowKind kind;
     int         top;
@@ -4722,10 +4967,31 @@ static int g_listHotRow = -1;                    // ホット行（g_listLayout 
 static POINT g_listAnchor = {};                  // 表示位置の基準（新規表示時のカーソル座標。組み直しで再利用）
 static bool  g_listInOverflow = false;           // 新規表示時にアイコンがフライアウト内にあったか（組み直しで再利用）
 static RECT  g_listOverflowRect = {};            // そのときのフライアウト矩形
+static bool  g_listInputMode = false;            // 入力モード（登録欄のクリックで一覧をアクティブ化している間）
 
 // 一覧ポップアップが画面に出ているか（ウィンドウ未生成は非表示扱い）
 static bool isListPopupVisible() {
     return g_listWnd && IsWindowVisible(g_listWnd);
+}
+
+// 入力モードへ入る（登録欄のクリック時）
+// WS_EX_NOACTIVATE を外してから前面化し、一覧をアクティブにしてキー入力を受けられるようにする。
+// 前面化は既存の forceForeground を使う。（クリック直後でも確実に権限を得るため）
+static void enterListInputMode(HWND hWnd) {
+    SetWindowLongPtrW(hWnd, GWL_EXSTYLE, GetWindowLongPtrW(hWnd, GWL_EXSTYLE) & ~WS_EX_NOACTIVATE);
+    g_listInputMode = true;
+    forceForeground(hWnd);
+}
+
+// 入力モードを抜ける（非アクティブ化・一覧の非表示時）
+// WS_EX_NOACTIVATE を戻し、離脱監視を最初から数え直させる。入力内容は保持する。
+static void exitListInputMode() {
+    if (g_listWnd) {
+        SetWindowLongPtrW(g_listWnd, GWL_EXSTYLE,
+                          GetWindowLongPtrW(g_listWnd, GWL_EXSTYLE) | WS_EX_NOACTIVATE);
+    }
+    g_listInputMode   = false;
+    g_listOutsideTicks = 0;
 }
 
 // 後方定義の関数を一覧ウィンドウの WndProc から呼ぶための前方宣言
@@ -4733,14 +4999,27 @@ static void markIssueRead(int issueId);
 static void handleTrayCommand(UINT id);
 static void cycleIssueState(size_t itemIndex);
 
-// クライアント座標 y の行ヒットテスト（セパレータは対象外）。ヒットなしは -1
+// クライアント座標 y の行ヒットテスト（セパレータと登録欄は対象外）。ヒットなしは -1
+// 登録欄の行背景のクリックでホット表示やクエリ画面遷移を起こさないため、登録欄も除く。
 static int listRowHitTest(int y) {
     for (size_t i = 0; i < g_listLayout.size(); ++i) {
         const auto& row = g_listLayout[i];
-        if (row.kind == ListRowKind::Separator) continue;
+        if (row.kind == ListRowKind::Separator || row.kind == ListRowKind::Register) continue;
         if (y >= row.top && y < row.top + row.height) return static_cast<int>(i);
     }
     return -1;
+}
+
+// カーソルが登録欄の行（子コントロール上を含む）にあるか
+static bool cursorOnRegisterRow(HWND hWnd) {
+    POINT pt;
+    GetCursorPos(&pt);
+    ScreenToClient(hWnd, &pt);
+    for (const auto& row : g_listLayout) {
+        if (row.kind == ListRowKind::Register && pt.y >= row.top && pt.y < row.top + row.height)
+            return true;
+    }
+    return false;
 }
 
 // 行のクライアント矩形（横幅はウィンドウ全幅）
@@ -4803,6 +5082,8 @@ static void paintListWindow(HWND hWnd) {
         case ListRowKind::Empty:
             drawTextRow(hMem, rc, NO_ISSUES, hot);
             break;
+        case ListRowKind::Register:
+            break;  // 背景は全面塗りつぶし済み。子コントロールは自分で描く
         }
     }
     BitBlt(hdc, 0, 0, client.right, client.bottom, hMem, 0, 0, SRCCOPY);
@@ -4813,7 +5094,9 @@ static void paintListWindow(HWND hWnd) {
 }
 
 // 一覧ポップアップのウィンドウプロシージャ
-// 非アクティブ（WS_EX_NOACTIVATE + MA_NOACTIVATE）のためキー入力は届かない。マウス専用。
+// 通常は非アクティブ（WS_EX_NOACTIVATE + MA_NOACTIVATE）のためキー入力は届かない。
+// キー入力を受けるのは登録欄のクリックで入った入力モードの間だけで、Tab・Enter・Esc は
+// メッセージループの IsDialogMessageW が WM_COMMAND（IDOK・IDCANCEL）へ変換する。
 // 行の左クリック＝チケットを開いて既読化して閉じる。フッタ・0 件行＝クエリ画面を開いて閉じる。
 // 行の右クリック＝状態遷移で、一覧は開いたまま。（通常 → ピン留め → 非表示 → 通常）
 // 離脱による自動クローズはトレイ側の IDT_LIST_WATCH が担い、ここでは扱わない。
@@ -4823,8 +5106,39 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
     }
     if (msg == WM_MOUSEACTIVATE) {
-        // クリックでもアクティブ化しない（WS_EX_NOACTIVATE の補強。フォーカス非奪取の要）
-        return MA_NOACTIVATE;
+        // 登録欄の行（子コントロール上を含む）のクリックでだけ入力モードへ入り、アクティブ化する。
+        // それ以外はアクティブ化しない（WS_EX_NOACTIVATE の補強。フォーカス非奪取の要）
+        if (!g_listInputMode && g_regEdit && cursorOnRegisterRow(hWnd)) enterListInputMode(hWnd);
+        return g_listInputMode ? MA_ACTIVATE : MA_NOACTIVATE;
+    }
+    if (msg == WM_SETFOCUS && g_regEdit) {
+        // アクティブ化時に一覧自体へ来たフォーカスを件名欄へ渡す。（子のクリックなら続けて子へ移る）
+        SetFocus(g_regEdit);
+        return 0;
+    }
+    if (msg == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE && g_listInputMode) {
+        // 他アプリへ切り替わったら入力モードだけ抜け、以後は離脱監視に閉じる判断を任せる。
+        // 自スレッドの窓（DTP のカレンダー等）へ移る場合は抜けない。（抜けるとカレンダー操作中に
+        // 離脱監視が一覧を閉じるため）
+        HWND other = reinterpret_cast<HWND>(lParam);
+        if (!other || GetWindowThreadProcessId(other, nullptr) != GetCurrentThreadId())
+            exitListInputMode();
+        return 0;
+    }
+    if (msg == WM_COMMAND) {
+        const UINT id = LOWORD(wParam);
+        if (id == IDOK) {  // 登録ボタン・Enter
+            submitRegistration();
+            return 0;
+        }
+        if (id == IDCANCEL) {  // Esc
+            if (g_hWnd) hideListPopup(g_hWnd);
+            return 0;
+        }
+        if (id == IDC_REG_EDIT && HIWORD(wParam) == EN_CHANGE) {
+            updateRegisterControls();
+            return 0;
+        }
     }
     if (msg == WM_MOUSEMOVE) {
         int hit = listRowHitTest(static_cast<short>(HIWORD(lParam)));
@@ -4888,10 +5202,43 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
+// 登録欄の子コントロールを生成する（register_project 設定時のみ、一覧ウィンドウの生成直後に 1 回）
+// 位置と大きさは showListPopup が表示のたびに決める。
+// 1 つでも生成に失敗したら全部破棄して登録欄なしで動かす。（一覧そのものは使えるようにする）
+static void createRegisterControls(HWND parent, HINSTANCE hInst) {
+    const DWORD base = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
+    g_regEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", base | ES_AUTOHSCROLL,
+        0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_REG_EDIT)), hInst, nullptr);
+    g_regDate = CreateWindowExW(0, DATETIMEPICK_CLASSW, L"", base | DTS_SHORTDATEFORMAT,
+        0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_REG_DATE)), hInst, nullptr);
+    g_regButton = CreateWindowExW(0, L"BUTTON", L"登録", base | BS_DEFPUSHBUTTON,
+        0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), hInst, nullptr);
+    if (!g_regEdit || !g_regDate || !g_regButton) {
+        writeLog("list: register controls creation failed: " + std::to_string(GetLastError()));
+        for (HWND* h : { &g_regEdit, &g_regDate, &g_regButton }) {
+            if (*h) DestroyWindow(*h);
+            *h = nullptr;
+        }
+        return;
+    }
+    for (HWND h : { g_regEdit, g_regDate, g_regButton })
+        SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g_hMenuFont), FALSE);
+    SendMessageW(g_regEdit, EM_LIMITTEXT, REG_SUBJECT_MAX_CHARS, 0);
+    SendMessageW(g_regEdit, EM_SETCUEBANNER, TRUE,
+                 reinterpret_cast<LPARAM>(L"新しいチケットの件名（3 文字以上）"));
+    // 書式はロケールに依存させない（幅の計測を固定の見本文字列で行うため）
+    SendMessageW(g_regDate, DTM_SETFORMATW, 0, reinterpret_cast<LPARAM>(L"yyyy/MM/dd"));
+    SendMessageW(g_regDate, DTM_SETMCFONT, reinterpret_cast<WPARAM>(g_hMenuFont), FALSE);
+    resetRegisterDate();
+    updateRegisterControls();
+}
+
 // 一覧ポップアップウィンドウの生成（初回のみ。以降は表示/非表示で使い回す）
-// WS_EX_NOACTIVATE：表示・クリックでもフォアグラウンドを奪わない（本ウィンドウの核）
+// WS_EX_NOACTIVATE：表示・クリックでもフォアグラウンドを奪わない（本ウィンドウの核。入力モード中は外す）
 // WS_EX_TOOLWINDOW：タスクバー・Alt+Tab に出さない
 // WS_EX_TOPMOST：タスクバー近傍でも手前に出す
+// 背景ブラシ（メニュー色）は、v6 の Button・DTP が親の背景を描かせる際の WM_ERASEBKGND 用。
+// （一覧自体は WM_PAINT で全面を描くため、見た目は変わらない）
 static HWND ensureListWindow() {
     if (g_listWnd) return g_listWnd;
     WNDCLASSEXW wc = {};
@@ -4899,6 +5246,7 @@ static HWND ensureListWindow() {
     wc.style         = CS_DROPSHADOW;
     wc.lpfnWndProc   = listWndProc;
     wc.hInstance     = GetModuleHandleW(nullptr);
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(static_cast<INT_PTR>(COLOR_MENU + 1));
     // UNICODE 未定義ビルドのため IDC_ARROW（MAKEINTRESOURCE）は LPSTR に展開される。W 版へ読み替える
     wc.hCursor       = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
     wc.lpszClassName = LIST_WND_CLASS;
@@ -4909,8 +5257,11 @@ static HWND ensureListWindow() {
     g_listWnd = CreateWindowExW(LIST_WND_EXSTYLE,
         LIST_WND_CLASS, nullptr, LIST_WND_STYLE,
         0, 0, 0, 0, g_hWnd, nullptr, wc.hInstance, nullptr);
-    if (!g_listWnd)
+    if (!g_listWnd) {
         writeLog("list: CreateWindowExW failed: " + std::to_string(GetLastError()));
+        return nullptr;
+    }
+    if (!g_currentConfig.registerProject.empty()) createRegisterControls(g_listWnd, wc.hInstance);
     return g_listWnd;
 }
 
@@ -4922,6 +5273,8 @@ static HWND ensureListWindow() {
 // refresh は表示中の一覧を最新の状態で組み直す指定だ。
 // 位置は新規表示時のカーソル座標を基準に同じ規則で求め直す。
 // 離脱監視の状態（猶予・タイマー）は引き継ぐ。ホット行は現在のカーソル位置から求め直す。
+// 登録欄（register_project 設定時）は常に末尾の行で、作業領域による打ち切りでも必ず残す。
+// 子コントロールは組み直しのたびに置き直し、入力中の内容とフォーカスはそのまま保つ。
 static void showListPopup(HWND trayWnd, bool refresh) {
     HWND hWnd = ensureListWindow();
     if (!hWnd) return;
@@ -4995,13 +5348,24 @@ static void showListPopup(HWND trayWnd, bool refresh) {
     GetTextMetricsW(hdc, &tm);
     const int textRowHeight = tm.tmHeight + 6;
     SelectObject(hdc, oldFont);
-    auto textRowWidth = [&](const wchar_t* text) {
+    auto textWidth = [&](const wchar_t* text) {
         HFONT prev = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
         SIZE sz = {};
         GetTextExtentPoint32W(hdc, text, static_cast<int>(wcslen(text)), &sz);
         SelectObject(hdc, prev);
-        return static_cast<int>(sz.cx) + 20;
+        return static_cast<int>(sz.cx);
     };
+    auto textRowWidth = [&](const wchar_t* text) { return textWidth(text) + 20; };
+
+    // 登録欄の寸法（コントロールの高さは文字高＋枠、DTP の幅は固定書式の見本＋ドロップダウンボタン）
+    const bool regEnabled = (g_regEdit != nullptr);
+    const int  regCtrlH   = tm.tmHeight + 8;
+    const int  regRowH    = regCtrlH + 2 * REG_PAD;
+    const int  regDateW   = textWidth(L"0000/00/00") + GetSystemMetrics(SM_CXVSCROLL) + 16;
+    const int  regButtonW = textWidth(L"登録") + 32;
+    const int  regMinW    = REG_PAD * 4 + REG_EDIT_MIN_WIDTH + regDateW + regButtonW;
+    // 登録欄とその上のセパレータの高さ（無効時は 0）
+    const int  regTailH   = regEnabled ? 9 + regRowH : 0;
 
     if (rows.empty()) {
         g_listFooterText.clear();
@@ -5009,8 +5373,8 @@ static void showListPopup(HWND trayWnd, bool refresh) {
         pushRow(ListRowKind::Empty, textRowHeight, 0);
     }
     else {
-        // セパレータとフッタは必ず出すため、その高さを先に予約して行を詰める
-        const int tailHeight = 9 + textRowHeight;
+        // セパレータとフッタ（と登録欄）は必ず出すため、その高さを先に予約して行を詰める
+        const int tailHeight = 9 + textRowHeight + regTailH;
         size_t idx = 0;
         for (const auto& row : rows) {
             g_issueItems.push_back(makeItem(row));
@@ -5033,7 +5397,27 @@ static void showListPopup(HWND trayWnd, bool refresh) {
         pushRow(ListRowKind::Separator, 9, 0);  // メニューのセパレータ相当（余白込み）
         pushRow(ListRowKind::Footer, textRowHeight, 0);
     }
+    int regTop = 0;
+    if (regEnabled) {
+        width = (std::max)(width, regMinW);
+        pushRow(ListRowKind::Separator, 9, 0);
+        regTop = y;
+        pushRow(ListRowKind::Register, regRowH, 0);
+    }
     ReleaseDC(hWnd, hdc);
+
+    // 登録欄の子コントロールを右から「登録・期日」と詰め、件名欄を残りの幅に広げる
+    if (regEnabled) {
+        const int cy = regTop + REG_PAD;
+        int x = width - REG_PAD - regButtonW;
+        SetWindowPos(g_regButton, nullptr, x, cy, regButtonW, regCtrlH, SWP_NOZORDER | SWP_NOACTIVATE);
+        x -= REG_PAD + regDateW;
+        SetWindowPos(g_regDate, nullptr, x, cy, regDateW, regCtrlH, SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(g_regEdit, nullptr, REG_PAD, cy, x - REG_PAD * 2, regCtrlH,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        // 新規表示で書きかけの件名が無ければ期日を当日に戻す。（日をまたいで開き直した場合の既定値）
+        if (!refresh && GetWindowTextLengthW(g_regEdit) == 0) resetRegisterDate();
+    }
 
     // クライアントサイズ → ウィンドウサイズ（WS_BORDER の枠分を上乗せ）
     RECT wr = { 0, 0, width, y };
@@ -5112,7 +5496,9 @@ static void showListPopup(HWND trayWnd, bool refresh) {
 // カーソルがまだアイコン上にある閉じ操作では、ホバー再表示を抑止する
 // （g_hoverSuppressed。NIN_POPUPCLOSE で解除）。閉じた直後の微動で NIN_POPUPOPEN が
 // 再送されても開き直さないための備えだ。（再送条件は文書化されていない）
+// 入力モードは非表示化より先に抜ける。（非表示化で届く WM_ACTIVATE の再入を避ける。入力内容は保持する）
 static void hideListPopup(HWND trayWnd) {
+    if (g_listInputMode) exitListInputMode();
     if (g_listWnd) ShowWindow(g_listWnd, SW_HIDE);
     g_popupShowing.store(false);
     g_listHotRow = -1;
@@ -5390,6 +5776,12 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         POINT pt;
         GetCursorPos(&pt);
         if (g_listWnd && IsWindowVisible(g_listWnd)) {
+            // 入力モード中は離脱で閉じない。（入力中にカーソルが外れても消さない。
+            // 閉じるのは Esc・アイコンのトグル・非アクティブ化で入力モードを抜けた後の離脱）
+            if (g_listInputMode) {
+                g_listOutsideTicks = 0;
+                return 0;
+            }
             // 表示中：アイコンとポップアップの両方から離れた状態が連続したら閉じる。
             // アイコン上の判定は多層防御とする。OS のホバー状態（g_iconHovered。高 DPI でも
             // 正しい）と、アイコン矩形との突き合わせ（100% 環境と旧方式フォールバックで正しい）
@@ -5427,6 +5819,18 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     // ポーリング成功後の組み直し依頼（閉じている一覧は次に開いた時点で組み立てるため何もしない）
     if (msg == WM_LIST_REFRESH) {
         if (isListPopupVisible()) showListPopup(hWnd, true);
+        return 0;
+    }
+    // 登録スレッドの完了通知（成功なら入力をクリアし、即時ポーリングで新チケットを一覧へ反映する）
+    if (msg == WM_REGISTER_DONE) {
+        g_registerBusy = false;
+        if (wParam && g_regEdit) {
+            SetWindowTextW(g_regEdit, L"");
+            resetRegisterDate();
+            g_registerPoll.store(true);
+        }
+        updateRegisterControls();
+        if (g_listInputMode && g_regEdit) SetFocus(g_regEdit);  // 送信中の無効化で失ったフォーカスを戻す
         return 0;
     }
     if (msg == WM_COMMAND) {
@@ -5873,7 +6277,7 @@ static void showPollDoneToast(int mutedOwn)
     }
 }
 
-// shutdown と手動更新（g_manualPoll）だけを監視して待つ（100ms 刻み）
+// shutdown と明示操作の即時ポーリング（g_manualPoll・g_registerPoll）だけを監視して待つ（100ms 刻み）
 // waitInterruptible と違い forcePoll では起きない。休止時間帯とクールダウン待ちで使う。
 // （forcePoll で即復帰すると NIC 変化の連発時に周回して待機の目的が破れるため）
 // waitInterruptible と同じ GetTickCount64 の期限方式とする。Sleep の積算方式は
@@ -5881,7 +6285,7 @@ static void showPollDoneToast(int mutedOwn)
 // ポーリングが最大 1 時間遅れるため使わない。（GetTickCount64 はサスペンド時間を含む）
 static void waitIgnoringForcePoll(ULONGLONG ms) {
     ULONGLONG end = GetTickCount64() + ms;
-    while (!g_shutdownRequested && !g_manualPoll.load()) {
+    while (!g_shutdownRequested && !g_manualPoll.load() && !g_registerPoll.load()) {
         ULONGLONG now = GetTickCount64();
         if (end <= now) break;
         ULONGLONG remain = end - now;
@@ -6005,10 +6409,13 @@ static void pollThreadFunc(std::wstring dataDir, Config cfg) {
             // ことで、休止中はどのトリガーでもポーリングしない。（schedule の 0 を最優先とする）
             // 起動直後の 1 回だけは例外として実行し、一覧を出せる状態にする。
             // calcSleepUntilNextPoll(0) は内部ガードで 1 回/時扱いになり「次の正時まで」を返す。
-            // 「今すぐ更新」は明示のユーザ操作のため、休止時間帯・クールダウンの抑止を受けない
-            bool manualTriggered = g_manualPoll.exchange(false);
+            // 「今すぐ更新」は明示のユーザ操作のため、休止時間帯・クールダウンの抑止を受けない。
+            // 登録欄での登録直後の反映（registerTriggered）も同じ扱いとする。（応答 Toast は出さない）
+            bool manualTriggered   = g_manualPoll.exchange(false);
+            bool registerTriggered = g_registerPoll.exchange(false);
+            bool immediate         = manualTriggered || registerTriggered;
 
-            if (pollsPerHour == 0 && !startupPoll && !manualTriggered) {
+            if (pollsPerHour == 0 && !startupPoll && !immediate) {
                 g_forcePoll.store(false);  // 休止中に積まれたトリガーは破棄する（次の稼働正時に自然に取得される）
                 waitIgnoringForcePoll(calcSleepUntilNextPoll(0));
                 continue;
@@ -6028,7 +6435,7 @@ static void pollThreadFunc(std::wstring dataDir, Config cfg) {
             ULONGLONG lastAttempt = g_lastPollAttemptTick.load();
             bool stale = (lastTick > 0) && (tickNow - lastTick >= STALE_POLL_THRESHOLD_MS);
 
-            if (!manualTriggered && (forceTriggered || stale) && !startupPoll && lastAttempt > 0
+            if (!immediate && (forceTriggered || stale) && !startupPoll && lastAttempt > 0
                 && (tickNow - lastAttempt < FORCE_POLL_COOLDOWN_MS)) {
                 writeLog("force poll deferred (cooldown)");
                 // クールダウンの残り時間は forcePoll を無視して待つ。
@@ -6037,6 +6444,7 @@ static void pollThreadFunc(std::wstring dataDir, Config cfg) {
                 continue;
             }
             if (manualTriggered) writeLog("manual poll triggered");
+            if (registerTriggered) writeLog("register poll triggered");
             if (forceTriggered && !startupPoll) writeLog("force poll triggered");
             if (stale && !startupPoll)
                 writeLog("stale poll triggered (" + std::to_string((tickNow - lastTick) / 1000) + "s since last poll)");
@@ -6319,6 +6727,8 @@ int wmain() {
             writeLog("query_ids: [" + s + "]"
                 + (cfg.queryIds.empty() ? " (assigned-to-me fallback)" : ""));
         }
+        writeLog("register_project: " + (cfg.registerProject.empty()
+            ? std::string("(disabled)") : wideToUtf8(cfg.registerProject)));
 
         // 更新チェックスレッド起動（起動時に 1 回のみ実行）
         // detach しない。プロセス終了時の静的破棄と競合しないよう、シャットダウン時に join する。
@@ -6336,6 +6746,11 @@ int wmain() {
         // 一覧・メニュー描画用フォントを初期化（一覧ポップアップとバージョン通知行が使用する）
         initMenuFonts();
 
+        // 一覧の登録欄（DateTimePicker ほか）のクラス登録。失敗時は登録欄の生成が失敗し、
+        // 登録欄なしで一覧が動く（createRegisterControls を参照）
+        INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_DATE_CLASSES | ICC_STANDARD_CLASSES };
+        if (!InitCommonControlsEx(&icc)) writeLog("InitCommonControlsEx failed");
+
         // ピン留めと非表示チケットを復元する（起動直後のポーリング前でも一覧に反映するため）
         loadPins(g_dataDir);
         loadHidden(g_dataDir);
@@ -6351,11 +6766,13 @@ int wmain() {
             enterDisabledMode(g_hWnd, initReason, cfg, exeDir);
         }
 
-        // メッセージループ（純粋）
+        // メッセージループ
         // GetMessage は WM_QUIT で 0 を返してループを抜ける。
         // WM_QUIT は IDM_EXIT 等の終了経路で PostQuitMessage(0) により投函される。
         MSG msg;
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            // 一覧の登録欄の Tab（移動）・Enter（IDOK）・Esc（IDCANCEL）をダイアログ同様に処理する
+            if (g_listWnd && IsDialogMessageW(g_listWnd, &msg)) continue;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -6376,6 +6793,9 @@ int wmain() {
         // トレイアイコン削除より後に置き、ユーザから見た終了は即座に完了させる。
         // ただし PostMessage(g_hWnd, ...) を発火し得るため DestroyWindow より前で必ず join する。
         if (pollThread.joinable()) pollThread.join();
+        // 登録スレッドも WM_REGISTER_DONE を投函し得るため DestroyWindow より前に join する。
+        // （静的な std::thread を joinable のまま破棄すると std::terminate になるため必ず join する）
+        if (g_registerThread.joinable()) g_registerThread.join();
 
         DestroyWindow(g_hWnd);
         g_hWnd = nullptr;  // 破棄済みハンドルの再利用を防ぐ（catch の後始末ガードが誤発火しないため）
@@ -6398,6 +6818,7 @@ int wmain() {
         g_shutdownRequested = true;
         if (pollThread.joinable()) pollThread.join();
         if (updateThread.joinable()) updateThread.join();
+        if (g_registerThread.joinable()) g_registerThread.join();
         // 正常終了パスと同様にトレイ登録を後始末する。（怠るとプロセス消滅後も
         // ゴーストアイコンが残る）通知音スレッドも待ち、静的破棄との競合を防ぐ
         if (g_hWnd) {
