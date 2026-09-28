@@ -886,6 +886,15 @@ static void testBuildIssueCreateBody() {
     CHECK(buildIssueCreateBody(L"my-project", L"件名 \"x\"", "2026-09-28", 3) == expected);
 }
 
+static void testRegisterProjectFromLogin() {
+    CHECK_WSTR(registerProjectFromLogin(L"t_nikai"), L"t_nikai");
+    CHECK_WSTR(registerProjectFromLogin(L"t_nikai@example.com"), L"t_nikai");
+    CHECK_WSTR(registerProjectFromLogin(L"Taro-Y"), L"taro-y");   // 小文字化
+    CHECK_WSTR(registerProjectFromLogin(L"1abc"), L"");           // 数字始まりは不可
+    CHECK_WSTR(registerProjectFromLogin(L"a.b"), L"");            // 識別子に使えない文字
+    CHECK_WSTR(registerProjectFromLogin(L"@example.com"), L"");   // 空
+}
+
 // テストの列挙実行と集計出力（失敗ありなら終了コード 1）
 int main() {
     // 失敗診断は日本語（UTF-8）を含むため、コンソールの出力コードページを合わせる
@@ -916,6 +925,7 @@ int main() {
     testAlignTowardCenter();
     testRegisterSubject();
     testBuildIssueCreateBody();
+    testRegisterProjectFromLogin();
     printf("checks: %d, failed: %d\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }

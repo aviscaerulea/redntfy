@@ -33,7 +33,7 @@ The tray icon shows a red badge in the bottom-right corner when there are unread
 
 Each row of the list shows the due date, assignee, project, and days left until the due date, with icons. Unread tickets and tickets with a due date are shown in bold. Tickets notified as new are marked with ✨. The pending count appears in the footer. Clicking a row opens the ticket in the browser and marks it as read. Right-clicking a row cycles through pinned, hidden, and normal.
 
-When a target project is configured, a subject field, a due date, and a register button appear at the bottom of the list. Enter a subject (at least 3 characters), pick a due date from the calendar, and register it to create a ticket assigned to yourself. The due date defaults to today.
+When a target project is available, a subject field, a due date, and a register button appear at the bottom of the list. Enter a subject (at least 3 characters), pick a due date from the calendar, and register it to create a ticket assigned to yourself. The due date defaults to today. If no target project is configured, tickets go to your personal project whose identifier matches your login name, if it exists.
 
 Right-clicking the tray icon opens the tray menu, which provides various settings.
 

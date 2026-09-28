@@ -18,7 +18,8 @@
  * ピンは pins.json に永続化し、保存クエリの集合から外れたチケットも一覧に表示し続ける。
  * 非表示チケットは hidden.json に永続化し、グレー＋取消線で表示・通知と件数から除外・
  * 「非表示チケットを除外」トグル ON で一覧からも出さない。
- * [redmine] register_project 設定時は、一覧末尾の登録欄から件名と期日を入力して
+ * 登録先プロジェクト（register_project、未設定ならログイン名と同じ識別子のプロジェクト）が
+ * ある場合は、一覧末尾の登録欄から件名と期日を入力して
  * 自分担当のチケットを登録できる。（登録欄のクリック時だけ一覧をアクティブ化してキー入力を受ける）
  *
  * 終了コード：
@@ -460,7 +461,7 @@ struct Config {
     // 先頭要素は「代表クエリ」で、複数件 Toast と一覧フッタから開く URL に使う。
     // 空のときはフォールバックモードとして、自分（と所属グループ）が担当のチケットを追跡する。
     std::vector<int> queryIds;
-    // 一覧の登録欄の登録先プロジェクト（識別子または数値 id）。空なら登録欄を出さない
+    // 登録欄へ明示する登録先（識別子または数値 id）。空ならログイン名から自動判定する（g_registerProject を参照）
     std::wstring registerProject;
 
     // 添字は JST（UTC+9）固定の時。OS のタイムゾーン設定に依存しない。
@@ -1836,7 +1837,8 @@ static winrt::Windows::Data::Json::JsonObject redmineGetJson(
 // 失敗時は 0 を返す。0 のときは自分の操作の除外判定を行わない。（通知欠落より過剰通知側に倒す）
 // outOwnGroups は成功時のみ上書きする。グループ担当判定（/groups.json）が権限不足で
 // 使えない場合のフォールバック用。
-static int fetchMyUserId(const Config& cfg, std::vector<int>& outOwnGroups) {
+// outLogin は成功時のみ自分のログイン名で上書きする。（登録先プロジェクトの自動判定用）
+static int fetchMyUserId(const Config& cfg, std::vector<int>& outOwnGroups, std::wstring& outLogin) {
     auto obj = redmineGetJson(cfg, cfg.redmineUrl + L"/users/current.json?include=groups",
                               "fetchMyUserId");
     if (!obj) return 0;
@@ -1850,6 +1852,7 @@ static int fetchMyUserId(const Config& cfg, std::vector<int>& outOwnGroups) {
                 if (gid > 0) outOwnGroups.push_back(gid);
             }
         }
+        outLogin = user.GetNamedString(L"login", L"").c_str();
         return static_cast<int>(user.GetNamedNumber(L"id", 0));
     }
     catch (...) {
@@ -4712,7 +4715,8 @@ static void drawIssueRow(HDC hdc, const RECT& rcItem, const IssueItem& item, boo
 }
 
 // ==================== 一覧の登録欄 ====================
-// register_project 設定時に一覧の末尾へ置く「件名 Edit・期日 DTP・登録ボタン」の簡易チケット登録。
+// 登録先の確定時に一覧の末尾へ置く「件名 Edit・期日 DTP・登録ボタン」の簡易チケット登録。
+// 登録先は register_project の明示値、未設定ならログイン名と同じ識別子の実在プロジェクト。
 // 送信は POST /issues.json で、担当は自分、トラッカー・ステータス・優先度はプロジェクト既定に任せる。
 // 送信は専用スレッド（registerIssueThreadFunc）で行い、完了を WM_REGISTER_DONE でメインへ返す。
 
@@ -4789,7 +4793,34 @@ static std::string buildIssueCreateBody(const std::wstring& project, const std::
         + "\",\"assigned_to_id\":" + std::to_string(assigneeId) + "}}";
 }
 
-// 登録欄の子コントロール（ensureListWindow が register_project 設定時だけ生成する。未設定なら nullptr）
+// ログイン名から登録先プロジェクトの識別子を作る（register_project 未設定時の自動判定）
+// "@" より前を英小文字にした値。Redmine の識別子の形（英小文字で始まり、英小文字・数字・-・_ のみ）に
+// 合わなければ空を返す。（URL へ入れる前に弾き、存在確認の HTTP を打たない）
+static std::wstring registerProjectFromLogin(const std::wstring& login) {
+    std::wstring id = login.substr(0, login.find(L'@'));
+    for (auto& c : id) {
+        if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
+    }
+    if (id.empty() || id[0] < L'a' || id[0] > L'z') return {};
+    for (wchar_t c : id) {
+        const bool ok = (c >= L'a' && c <= L'z') || (c >= L'0' && c <= L'9') || c == L'-' || c == L'_';
+        if (!ok) return {};
+    }
+    return id;
+}
+
+// 確定した登録先プロジェクト（g_mtx で保護。空 = 登録欄なし）
+// register_project の明示値は wmain が起動時に設定し、未設定ならポーリングスレッドが
+// ログイン名から自動判定して存在を確かめたときに設定する。
+static std::wstring g_registerProject;
+
+// 確定した登録先の取得（空 = 未確定または登録欄なし）
+static std::wstring currentRegisterProject() {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    return g_registerProject;
+}
+
+// 登録欄の子コントロール（登録先の確定後に showListPopup が生成する。未生成なら nullptr）
 static HWND g_regEdit   = nullptr;   // 件名
 static HWND g_regDate   = nullptr;   // 期日（DateTimePicker）
 static HWND g_regButton = nullptr;   // 登録ボタン（id = IDOK。Enter と同じ WM_COMMAND 経路にする）
@@ -4907,7 +4938,7 @@ static void submitRegistration() {
     }
     SYSTEMTIME st = {};
     if (DateTime_GetSystemtime(g_regDate, &st) != GDT_VALID) return;
-    const std::string body = buildIssueCreateBody(g_currentConfig.registerProject, subject,
+    const std::string body = buildIssueCreateBody(currentRegisterProject(), subject,
         ymdToIsoDate(st.wYear * 10000 + st.wMonth * 100 + st.wDay), me);
     // 前回分は完了通知の受信後（busy = false）なので、join は即座に戻る
     if (g_registerThread.joinable()) g_registerThread.join();
@@ -4927,7 +4958,7 @@ static void submitRegistration() {
 // 自前ポップアップ（WS_EX_NOACTIVATE）で一覧を表示する。
 // 非モーダルのため、フォーカス復元・EndMenu・クローズ直後のクリック猶予といった
 // モーダルメニュー時代の補正処理は存在しない。チケット行はマウス専用の UI。
-// 例外は末尾の登録欄（register_project 設定時のみ）で、登録欄のクリックでだけ
+// 例外は末尾の登録欄（登録先の確定時のみ）で、登録欄のクリックでだけ
 // WS_EX_NOACTIVATE を外して一覧をアクティブ化し、キー入力を受ける。（入力モード）
 // 入力モード中は離脱で閉じず、他アプリへの切り替えで入力モードだけ抜ける。
 // 開く：ホバー（OS の NIN_POPUPOPEN 通知から hover_delay_ms 後）または
@@ -5202,7 +5233,7 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-// 登録欄の子コントロールを生成する（register_project 設定時のみ、一覧ウィンドウの生成直後に 1 回）
+// 登録欄の子コントロールを生成する（登録先の確定後、最初の一覧表示時に 1 回。失敗時は次の表示で再試行）
 // 位置と大きさは showListPopup が表示のたびに決める。
 // 1 つでも生成に失敗したら全部破棄して登録欄なしで動かす。（一覧そのものは使えるようにする）
 static void createRegisterControls(HWND parent, HINSTANCE hInst) {
@@ -5225,7 +5256,7 @@ static void createRegisterControls(HWND parent, HINSTANCE hInst) {
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g_hMenuFont), FALSE);
     SendMessageW(g_regEdit, EM_LIMITTEXT, REG_SUBJECT_MAX_CHARS, 0);
     SendMessageW(g_regEdit, EM_SETCUEBANNER, TRUE,
-                 reinterpret_cast<LPARAM>(L"新しいチケットの件名（3 文字以上）"));
+                 reinterpret_cast<LPARAM>(L"新しいチケットの件名"));
     // 書式はロケールに依存させない（幅の計測を固定の見本文字列で行うため）
     SendMessageW(g_regDate, DTM_SETFORMATW, 0, reinterpret_cast<LPARAM>(L"yyyy/MM/dd"));
     SendMessageW(g_regDate, DTM_SETMCFONT, reinterpret_cast<WPARAM>(g_hMenuFont), FALSE);
@@ -5261,7 +5292,6 @@ static HWND ensureListWindow() {
         writeLog("list: CreateWindowExW failed: " + std::to_string(GetLastError()));
         return nullptr;
     }
-    if (!g_currentConfig.registerProject.empty()) createRegisterControls(g_listWnd, wc.hInstance);
     return g_listWnd;
 }
 
@@ -5273,11 +5303,15 @@ static HWND ensureListWindow() {
 // refresh は表示中の一覧を最新の状態で組み直す指定だ。
 // 位置は新規表示時のカーソル座標を基準に同じ規則で求め直す。
 // 離脱監視の状態（猶予・タイマー）は引き継ぐ。ホット行は現在のカーソル位置から求め直す。
-// 登録欄（register_project 設定時）は常に末尾の行で、作業領域による打ち切りでも必ず残す。
+// 登録欄（登録先の確定時）は常に末尾の行で、作業領域による打ち切りでも必ず残す。
 // 子コントロールは組み直しのたびに置き直し、入力中の内容とフォーカスはそのまま保つ。
 static void showListPopup(HWND trayWnd, bool refresh) {
     HWND hWnd = ensureListWindow();
     if (!hWnd) return;
+
+    // 登録先が確定していれば登録欄を生成する（自動判定は起動後のポーリングで確定するため、初回表示時とは限らない）
+    if (!g_regEdit && !currentRegisterProject().empty())
+        createRegisterControls(hWnd, GetModuleHandleW(nullptr));
 
     const Config& cfg = g_currentConfig;
     int visible = 0;
@@ -6298,6 +6332,8 @@ static void waitIgnoringForcePoll(ULONGLONG ms) {
 // 本スレッド専用でロック不要。resolvePollMetadata が休止時間帯の判定後に毎周回更新する。
 struct PollSession {
     std::vector<int> ownGroups;        // 自分の所属グループ（fetchMyUserId が設定）
+    std::wstring login;                // 自分のログイン名（fetchMyUserId が設定）
+    bool registerProjectResolved = false;  // 登録先の自動判定が確定したか（明示設定時は判定しない）
     std::vector<int> groupIds;         // グループ担当判定に使う集合（全グループ、権限不足時は所属グループ）
     bool groupIdsResolved = false;
 
@@ -6318,7 +6354,7 @@ struct PollSession {
     ULONGLONG versionMetaFetchTick = 0;
 };
 
-// ポーリングの判定材料（user id・グループ集合・バージョン欄情報）を確定・更新する
+// ポーリングの判定材料（user id・グループ集合・登録先の自動判定・バージョン欄情報）を確定・更新する
 // 未確定分の取得を毎周回試み、失敗分は次回ポーリングで再試行する。HTTP を伴うため、
 // 呼び出し側は休止時間帯の判定より後に呼ぶこと。（休止中はネットワークに触れない）
 // manualTriggered はバージョン欄情報のキャッシュ破棄条件。（「今すぐ更新」で強制再取得）
@@ -6326,7 +6362,7 @@ static void resolvePollMetadata(const Config& cfg, PollSession& s, bool manualTr
     // 自分の user id を確定する。（失敗時 0 = 自分の操作の除外判定なし）
     // 自動起動直後などネットワーク未接続で失敗した場合に備え、取得できるまで毎回試みる
     if (g_myUserId == 0) {
-        g_myUserId = fetchMyUserId(cfg, s.ownGroups);
+        g_myUserId = fetchMyUserId(cfg, s.ownGroups, s.login);
         if (g_myUserId != 0) writeLog("my user id: " + std::to_string(g_myUserId.load()));
     }
 
@@ -6344,6 +6380,33 @@ static void resolvePollMetadata(const Config& cfg, PollSession& s, bool manualTr
             s.groupIds = s.ownGroups;
             s.groupIdsResolved = true;
             writeLog("group ids: " + std::to_string(s.groupIds.size()) + " (own groups fallback)");
+        }
+    }
+
+    // 登録先の自動判定（register_project 未設定時のみ。user id 取得後に確定するまで毎回試みる）
+    // ログイン名から作った識別子のプロジェクトが実在すれば登録先とする。403・404 は「無い」で確定し、
+    // それ以外の失敗は次回ポーリングで再試行する。確定した回のポーリング後の組み直しで登録欄が現れる
+    if (cfg.registerProject.empty() && !s.registerProjectResolved && g_myUserId != 0) {
+        const std::wstring id = registerProjectFromLogin(s.login);
+        if (id.empty()) {
+            s.registerProjectResolved = true;
+            writeLog("register project: login is not a valid project identifier (disabled)");
+        }
+        else {
+            DWORD status = 0;
+            redmineGet(cfg.redmineUrl + L"/projects/" + id + L".json", cfg.apiKey, &status);
+            if (status == 200) {
+                {
+                    std::lock_guard<std::mutex> lk(g_mtx);
+                    g_registerProject = id;
+                }
+                s.registerProjectResolved = true;
+                writeLog("register project: " + wideToUtf8(id) + " (auto)");
+            }
+            else if (status == 403 || status == 404) {
+                s.registerProjectResolved = true;
+                writeLog("register project: " + wideToUtf8(id) + " not found (disabled)");
+            }
         }
     }
 
@@ -6698,6 +6761,8 @@ int wmain() {
         g_disabledReason.store(static_cast<int>(initReason));
 
         g_currentConfig = cfg;  // スレッド起動前に 1 回だけ設定（以降は不変・ロック不要）
+        // 明示の登録先。（スレッド起動前のためロック不要。未設定ならポーリングスレッドが自動判定する）
+        g_registerProject = cfg.registerProject;
 
         // 通知音を読み込みノーマライズしてキャッシュに格納（以降の再生はキャッシュを使用）
         loadWavAndNormalize(exeDir, cfg);
@@ -6728,7 +6793,7 @@ int wmain() {
                 + (cfg.queryIds.empty() ? " (assigned-to-me fallback)" : ""));
         }
         writeLog("register_project: " + (cfg.registerProject.empty()
-            ? std::string("(disabled)") : wideToUtf8(cfg.registerProject)));
+            ? std::string("(auto from login)") : wideToUtf8(cfg.registerProject)));
 
         // 更新チェックスレッド起動（起動時に 1 回のみ実行）
         // detach しない。プロセス終了時の静的破棄と競合しないよう、シャットダウン時に join する。
