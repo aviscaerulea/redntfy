@@ -5128,6 +5128,7 @@ static void paintListWindow(HWND hWnd) {
 // 通常は非アクティブ（WS_EX_NOACTIVATE + MA_NOACTIVATE）のためキー入力は届かない。
 // キー入力を受けるのは登録欄のクリックで入った入力モードの間だけで、Tab・Enter・Esc は
 // メッセージループの IsDialogMessageW が WM_COMMAND（IDOK・IDCANCEL）へ変換する。
+// WM_CLOSE（入力モード中の Alt+F4）は破棄ではなく非表示で閉じる。（g_listWnd は使い回すため）
 // 行の左クリック＝チケットを開いて既読化して閉じる。フッタ・0 件行＝クエリ画面を開いて閉じる。
 // 行の右クリック＝状態遷移で、一覧は開いたまま。（通常 → ピン留め → 非表示 → 通常）
 // 離脱による自動クローズはトレイ側の IDT_LIST_WATCH が担い、ここでは扱わない。
@@ -5154,6 +5155,13 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         HWND other = reinterpret_cast<HWND>(lParam);
         if (!other || GetWindowThreadProcessId(other, nullptr) != GetCurrentThreadId())
             exitListInputMode();
+        return 0;
+    }
+    if (msg == WM_CLOSE) {
+        // Alt+F4（入力モード中はアクティブなため届く）は Esc と同じく非表示で閉じる。
+        // DefWindowProcW に落とすと DestroyWindow され、使い回している g_listWnd と
+        // 登録欄の子コントロールのハンドルが失効して再起動まで一覧を開けなくなる
+        if (g_hWnd) hideListPopup(g_hWnd);
         return 0;
     }
     if (msg == WM_COMMAND) {
