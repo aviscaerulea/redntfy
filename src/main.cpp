@@ -5152,6 +5152,8 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         // 他アプリへ切り替わったら入力モードだけ抜け、以後は離脱監視に閉じる判断を任せる。
         // 自スレッドの窓（DTP のカレンダー等）へ移る場合は抜けない。（抜けるとカレンダー操作中に
         // 離脱監視が一覧を閉じるため）
+        // カレンダーを開いたまま他アプリへ切り替わった場合はここに届かないため、
+        // IDT_LIST_WATCH がフォアグラウンドを見て抜ける。
         HWND other = reinterpret_cast<HWND>(lParam);
         if (!other || GetWindowThreadProcessId(other, nullptr) != GetCurrentThreadId())
             exitListInputMode();
@@ -5818,9 +5820,16 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         POINT pt;
         GetCursorPos(&pt);
         if (g_listWnd && IsWindowVisible(g_listWnd)) {
-            // 入力モード中は離脱で閉じない。（入力中にカーソルが外れても消さない。
-            // 閉じるのは Esc・アイコンのトグル・非アクティブ化で入力モードを抜けた後の離脱）
             if (g_listInputMode) {
+                // 入力モード中は離脱で閉じない。（入力中にカーソルが外れても消さない。
+                // 閉じるのは Esc・Alt+F4・アイコンのトグル・非アクティブ化で入力モードを抜けた後の離脱）
+                // ただしフォアグラウンドが自スレッドの窓（一覧・登録欄・DTP のカレンダー）でなければ
+                // ここで入力モードを抜ける。カレンダーを開いたまま他アプリへ切り替わると、一覧自身には
+                // WM_ACTIVATE が届かず入力モードが残るため、タイマー側で検出する。
+                // （抜けた tick は離脱と数えず、次の tick から離脱監視に移る）
+                HWND fg = GetForegroundWindow();
+                if (!fg || GetWindowThreadProcessId(fg, nullptr) != GetCurrentThreadId())
+                    exitListInputMode();
                 g_listOutsideTicks = 0;
                 return 0;
             }
