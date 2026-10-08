@@ -5395,7 +5395,7 @@ static void showListPopup(HWND trayWnd, bool refresh) {
     const bool regEnabled = (g_regEdit != nullptr);
     const int  regCtrlH   = tm.tmHeight + 8;
     const int  regRowH    = regCtrlH + 2 * REG_PAD;
-    const int  regDateW   = textWidth(L"0000/00/00") + GetSystemMetrics(SM_CXVSCROLL) + 16;
+    const int  regDateW   = textWidth(L"0000/00/00") + GetSystemMetrics(SM_CXVSCROLL) + 8;
     const int  regButtonW = textWidth(L"登録") + 32;
     const int  regMinW    = REG_PAD * 4 + REG_EDIT_MIN_WIDTH + regDateW + regButtonW;
     // 登録欄とその上のセパレータの高さ（無効時は 0）
