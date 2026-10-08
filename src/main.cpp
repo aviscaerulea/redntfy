@@ -1611,6 +1611,19 @@ static Config loadConfig(const std::wstring& exeDir) {
         if (base && (*base)["redmine"][key].is_string())   return toWide(**(*base)["redmine"][key].as_string());
         return {};
     };
+    // [redmine] の register_project（識別子の文字列、または数値 id の整数）
+    // 整数は 10 進文字列に変換して識別子と同じ扱いにする。（Redmine の API はどちらも受ける。
+    // 整数を黙って無視すると、ログイン名由来の別プロジェクトへ登録されるため）
+    // local のキーが文字列・整数のどちらでも base より優先する。
+    auto readRegisterProject = [&]() -> std::wstring {
+        for (const auto* tbl : { local ? &*local : nullptr, base ? &*base : nullptr }) {
+            if (!tbl) continue;
+            const auto& node = (*tbl)["redmine"]["register_project"];
+            if (node.is_string())  return toWide(**node.as_string());
+            if (node.is_integer()) return std::to_wstring(**node.as_integer());
+        }
+        return {};
+    };
     // [redmine] の整数配列（query_ids）
     // 配列は「local にキーが存在するか」で採否を決める。（duck_targets / schedule と同じ方針）
     // 0 以下・非整数の要素と重複 id は除外する。（同じ HTTP を 2 回叩かない）
@@ -1635,7 +1648,7 @@ static Config loadConfig(const std::wstring& exeDir) {
     while (!cfg.redmineUrl.empty() && cfg.redmineUrl.back() == L'/')
         cfg.redmineUrl.pop_back();  // 末尾スラッシュを除去して URL 連結を単純化する
     cfg.apiKey  = readRedmineString("api_key");
-    cfg.registerProject = readRedmineString("register_project");
+    cfg.registerProject = readRegisterProject();
     if (auto q = readRedmineIntArray(local, "query_ids"))     cfg.queryIds = std::move(*q);
     else if (auto q = readRedmineIntArray(base, "query_ids")) cfg.queryIds = std::move(*q);
 
