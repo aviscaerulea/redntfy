@@ -4977,7 +4977,7 @@ static void submitRegistration() {
 // 開く：ホバー（OS の NIN_POPUPOPEN 通知から hover_delay_ms 後）または
 // アイコン左クリック（NIN_SELECT、即時）。
 // 閉じる：アイコンとポップアップ両方からの離脱（IDT_LIST_WATCH が監視。入力モード中は除く）・
-// アイコン左クリックのトグル・行クリックでチケットを開いたとき・入力モード中の Esc。
+// アイコン左クリックのトグル・行クリックでチケットを開いたとき・入力モード中の Esc と Alt+F4。
 // 起点によらず同一ルール。
 // 唯一の例外として、ホバー自動表示から hover_click_guard_ms 以内のアイコン左クリックは
 // 無視する。（詳細は handleTrayLeftClick を参照）
