@@ -51,7 +51,7 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
 
 - スレッド構成：メイン（メッセージループ・トレイ UI）／`pollThreadFunc`（HTTP・Toast・音・状態保存）／`soundThread`（WASAPI 再生）／`checkForUpdates`（起動時 1 回、シャットダウン時に join）／`registerIssueThreadFunc`（登録欄の送信 1 回ごとに起動、シャットダウン時に join）
 
-- 共有状態は `g_mtx`（`g_issues`・`g_pins`・`g_unreadIds`・`g_newIds`・`g_hiddenIds`・`g_latestVersion`）と atomic（`g_myUserId`・`g_assignedToMeOnly` など）で保護する  
+- 共有状態は `g_mtx`（`g_issues`・`g_pins`・`g_unreadIds`・`g_newIds`・`g_hiddenIds`・`g_priorityPositions`・`g_latestVersion`）と atomic（`g_myUserId`・`g_assignedToMeOnly` など）で保護する  
   `g_currentConfig` は起動時に 1 回設定した後は不変で、ロック無しで読み取る。
 
 - 永続化は `state.json`（検知済み）、`pins.json`（ピン留め）、`hidden.json`（非表示チケットの id 配列）で、書き出しは `atomicWriteJson`（tmp 経由の置換）  
@@ -112,6 +112,18 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   クエリ集合から外れた id はポーリング成功時に自動削除する。（`pruneHidden`）
   ピンと同じく list_limit の予算には数えない。（枠を消費させると未読の通常行を窓外へ押し出すため）
   ピンと違いフィルタの免除と個別取得の鮮度維持はしない。
+
+- 一覧の並び順は `g_listSort`（`ListSort` の 4 方式）で、トレイのサブメニュー「並び順」のラジオで選ぶ  
+  選んだ方式はレジストリ `ListSort` に永続化する。
+  旧トグルのレジストリ `SortByDue` は `ListSort` 不在時の移行読み込み専用で、0 以外なら期日順にする。`ListSort` の範囲外の値は更新日順にする。
+  更新日順は updated_on 降順（既定）。期日順は期日昇順、期日なしは末尾、同日は更新日時降順。
+  作成日順は created_on 降順、優先度順は順位降順で、どちらも同順位は期日順の規則で並べる。
+  優先度の順位は `/enumerations/issue_priorities.json` から取得して `g_priorityPositions` に置く。
+  （API は `position` を返さず配列が position 昇順のため添字 + 1 を順位にし、`position` があればその値を優先する）
+  取得は成功するまで毎回のポーリングで再試行し、成功後は再取得も永続化もしない。
+  順位表が未取得のときと順位表に無い id は priority id を順位にして縮退する。
+  `created_on`・`priority_id` は pins.json にも書き、集合外ピンも同じ規則で並べる。
+  旧形式の pins.json（両キーなし）のピンは次の `refreshPins` で実値になるまで作成日・優先度とも末尾側に並ぶ。
 
 - 一覧の太字は未読または期日ありの行（`issueRowBold`）  
   期日ありの太字は期日を常に目立たせる目的のため、既読化しても細字に戻らない。非表示行は期日があっても太字にしない。

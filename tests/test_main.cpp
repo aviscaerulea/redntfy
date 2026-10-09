@@ -820,6 +820,61 @@ static void testBuildListRowsRowMax() {
     g_currentConfig.listLimit = savedLimit;
 }
 
+// ==================== buildListRows（並び順） ====================
+
+// 4 方式の並べ替えとタイブレーク。優先度順は順位表の有無で経路が変わる
+static void testBuildListRowsSort() {
+    auto mk = [](int id, const char* updated, const char* created, const char* due, int prio) {
+        Issue is;
+        is.id = id; is.updatedOn = updated; is.createdOn = created; is.dueDate = due; is.priorityId = prio;
+        return is;
+    };
+    auto ids = [](const std::vector<ListRow>& rows) {
+        std::vector<int> v;
+        for (const auto& r : rows) v.push_back(r.id);
+        return v;
+    };
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_issues = {mk(1, "2026-08-03T00:00:00Z", "2026-07-01T00:00:00Z", "2026-09-10", 2),
+                    mk(2, "2026-08-01T00:00:00Z", "2026-07-03T00:00:00Z", "2026-09-05", 4),
+                    mk(3, "2026-08-02T00:00:00Z", "2026-07-03T00:00:00Z", "",           4),
+                    mk(4, "2026-08-04T00:00:00Z", "2026-07-02T00:00:00Z", "2026-09-01", 1)};
+        g_pins.clear(); g_unreadIds.clear(); g_hiddenIds.clear(); g_priorityPositions.clear();
+    }
+    int savedLimit = g_currentConfig.listLimit;
+    int savedSort  = g_listSort.load();
+    g_currentConfig.listLimit = 10;
+    g_excludeHidden.store(false);
+    int visible = 0;
+    using V = std::vector<int>;
+
+    g_listSort.store(static_cast<int>(ListSort::Updated));
+    CHECK((ids(buildListRows(visible)) == V{4, 1, 3, 2}));            // 更新日降順
+    g_listSort.store(99);
+    CHECK((ids(buildListRows(visible)) == V{4, 1, 3, 2}));            // 範囲外は更新日順
+    g_listSort.store(static_cast<int>(ListSort::Due));
+    CHECK((ids(buildListRows(visible)) == V{4, 2, 1, 3}));            // 期日昇順、期日なし末尾
+    g_listSort.store(static_cast<int>(ListSort::Created));
+    CHECK((ids(buildListRows(visible)) == V{2, 3, 4, 1}));            // 作成日降順。2・3 同日は期日順で 2 が先
+    g_listSort.store(static_cast<int>(ListSort::Priority));
+    CHECK((ids(buildListRows(visible)) == V{2, 3, 1, 4}));            // 順位表なし：priority id 降順、同順位は期日順
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_priorityPositions = {{1, 30}, {2, 20}};                   // id 4 は未知 → 順位 4 に縮退
+    }
+    CHECK((ids(buildListRows(visible)) == V{4, 1, 2, 3}));            // 順位表あり：30 > 20 > 4（2・3 は期日順）
+
+    // 後始末（他テストへの影響防止）
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_issues.clear();
+        g_priorityPositions.clear();
+    }
+    g_listSort.store(savedSort);
+    g_currentConfig.listLimit = savedLimit;
+}
+
 // 最終 journal と updated_on の突き合わせ（journal を伴わない更新の検出）
 static void testJournalMatchesUpdate() {
     CHECK(isoUtcToEpoch("1970-01-01T00:00:00Z") == 0);
@@ -920,6 +975,7 @@ int main() {
     testSelectNotifyTargets();
     testBuildListRowsHidden();
     testBuildListRowsRowMax();
+    testBuildListRowsSort();
     testRoundToDivisorOf60();
     testJournalMatchesUpdate();
     testAlignTowardCenter();

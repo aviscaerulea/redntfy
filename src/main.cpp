@@ -167,12 +167,18 @@ static constexpr UINT IDM_OPEN_QUERY          = 40009; // Redmine の代表画�
 static constexpr UINT IDM_STARTUP             = 40010; // Windows スタートアップ登録トグル
 static constexpr UINT IDM_ASSIGNED_TO_ME      = 40011; // 担当が自分個人以外（グループ・他ユーザ・未割当）のチケットを一覧・tooltip・通知から除外するトグル
 static constexpr UINT IDM_UPDATE_NOW          = 40012; // 休止時間帯・クールダウンを無視した即時ポーリング
-static constexpr UINT IDM_SORT_BY_DUE         = 40013; // 一覧を期日昇順に並べるトグル
+// 40013（旧 IDM_SORT_BY_DUE）は欠番。並び順はサブメニュー「並び順」のラジオ 4 択へ移行した
 static constexpr UINT IDM_EXCLUDE_NO_VERSION  = 40014; // バージョン未指定を一覧・tooltip・通知から除外するトグル（期日ありは例外的に残す）
 static constexpr UINT IDM_MUTE_OWN_CHANGES    = 40015; // 自分の操作による起票・更新を通知抑止するトグル（一覧・tooltip は変更しない）
 static constexpr UINT IDM_OPEN_GUIDE          = 40016; // セットアップガイド（GitHub Pages）を開く
 static constexpr UINT IDM_EXCLUDE_HIDDEN      = 40017; // 非表示チケットを一覧から除外するトグル（OFF はグレー＋取消線で表示）
 static constexpr UINT IDM_HOVER_POPUP         = 40018; // ホバーで一覧を自動表示するトグル（OFF でも左クリックでは開ける）
+// 一覧の並び順（サブメニュー「並び順」のラジオ項目。ListSort の値順に連番で、
+// CheckMenuRadioItem の範囲指定と IDM_SORT_UPDATED + 値 の対応に依存する）
+static constexpr UINT IDM_SORT_UPDATED        = 40019; // 更新日順（既定。updated_on 降順）
+static constexpr UINT IDM_SORT_DUE            = 40020; // 期日順（昇順、期日なしは末尾）
+static constexpr UINT IDM_SORT_CREATED        = 40021; // 作成日順（created_on 降順、同順位は期日順）
+static constexpr UINT IDM_SORT_PRIORITY       = 40022; // 優先度順（高→低、同順位は期日順）
 
 static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/redntfy";
 // セットアップガイド（GitHub Pages。docs/ 配下の内容が公開される）
@@ -255,8 +261,13 @@ static std::atomic<bool> g_muteInMeeting{true};
 // 対価として、ON 中に抑止した更新は state.json に記録済みのため OFF に戻しても再通知されない。
 static std::atomic<bool> g_assignedToMeOnly{false};
 
-// 一覧を期日昇順に並べるトグル（レジストリ永続化。OFF は更新日時降順）
-static std::atomic<bool> g_sortByDue{false};
+// 一覧の並び順（トレイメニュー「並び順」のラジオ 4 択。レジストリ ListSort で永続化）
+// 値は IDM_SORT_* の連番と CheckMenuRadioItem の対応に使うため、0 から欠番なく振る。
+enum class ListSort { Updated = 0, Due = 1, Created = 2, Priority = 3 };
+// 現在の並び順（ListSort の整数値。範囲外は buildListRows が Updated として扱う）
+// 期日順のタイブレークは期日昇順・期日なし末尾・同日は更新日時降順。作成日順と優先度順の
+// 同順位はこの期日順規則で安定させる。
+static std::atomic<int> g_listSort{static_cast<int>(ListSort::Updated)};
 
 // バージョン未指定のチケットを一覧・tooltip・通知から除外するトグル（レジストリ永続化）
 // 期日が設定されているチケットは「時限のある未来課題」として、バージョン未指定でも残す。
@@ -386,6 +397,8 @@ struct Issue {
                                    // 一致するかを見るだけでグループ担当を弾ける。型の判別は不要。
     bool        closed    = false; // status.is_closed（一覧で打ち消し線表示）
     std::string dueDate;           // due_date（"YYYY-MM-DD"、期限なしは空。一覧の日付表示に使う）
+    std::string createdOn;         // created_on（UTC ISO 8601。作成日順の並べ替え専用。辞書順比較可）
+    int         priorityId = 0;    // priority.id（優先度順の並べ替え専用。0 = 不明）
     std::vector<int> queryIds;     // このチケットが現れた保存クエリ id（昇順）。クエリ流入の検知に使う
     bool assignedToGroup = false;  // 担当がグループ（一覧の 👥 マーカー。取得後にグループ id 集合と突合して設定）
     bool isBugTracker    = false;  // トラッカーが bug_trackers に一致（一覧の 💥 マーカー。パース時に判定）
@@ -413,6 +426,8 @@ struct PinEntry {
     std::string updatedOn;
     bool        closed = false;
     std::string dueDate;           // due_date（"YYYY-MM-DD"、期限なしは空。一覧の日付表示に使う）
+    std::string createdOn;         // created_on（作成日順の並べ替え用。集合外ピンも並べられるよう永続化）
+    int         priorityId = 0;    // priority.id（優先度順の並べ替え用。同上）
     bool assignedToGroup = false;  // 担当がグループ（👥 マーカー。集合外ピンも表示できるよう永続化）
     bool isBugTracker    = false;  // バグ・障害トラッカー（💥 マーカー。集合外ピンも表示できるよう永続化）
     std::string updaterDisplay;    // 最終更新者の表示名（姓。集合外ピンも表示できるよう永続化）
@@ -507,6 +522,11 @@ static WavCache g_wavCache;
 static std::mutex              g_mtx;
 static std::vector<Issue>      g_issues;   // updated_on 降順ソート済み
 static std::vector<PinEntry>   g_pins;     // ピン留め（g_mtx で保護。上限なし）
+// 優先度 id → 順位（g_mtx で保護。大きいほど高優先。buildListRows が優先度順の並べ替えに読む）
+// ポーリングスレッドが resolvePollMetadata で /enumerations/issue_priorities.json から
+// セッション 1 回だけ確定してコピーする。空（未取得）や未知 id は priority id を順位に使って縮退する。
+// 永続化しない。（Redmine 側の順位変更は再起動で追従する）
+static std::unordered_map<int, int> g_priorityPositions;
 
 // 起動設定（wmain で loadConfig 直後・スレッド起動前に 1 回だけ設定し、以降は不変。
 // ホットリロードしないため、スレッド起動後は全スレッドからロック無しで読み取ってよい）
@@ -1287,6 +1307,8 @@ static void savePins(const std::wstring& dir) {
                 o.Insert(L"updated_on", JsonValue::CreateStringValue(winrt::to_hstring(p.updatedOn)));
                 o.Insert(L"closed",     JsonValue::CreateBooleanValue(p.closed));
                 o.Insert(L"due_date",   JsonValue::CreateStringValue(winrt::to_hstring(p.dueDate)));
+                o.Insert(L"created_on", JsonValue::CreateStringValue(winrt::to_hstring(p.createdOn)));
+                o.Insert(L"priority_id", JsonValue::CreateNumberValue(p.priorityId));
                 o.Insert(L"assigned_to_group", JsonValue::CreateBooleanValue(p.assignedToGroup));
                 o.Insert(L"bug_tracker", JsonValue::CreateBooleanValue(p.isBugTracker));
                 o.Insert(L"updater",    JsonValue::CreateStringValue(winrt::to_hstring(p.updaterDisplay)));
@@ -1332,6 +1354,8 @@ static void loadPins(const std::wstring& dir) {
             p.closed    = o.GetNamedBoolean(L"closed", false);
             // 旧形式（キーなし）は既定値で開始し、次のポーリングの refreshPins で実値になる
             p.dueDate   = winrt::to_string(o.GetNamedString(L"due_date", L""));
+            p.createdOn  = winrt::to_string(o.GetNamedString(L"created_on", L""));
+            p.priorityId = static_cast<int>(o.GetNamedNumber(L"priority_id", 0));
             p.projectName     = normalizeSpaces(winrt::to_string(o.GetNamedString(L"project", L"")));
             p.assignedToGroup = o.GetNamedBoolean(L"assigned_to_group", false);
             p.isBugTracker    = o.GetNamedBoolean(L"bug_tracker", false);
@@ -1817,6 +1841,13 @@ static Issue parseIssueObject(const Config& cfg,
         auto v = obj.GetNamedValue(L"due_date", nullptr);
         if (v && v.ValueType() == JsonValueType::String) is.dueDate = winrt::to_string(v.GetString());
     }
+    // created_on は作成日順の並べ替え専用。updated_on と同じ UTC ISO 8601 で辞書順比較できる
+    is.createdOn = winrt::to_string(obj.GetNamedString(L"created_on", L""));
+    // priority は include 指定なしで常に含まれる。id だけを優先度順の順位解決に使う
+    if (obj.HasKey(L"priority")) {
+        auto pr = obj.GetNamedObject(L"priority", nullptr);
+        if (pr) is.priorityId = static_cast<int>(pr.GetNamedNumber(L"id", 0));
+    }
     return is;
 }
 
@@ -1938,6 +1969,38 @@ static bool fetchVersionedTrackerIds(const Config& cfg,
     }
     catch (...) {
         writeLog("fetchVersionedTrackerIds: unexpected JSON structure");
+        return false;
+    }
+}
+
+// /enumerations/issue_priorities.json から優先度 id → 順位（大きいほど高優先）を取得する
+//
+// 戻り値 true = 取得成功（結果を out に確定）。false = 接続失敗・構造不一致（呼び出し側が再試行）。
+// Redmine の本 API は position を返さないが、配列は position 昇順（低→高）で並ぶため、
+// 添字 + 1 を順位にする。将来 position が返る版に備え、キーがあればその値を優先する。
+// 項目 0 件でも成功扱い。（縮退は buildListRows 側が priority id で行う）admin 権限は不要。
+static bool fetchPriorityPositions(const Config& cfg, std::unordered_map<int, int>& out) {
+    auto obj = redmineGetJson(cfg, cfg.redmineUrl + L"/enumerations/issue_priorities.json",
+                              "fetchPriorityPositions");
+    if (!obj) return false;
+    try {
+        std::unordered_map<int, int> positions;
+        if (obj.HasKey(L"issue_priorities")) {
+            int index = 0;
+            for (auto v : obj.GetNamedArray(L"issue_priorities")) {
+                auto p = v.GetObject();
+                ++index;
+                int id = static_cast<int>(p.GetNamedNumber(L"id", 0));
+                if (id <= 0) continue;
+                positions[id] = p.HasKey(L"position")
+                    ? static_cast<int>(p.GetNamedNumber(L"position", index)) : index;
+            }
+        }
+        out = std::move(positions);
+        return true;
+    }
+    catch (...) {
+        writeLog("fetchPriorityPositions: unexpected JSON structure");
         return false;
     }
 }
@@ -2390,7 +2453,8 @@ static constexpr const wchar_t* REG_KEY_PATH        = L"SOFTWARE\\redntfy";
 static constexpr const wchar_t* REG_SOUND_ENABLED     = L"SoundEnabled";
 static constexpr const wchar_t* REG_MUTE_IN_MEETING   = L"MuteInMeeting";
 static constexpr const wchar_t* REG_ASSIGNED_TO_ME    = L"AssignedToMeOnly";
-static constexpr const wchar_t* REG_SORT_BY_DUE       = L"SortByDue";
+static constexpr const wchar_t* REG_LIST_SORT         = L"ListSort";   // 一覧の並び順（ListSort の値）
+static constexpr const wchar_t* REG_SORT_BY_DUE       = L"SortByDue";  // 旧トグル。ListSort 不在時の移行読み込み専用で書き込まない
 static constexpr const wchar_t* REG_EXCLUDE_NO_VERSION = L"ExcludeNoVersion";
 static constexpr const wchar_t* REG_MUTE_OWN_CHANGES  = L"MuteOwnChanges";
 static constexpr const wchar_t* REG_EXCLUDE_HIDDEN    = L"ExcludeHidden";
@@ -3435,6 +3499,8 @@ struct ListRow {
     std::string updaterFirst;         // 最終更新者の名（{firstname}。未取得は空）
     std::string dueDate;              // "YYYY-MM-DD"（期日なしは空）
     std::string updatedOn;
+    std::string createdOn;            // created_on（作成日順の並べ替え用。未取得は空で末尾側へ）
+    int         priorityRank = 0;     // 優先度の順位（大きいほど高優先。順位表に無ければ priority id）
     bool        assignedToGroup = false;
     bool        isBugTracker    = false;
     bool        pinned          = false;
@@ -3449,8 +3515,10 @@ struct ListRow {
 //   1. g_issues から表示フィルタ（担当者フィルタ AND バージョンフィルタ）を通った行をすべて採る
 //      （フィルタで外れてもピン留め済みなら残す。ピンはすべてのフィルタより優先する）
 //   2. 1 に含まれないピンを追加する（保存クエリの集合外ピンはキャッシュ内容で表示）
-//   3. 全体を並べ替える（既定は updated_on 降順。「期日順に並べる」ON なら期日昇順で
-//      期日なしは末尾。ピンも同じ規則で本来の位置に置く）
+//   3. 全体を g_listSort の方式で並べ替える（ピンも同じ規則で本来の位置に置く）
+//      更新日順：updated_on 降順（既定）／期日順：期日昇順、期日なし末尾、同日は更新日時降順／
+//      作成日順：created_on 降順、同順位は期日順の規則／優先度順：順位降順、同順位は期日順の規則。
+//      優先度の順位は g_priorityPositions（未取得・未知 id は priority id で縮退）
 //   4. 先頭 list_limit 件へ絞る（ピン留めと非表示チケットは上限適用外で常に残す）
 //   5. 全体を LIST_ROW_MAX 件へ打ち切る（ピン・非表示も含めた行数上限。超過分は
 //      非表示行 → ピン行 → 通常行の順に、各種別の末尾から落とす）
@@ -3471,6 +3539,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
     std::unordered_set<int> unread;
     std::unordered_set<int> newIds;
     std::unordered_set<int> hiddenIds;
+    std::unordered_map<int, int> priorityPositions;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         issues    = g_issues;
@@ -3478,7 +3547,13 @@ static std::vector<ListRow> buildListRows(int& visible) {
         unread    = g_unreadIds;
         newIds    = g_newIds;
         hiddenIds = g_hiddenIds;
+        priorityPositions = g_priorityPositions;
     }
+    // 優先度の順位。順位表に無い id（未取得・未知）は id そのものを順位にして縮退する
+    auto rankOf = [&priorityPositions](int priorityId) {
+        auto it = priorityPositions.find(priorityId);
+        return it != priorityPositions.end() ? it->second : priorityId;
+    };
 
     auto isPinned = [&pins](int id) {
         for (const auto& p : pins) {
@@ -3508,7 +3583,9 @@ static std::vector<ListRow> buildListRows(int& visible) {
         rows.push_back({.id = is.id, .subject = is.subject, .projectName = is.projectName,
                         .updater = is.updaterDisplay, .updaterFirst = is.updaterFirstName,
                         .dueDate = is.dueDate,
-                        .updatedOn = is.updatedOn, .assignedToGroup = is.assignedToGroup,
+                        .updatedOn = is.updatedOn, .createdOn = is.createdOn,
+                        .priorityRank = rankOf(is.priorityId),
+                        .assignedToGroup = is.assignedToGroup,
                         .isBugTracker = is.isBugTracker,
                         .pinned = pinned, .hidden = hidden, .closed = is.closed,
                         .unread = !hidden && unread.count(is.id) != 0,
@@ -3520,30 +3597,47 @@ static std::vector<ListRow> buildListRows(int& visible) {
         rows.push_back({.id = p.id, .subject = p.subject, .projectName = p.projectName,
                         .updater = p.updaterDisplay, .updaterFirst = p.updaterFirst,
                         .dueDate = p.dueDate,
-                        .updatedOn = p.updatedOn, .assignedToGroup = p.assignedToGroup,
+                        .updatedOn = p.updatedOn, .createdOn = p.createdOn,
+                        .priorityRank = rankOf(p.priorityId),
+                        .assignedToGroup = p.assignedToGroup,
                         .isBugTracker = p.isBugTracker,
                         .pinned = true, .closed = p.closed,
                         .unread = unread.count(p.id) != 0,
                         .isNew = newIds.count(p.id) != 0});
     }
 
-    if (g_sortByDue.load()) {
-        // 期日は ISO 形式のため文字列辞書順で昇順に比較できる。期日なしは末尾へ回し、
-        // 同順位は更新日時降順で安定させる
-        std::sort(rows.begin(), rows.end(), [](const ListRow& a, const ListRow& b) {
-            bool aNone = a.dueDate.empty(), bNone = b.dueDate.empty();
-            if (aNone != bNone) return bNone;
-            if (a.dueDate != b.dueDate) return a.dueDate < b.dueDate;
-            return a.updatedOn > b.updatedOn;
+    // 期日順の比較規則。期日は ISO 形式のため文字列辞書順で昇順に比較でき、期日なしは末尾、
+    // 同日は更新日時降順で安定させる。作成日順・優先度順の同順位もこの規則で揃える
+    auto dueLess = [](const ListRow& a, const ListRow& b) {
+        bool aNone = a.dueDate.empty(), bNone = b.dueDate.empty();
+        if (aNone != bNone) return bNone;
+        if (a.dueDate != b.dueDate) return a.dueDate < b.dueDate;
+        return a.updatedOn > b.updatedOn;
+    };
+    switch (static_cast<ListSort>(g_listSort.load())) {
+    case ListSort::Due:
+        std::sort(rows.begin(), rows.end(), dueLess);
+        break;
+    case ListSort::Created:
+        std::sort(rows.begin(), rows.end(), [&dueLess](const ListRow& a, const ListRow& b) {
+            if (a.createdOn != b.createdOn) return a.createdOn > b.createdOn;
+            return dueLess(a, b);
         });
-    }
-    else {
+        break;
+    case ListSort::Priority:
+        std::sort(rows.begin(), rows.end(), [&dueLess](const ListRow& a, const ListRow& b) {
+            if (a.priorityRank != b.priorityRank) return a.priorityRank > b.priorityRank;
+            return dueLess(a, b);
+        });
+        break;
+    default:  // Updated と範囲外
         std::sort(rows.begin(), rows.end(),
             [](const ListRow& a, const ListRow& b) { return a.updatedOn > b.updatedOn; });
+        break;
     }
 
     // 並べ替えの後に list_limit 件へ絞る。（ピン留めは上限適用外で常に残す）
-    // 絞り込みを並べ替えの前に行うと、期日順 ON のとき「更新は古いが期日が近い」チケットが
+    // 絞り込みを並べ替えの前に行うと、更新日順以外のとき「更新は古いが期日が近い」チケットが
     // 更新日時降順の窓から落ちて一覧に出ない。
     size_t limit = static_cast<size_t>(g_currentConfig.listLimit);
     if (rows.size() > limit) {
@@ -3569,8 +3663,8 @@ static std::vector<ListRow> buildListRows(int& visible) {
     // 超過分は非表示行 → ピン行 → 通常行の順に落とし、各種別とも並べ替え順の末尾から落とす。
     // （list_limit の予算外にした非表示・ピンが、予算内の未読通常行を押し出さないため。
     // 通常行が落ちるのは非表示とピンをすべて落としてもまだ超過するときだけ）
-    // 末尾から落とすため、更新日時降順なら更新の古い行、期日順なら期日の遠い行と
-    // 期日なしの行から落ちる。残す行の並び順は変えない。
+    // 末尾から落とすため、更新日順なら更新の古い行、期日順なら期日の遠い行と期日なしの行、
+    // 作成日順・優先度順なら作成の古い行・優先度の低い行から落ちる。残す行の並び順は変えない。
     if (rows.size() > LIST_ROW_MAX) {
         size_t excess = rows.size() - LIST_ROW_MAX;
         auto dropFromTail = [&rows, &excess](auto pred) {
@@ -4284,9 +4378,20 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_STRING | (g_muteOwnChanges ? MF_CHECKED : MF_UNCHECKED),
         IDM_MUTE_OWN_CHANGES, L"自分の操作による更新を通知しない");
 
-    // 一覧の並び順トグル（レジストリ永続化。ON で期日昇順、期日なしは末尾）
-    AppendMenuW(hMenu, MF_STRING | (g_sortByDue ? MF_CHECKED : MF_UNCHECKED),
-        IDM_SORT_BY_DUE, L"期日順に並べる");
+    // 一覧の並び順（サブメニューのラジオ 4 択。レジストリ永続化。既定は更新日順）
+    // 子メニューは MF_POPUP で親に預けるため、親の DestroyMenu が一緒に破棄する
+    HMENU hSort = CreatePopupMenu();
+    if (hSort) {
+        AppendMenuW(hSort, MF_STRING, IDM_SORT_UPDATED,  L"更新日順");
+        AppendMenuW(hSort, MF_STRING, IDM_SORT_DUE,      L"期日順");
+        AppendMenuW(hSort, MF_STRING, IDM_SORT_CREATED,  L"作成日順");
+        AppendMenuW(hSort, MF_STRING, IDM_SORT_PRIORITY, L"優先度順");
+        int sort = g_listSort.load();
+        if (sort < 0 || sort > static_cast<int>(ListSort::Priority)) sort = 0;
+        CheckMenuRadioItem(hSort, IDM_SORT_UPDATED, IDM_SORT_PRIORITY,
+                           IDM_SORT_UPDATED + static_cast<UINT>(sort), MF_BYCOMMAND);
+        AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hSort), L"並び順");
+    }
 
     // 音声通知（親：レジストリ永続化）
     AppendMenuW(hMenu, MF_STRING | (g_soundEnabled ? MF_CHECKED : MF_UNCHECKED),
@@ -4408,9 +4513,10 @@ static void handleTrayCommand(UINT id) {
         g_manualPoll.store(true);
         return;
     }
-    if (id == IDM_SORT_BY_DUE) {
-        g_sortByDue.store(!g_sortByDue.load());
-        writeRegDword(REG_SORT_BY_DUE, g_sortByDue.load() ? 1u : 0u);
+    if (id >= IDM_SORT_UPDATED && id <= IDM_SORT_PRIORITY) {
+        // ラジオ項目の id は ListSort の値と連番で対応する
+        g_listSort.store(static_cast<int>(id - IDM_SORT_UPDATED));
+        writeRegDword(REG_LIST_SORT, id - IDM_SORT_UPDATED);
         // 並べ替えで list_limit の窓に入る行が入れ替わり未読件数が変わるため、
         // 他のフィルタ系トグルと同じくバッジを即時更新する。（一覧は次に開いた時点で組み直される）
         if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
@@ -5644,6 +5750,8 @@ static void cycleIssueState(size_t itemIndex) {
             p.updatedOn       = cur->updatedOn;
             p.closed          = cur->closed;
             p.dueDate         = cur->dueDate;
+            p.createdOn       = cur->createdOn;
+            p.priorityId      = cur->priorityId;
             p.assignedToGroup = cur->assignedToGroup;
             p.isBugTracker    = cur->isBugTracker;
             p.updaterDisplay  = cur->updaterDisplay;
@@ -6007,6 +6115,9 @@ static void refreshPins(const std::wstring& dataDir, const Config& cfg,
         candidate.updatedOn   = src->updatedOn;
         candidate.closed      = src->closed;
         candidate.dueDate     = src->dueDate;
+        // 作成日と優先度は取得集合・個別取得のどちらにも常に含まれる。（未解決状態なし）
+        candidate.createdOn   = src->createdOn;
+        candidate.priorityId  = src->priorityId;
         // トラッカー判定は設定との照合だけで決まり、グループ判定のような未解決状態がない
         candidate.isBugTracker = src->isBugTracker;
         // 判定集合が未解決の間はグループフラグを書き込まない。空集合との突合結果（全 false）で
@@ -6376,6 +6487,11 @@ struct PollSession {
     std::optional<std::unordered_set<int>> versionedTrackers;
     bool versionedTrackersResolved = false;
 
+    // 優先度 id → 順位（fetchPriorityPositions が設定。確定時に g_priorityPositions へコピーする）
+    // セッション中 1 回だけ取得し、再取得はしない。失敗分は次回ポーリングで再試行する
+    std::unordered_map<int, int> priorityPositions;
+    bool priorityPositionsResolved = false;
+
     // プロジェクト id → バージョン定義有無のセッション内キャッシュ（projectHasAnyVersion が使う）
     std::unordered_map<int, bool> projectHasVersions;
 
@@ -6384,7 +6500,7 @@ struct PollSession {
     ULONGLONG versionMetaFetchTick = 0;
 };
 
-// ポーリングの判定材料（user id・グループ集合・登録先の自動判定・バージョン欄情報）を確定・更新する
+// ポーリングの判定材料（user id・グループ集合・登録先の自動判定・バージョン欄情報・優先度順位）を確定・更新する
 // 未確定分の取得を毎周回試み、失敗分は次回ポーリングで再試行する。HTTP を伴うため、
 // 呼び出し側は休止時間帯の判定より後に呼ぶこと。（休止中はネットワークに触れない）
 // manualTriggered はバージョン欄情報のキャッシュ破棄条件。（「今すぐ更新」で強制再取得）
@@ -6465,6 +6581,19 @@ static void resolvePollMetadata(const Config& cfg, PollSession& s, bool manualTr
             writeLog(s.versionedTrackers
                 ? "versioned trackers: " + std::to_string(s.versionedTrackers->size())
                 : "versioned trackers: not supported (treat all as versioned)");
+        }
+    }
+
+    // 優先度順の順位表を確定する（セッション 1 回。接続エラーは次回ポーリングで再試行）
+    // 未確定の間は buildListRows が priority id を順位にして縮退する
+    if (!s.priorityPositionsResolved) {
+        if (fetchPriorityPositions(cfg, s.priorityPositions)) {
+            s.priorityPositionsResolved = true;
+            {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                g_priorityPositions = s.priorityPositions;
+            }
+            writeLog("priority positions: " + std::to_string(s.priorityPositions.size()));
         }
     }
 }
@@ -6807,7 +6936,17 @@ int wmain() {
         g_soundEnabled  = readRegDword(REG_SOUND_ENABLED, 1u) != 0;
         g_muteInMeeting = readRegDword(REG_MUTE_IN_MEETING, 1u) != 0;
         g_assignedToMeOnly = readRegDword(REG_ASSIGNED_TO_ME, 0u) != 0;
-        g_sortByDue        = readRegDword(REG_SORT_BY_DUE, 0u) != 0;
+        // 並び順は ListSort を読み、無ければ旧 SortByDue（1 = 期日順）から移行する。範囲外は更新日順
+        {
+            constexpr DWORD kUnset = 0xFFFFFFFFu;
+            DWORD sort = readRegDword(REG_LIST_SORT, kUnset);
+            if (sort == kUnset) {
+                sort = readRegDword(REG_SORT_BY_DUE, 0u) != 0
+                    ? static_cast<DWORD>(ListSort::Due) : static_cast<DWORD>(ListSort::Updated);
+            }
+            if (sort > static_cast<DWORD>(ListSort::Priority)) sort = static_cast<DWORD>(ListSort::Updated);
+            g_listSort = static_cast<int>(sort);
+        }
         g_excludeNoVersion = readRegDword(REG_EXCLUDE_NO_VERSION, 0u) != 0;
         g_muteOwnChanges   = readRegDword(REG_MUTE_OWN_CHANGES, 1u) != 0;
         g_excludeHidden    = readRegDword(REG_EXCLUDE_HIDDEN, 0u) != 0;
