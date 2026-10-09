@@ -522,10 +522,22 @@ static WavCache g_wavCache;
 static std::mutex              g_mtx;
 static std::vector<Issue>      g_issues;   // updated_on 降順ソート済み
 static std::vector<PinEntry>   g_pins;     // ピン留め（g_mtx で保護。上限なし）
-// 優先度 id → 順位（g_mtx で保護。大きいほど高優先。buildListRows が優先度順の並べ替えに読む）
+// Redmine の優先度 1 件分（/enumerations/issue_priorities.json の 1 要素）
+struct PriorityEntry {
+    int         id = 0;
+    std::string name;             // 登録欄の優先度コンボの表示名
+    int         position = 0;     // 順位（大きいほど高優先。API が position を返さないため配列の添字 + 1）
+    bool        isDefault = false; // is_default（登録欄の既定選択）
+    bool        active = true;     // active（false は新規登録に選べない。並べ替えの順位表には残す）
+};
+// 登録に選べる優先度の一覧（g_mtx で保護。active のみ、順位昇順＝低→高。登録欄の優先度コンボの選択肢になる）
 // ポーリングスレッドが resolvePollMetadata で /enumerations/issue_priorities.json から
-// セッション 1 回だけ確定してコピーする。空（未取得）や未知 id は priority id を順位に使って縮退する。
-// 永続化しない。（Redmine 側の順位変更は再起動で追従する）
+// セッション 1 回だけ確定してコピーする。空 = 未取得または有効な優先度なしで、登録欄は優先度コンボを隠して
+// priority_id を送らない。（Redmine の既定に任せる）永続化しない。（Redmine 側の変更は再起動で追従する）
+static std::vector<PriorityEntry> g_priorities;
+// 優先度 id → 順位（g_mtx で保護。g_priorities と同時に確定する。buildListRows が優先度順の並べ替えに読む）
+// 無効化済み（active = false）の優先度も含める。（その優先度を持つ既存チケットを正しい順位で並べるため）
+// 空（未取得）や未知 id は priority id を順位に使って縮退する。
 static std::unordered_map<int, int> g_priorityPositions;
 
 // 起動設定（wmain で loadConfig 直後・スレッド起動前に 1 回だけ設定し、以降は不変。
@@ -1973,34 +1985,40 @@ static bool fetchVersionedTrackerIds(const Config& cfg,
     }
 }
 
-// /enumerations/issue_priorities.json から優先度 id → 順位（大きいほど高優先）を取得する
+// /enumerations/issue_priorities.json から優先度の一覧（順位昇順＝低→高）を取得する
 //
 // 戻り値 true = 取得成功（結果を out に確定）。false = 接続失敗・構造不一致（呼び出し側が再試行）。
 // Redmine の本 API は position を返さないが、配列は position 昇順（低→高）で並ぶため、
 // 添字 + 1 を順位にする。将来 position が返る版に備え、キーがあればその値を優先する。
-// 項目 0 件でも成功扱い。（縮退は buildListRows 側が priority id で行う）admin 権限は不要。
-static bool fetchPriorityPositions(const Config& cfg, std::unordered_map<int, int>& out) {
+// active が false の項目も採る。（呼び出し側が順位表には残し、登録の選択肢からは外す）
+// 項目 0 件でも成功扱い。（縮退は呼び出し側が担う）admin 権限は不要。
+static bool fetchPriorities(const Config& cfg, std::vector<PriorityEntry>& out) {
     auto obj = redmineGetJson(cfg, cfg.redmineUrl + L"/enumerations/issue_priorities.json",
-                              "fetchPriorityPositions");
+                              "fetchPriorities");
     if (!obj) return false;
     try {
-        std::unordered_map<int, int> positions;
+        std::vector<PriorityEntry> list;
         if (obj.HasKey(L"issue_priorities")) {
             int index = 0;
             for (auto v : obj.GetNamedArray(L"issue_priorities")) {
                 auto p = v.GetObject();
                 ++index;
-                int id = static_cast<int>(p.GetNamedNumber(L"id", 0));
-                if (id <= 0) continue;
-                positions[id] = p.HasKey(L"position")
+                PriorityEntry e;
+                e.id = static_cast<int>(p.GetNamedNumber(L"id", 0));
+                if (e.id <= 0) continue;
+                e.active    = p.GetNamedBoolean(L"active", true);
+                e.name      = normalizeSpaces(winrt::to_string(p.GetNamedString(L"name", L"")));
+                e.position  = p.HasKey(L"position")
                     ? static_cast<int>(p.GetNamedNumber(L"position", index)) : index;
+                e.isDefault = p.GetNamedBoolean(L"is_default", false);
+                list.push_back(std::move(e));
             }
         }
-        out = std::move(positions);
+        out = std::move(list);
         return true;
     }
     catch (...) {
-        writeLog("fetchPriorityPositions: unexpected JSON structure");
+        writeLog("fetchPriorities: unexpected JSON structure");
         return false;
     }
 }
@@ -4834,9 +4852,11 @@ static void drawIssueRow(HDC hdc, const RECT& rcItem, const IssueItem& item, boo
 }
 
 // ==================== 一覧の登録欄 ====================
-// 登録先の確定時に一覧の末尾へ置く「件名 Edit・期日 DTP・登録ボタン」の簡易チケット登録。
+// 登録先の確定時に一覧の末尾へ置く「件名 Edit・優先度コンボ・期日 DTP・登録ボタン」の簡易チケット登録。
 // 登録先は register_project の明示値、未設定ならログイン名と同じ識別子の実在プロジェクト。
-// 送信は POST /issues.json で、担当は自分、トラッカー・ステータス・優先度はプロジェクト既定に任せる。
+// 送信は POST /issues.json で、担当は自分、トラッカー・ステータスはプロジェクト既定に任せる。
+// 優先度は g_priorities（取得済みのとき）から選び、既定は is_default の項目。未取得の間はコンボを隠して
+// priority_id を送らず Redmine の既定に任せる。（接続不可でも登録操作は止めない）
 // 送信は専用スレッド（registerIssueThreadFunc）で行い、完了を WM_REGISTER_DONE でメインへ返す。
 
 // 件名の最小文字数（前後の空白を除いた文字数。空白だけ・短すぎる件名の誤登録を防ぐ）
@@ -4903,13 +4923,16 @@ static std::string ymdToIsoDate(int ymd) {
 
 // チケット作成 API（POST /issues.json）の要求本文
 // project は識別子または数値 id の文字列、dueIso は "YYYY-MM-DD"、assigneeId は担当者（自分）の user id。
+// priorityId は 0 なら送らない。（優先度一覧が未取得のとき。Redmine の既定に任せる）
 // tracker_id は送らない。（プロジェクトで有効な先頭のトラッカー＝プロジェクト既定に任せる）
 static std::string buildIssueCreateBody(const std::wstring& project, const std::wstring& subject,
-                                        const std::string& dueIso, int assigneeId) {
-    return "{\"issue\":{\"project_id\":\"" + jsonEscape(wideToUtf8(project))
+                                        const std::string& dueIso, int assigneeId, int priorityId) {
+    std::string body = "{\"issue\":{\"project_id\":\"" + jsonEscape(wideToUtf8(project))
         + "\",\"subject\":\"" + jsonEscape(wideToUtf8(subject))
         + "\",\"due_date\":\"" + jsonEscape(dueIso)
-        + "\",\"assigned_to_id\":" + std::to_string(assigneeId) + "}}";
+        + "\",\"assigned_to_id\":" + std::to_string(assigneeId);
+    if (priorityId > 0) body += ",\"priority_id\":" + std::to_string(priorityId);
+    return body + "}}";
 }
 
 // ログイン名から登録先プロジェクトの識別子を作る（register_project 未設定時の自動判定）
@@ -4940,11 +4963,16 @@ static std::wstring currentRegisterProject() {
 }
 
 // 登録欄の子コントロール（登録先の確定後に showListPopup が生成する。未生成なら nullptr）
-static HWND g_regEdit   = nullptr;   // 件名
-static HWND g_regDate   = nullptr;   // 期日（DateTimePicker）
-static HWND g_regButton = nullptr;   // 登録ボタン（id = IDOK。Enter と同じ WM_COMMAND 経路にする）
-static constexpr int IDC_REG_EDIT = 101;
-static constexpr int IDC_REG_DATE = 102;
+static HWND g_regEdit     = nullptr; // 件名
+static HWND g_regPriority = nullptr; // 優先度（ComboBox、ドロップダウンリスト。g_priorities が空の間は非表示）
+static HWND g_regDate     = nullptr; // 期日（DateTimePicker）
+static HWND g_regButton   = nullptr; // 登録ボタン（id = IDOK。Enter と同じ WM_COMMAND 経路にする）
+static constexpr int IDC_REG_EDIT     = 101;
+static constexpr int IDC_REG_DATE     = 102;
+static constexpr int IDC_REG_PRIORITY = 103;
+// 優先度コンボに入れた優先度 id（表示順。空 = 未投入で非表示）。g_priorities との差分検知と、
+// 選択項目から id を引くのに使う。（メインスレッド専用）
+static std::vector<int> g_regPriorityIds;
 static bool g_registerBusy = false;  // 登録要求の送信中（メインスレッド専用。完了通知で戻す）
 // 登録要求の送信スレッド。WM_REGISTER_DONE を投函し得るため、wmain の終了処理で
 // DestroyWindow より前に join する。（joinable のまま静的破棄すると std::terminate になる）
@@ -4959,6 +4987,58 @@ static void resetRegisterDate() {
     st.wMonth = static_cast<WORD>(ymd / 100 % 100);
     st.wDay   = static_cast<WORD>(ymd % 100);
     DateTime_SetSystemtime(g_regDate, GDT_VALID, &st);
+}
+
+// 優先度コンボの選択を既定（is_default の項目。無ければ先頭）に戻す
+static void resetRegisterPriority() {
+    if (!g_regPriority || g_regPriorityIds.empty()) return;
+    std::vector<PriorityEntry> list;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        list = g_priorities;
+    }
+    int sel = 0;
+    for (size_t i = 0; i < list.size() && i < g_regPriorityIds.size(); ++i) {
+        if (list[i].isDefault) { sel = static_cast<int>(i); break; }
+    }
+    SendMessageW(g_regPriority, CB_SETCURSEL, static_cast<WPARAM>(sel), 0);
+}
+
+// 優先度コンボの選択肢を g_priorities に合わせる（showListPopup が表示のたびに呼ぶ）
+// 戻り値は優先度コンボを表示するか（= 一覧を取得済みか）。未取得なら隠す。
+// id の並びが前回と同じなら選択を保ち、違えば入れ直して既定を選ぶ。（表示中の組み直しで選択を失わない）
+static bool syncRegisterPriorities() {
+    if (!g_regPriority) return false;
+    std::vector<PriorityEntry> list;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        list = g_priorities;
+    }
+    if (list.empty()) {
+        ShowWindow(g_regPriority, SW_HIDE);
+        return false;
+    }
+    std::vector<int> ids;
+    for (const auto& e : list) ids.push_back(e.id);
+    if (ids != g_regPriorityIds) {
+        SendMessageW(g_regPriority, CB_RESETCONTENT, 0, 0);
+        for (const auto& e : list) {
+            SendMessageW(g_regPriority, CB_ADDSTRING, 0,
+                         reinterpret_cast<LPARAM>(toWide(e.name).c_str()));
+        }
+        g_regPriorityIds = std::move(ids);
+        resetRegisterPriority();
+    }
+    ShowWindow(g_regPriority, SW_SHOW);
+    return true;
+}
+
+// 優先度コンボの選択項目の優先度 id（非表示・未選択は 0 = 送らない）
+static int getRegisterPriorityId() {
+    if (!g_regPriority || g_regPriorityIds.empty() || !IsWindowVisible(g_regPriority)) return 0;
+    const LRESULT sel = SendMessageW(g_regPriority, CB_GETCURSEL, 0, 0);
+    if (sel == CB_ERR || sel < 0 || static_cast<size_t>(sel) >= g_regPriorityIds.size()) return 0;
+    return g_regPriorityIds[static_cast<size_t>(sel)];
 }
 
 // 件名欄の入力を trim して返す
@@ -4977,6 +5057,7 @@ static std::wstring getRegisterSubject() {
 static void updateRegisterControls() {
     if (!g_regEdit) return;
     EnableWindow(g_regEdit, !g_registerBusy);
+    EnableWindow(g_regPriority, !g_registerBusy);
     EnableWindow(g_regDate, !g_registerBusy);
     EnableWindow(g_regButton, !g_registerBusy && isRegisterSubjectValid(getRegisterSubject()));
 }
@@ -5058,7 +5139,7 @@ static void submitRegistration() {
     SYSTEMTIME st = {};
     if (DateTime_GetSystemtime(g_regDate, &st) != GDT_VALID) return;
     const std::string body = buildIssueCreateBody(currentRegisterProject(), subject,
-        ymdToIsoDate(st.wYear * 10000 + st.wMonth * 100 + st.wDay), me);
+        ymdToIsoDate(st.wYear * 10000 + st.wMonth * 100 + st.wDay), me, getRegisterPriorityId());
     // 前回分は完了通知の受信後（busy = false）なので、join は即座に戻る
     if (g_registerThread.joinable()) g_registerThread.join();
     try {
@@ -5369,19 +5450,23 @@ static void createRegisterControls(HWND parent, HINSTANCE hInst) {
     const DWORD base = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
     g_regEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", base | ES_AUTOHSCROLL,
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_REG_EDIT)), hInst, nullptr);
+    // 優先度は選択肢が入るまで隠す。（WS_VISIBLE を付けず、syncRegisterPriorities が表示を決める）
+    g_regPriority = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+        0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_REG_PRIORITY)), hInst, nullptr);
     g_regDate = CreateWindowExW(0, DATETIMEPICK_CLASSW, L"", base | DTS_SHORTDATEFORMAT,
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_REG_DATE)), hInst, nullptr);
     g_regButton = CreateWindowExW(0, L"BUTTON", L"登録", base | BS_DEFPUSHBUTTON,
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), hInst, nullptr);
-    if (!g_regEdit || !g_regDate || !g_regButton) {
+    if (!g_regEdit || !g_regPriority || !g_regDate || !g_regButton) {
         writeLog("list: register controls creation failed: " + std::to_string(GetLastError()));
-        for (HWND* h : { &g_regEdit, &g_regDate, &g_regButton }) {
+        for (HWND* h : { &g_regEdit, &g_regPriority, &g_regDate, &g_regButton }) {
             if (*h) DestroyWindow(*h);
             *h = nullptr;
         }
         return;
     }
-    for (HWND h : { g_regEdit, g_regDate, g_regButton })
+    for (HWND h : { g_regEdit, g_regPriority, g_regDate, g_regButton })
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g_hMenuFont), FALSE);
     SendMessageW(g_regEdit, EM_LIMITTEXT, REG_SUBJECT_MAX_CHARS, 0);
     SendMessageW(g_regEdit, EM_SETCUEBANNER, TRUE,
@@ -5520,13 +5605,26 @@ static void showListPopup(HWND trayWnd, bool refresh) {
     };
     auto textRowWidth = [&](const wchar_t* text) { return textWidth(text) + 20; };
 
-    // 登録欄の寸法（コントロールの高さは文字高＋枠、DTP の幅は固定書式の見本＋ドロップダウンボタン）
+    // 登録欄の寸法（コントロールの高さは文字高＋枠、DTP の幅は固定書式の見本＋ドロップダウンボタン、
+    // 優先度コンボの幅は最長の優先度名＋ドロップダウンボタン。未取得で隠すときは幅 0 で余白も詰める）
     const bool regEnabled = (g_regEdit != nullptr);
+    const bool regPrio    = regEnabled && syncRegisterPriorities();
     const int  regCtrlH   = tm.tmHeight + 8;
     const int  regRowH    = regCtrlH + 2 * REG_PAD;
     const int  regDateW   = textWidth(L"0000/00/00") + GetSystemMetrics(SM_CXVSCROLL) + 8;
     const int  regButtonW = textWidth(L"登録") + 32;
-    const int  regMinW    = REG_PAD * 4 + REG_EDIT_MIN_WIDTH + regDateW + regButtonW;
+    int regPrioW = 0;
+    if (regPrio) {
+        std::vector<PriorityEntry> list;
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            list = g_priorities;
+        }
+        for (const auto& e : list) regPrioW = (std::max)(regPrioW, textWidth(toWide(e.name).c_str()));
+        regPrioW += GetSystemMetrics(SM_CXVSCROLL) + 12;
+    }
+    const int  regPrioSpan = regPrio ? REG_PAD + regPrioW : 0;
+    const int  regMinW    = REG_PAD * 4 + REG_EDIT_MIN_WIDTH + regPrioSpan + regDateW + regButtonW;
     // 登録欄とその上のセパレータの高さ（無効時は 0）
     const int  regTailH   = regEnabled ? 9 + regRowH : 0;
 
@@ -5569,17 +5667,27 @@ static void showListPopup(HWND trayWnd, bool refresh) {
     }
     ReleaseDC(hWnd, hdc);
 
-    // 登録欄の子コントロールを右から「登録・期日」と詰め、件名欄を残りの幅に広げる
+    // 登録欄の子コントロールを右から「登録・期日・優先度」と詰め、件名欄を残りの幅に広げる
     if (regEnabled) {
         const int cy = regTop + REG_PAD;
         int x = width - REG_PAD - regButtonW;
         SetWindowPos(g_regButton, nullptr, x, cy, regButtonW, regCtrlH, SWP_NOZORDER | SWP_NOACTIVATE);
         x -= REG_PAD + regDateW;
         SetWindowPos(g_regDate, nullptr, x, cy, regDateW, regCtrlH, SWP_NOZORDER | SWP_NOACTIVATE);
+        if (regPrio) {
+            x -= REG_PAD + regPrioW;
+            // ドロップダウンリストのコンボは高さがリスト込みのため、行高の 8 倍を与える。
+            // （選択欄の高さはフォントから決まり、行高には影響しない）
+            SetWindowPos(g_regPriority, nullptr, x, cy, regPrioW, regCtrlH * 8,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         SetWindowPos(g_regEdit, nullptr, REG_PAD, cy, x - REG_PAD * 2, regCtrlH,
                      SWP_NOZORDER | SWP_NOACTIVATE);
-        // 新規表示で書きかけの件名が無ければ期日を当日に戻す。（日をまたいで開き直した場合の既定値）
-        if (!refresh && GetWindowTextLengthW(g_regEdit) == 0) resetRegisterDate();
+        // 新規表示で書きかけの件名が無ければ期日と優先度を既定に戻す。（日をまたいで開き直した場合の既定値）
+        if (!refresh && GetWindowTextLengthW(g_regEdit) == 0) {
+            resetRegisterDate();
+            resetRegisterPriority();
+        }
     }
 
     // クライアントサイズ → ウィンドウサイズ（WS_BORDER の枠分を上乗せ）
@@ -5999,6 +6107,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         if (wParam && g_regEdit) {
             SetWindowTextW(g_regEdit, L"");
             resetRegisterDate();
+            resetRegisterPriority();
             g_registerPoll.store(true);
         }
         updateRegisterControls();
@@ -6487,10 +6596,9 @@ struct PollSession {
     std::optional<std::unordered_set<int>> versionedTrackers;
     bool versionedTrackersResolved = false;
 
-    // 優先度 id → 順位（fetchPriorityPositions が設定。確定時に g_priorityPositions へコピーする）
+    // 優先度の一覧を確定したか（fetchPriorities の成功で true。結果は g_priorities・g_priorityPositions へ公開する）
     // セッション中 1 回だけ取得し、再取得はしない。失敗分は次回ポーリングで再試行する
-    std::unordered_map<int, int> priorityPositions;
-    bool priorityPositionsResolved = false;
+    bool prioritiesResolved = false;
 
     // プロジェクト id → バージョン定義有無のセッション内キャッシュ（projectHasAnyVersion が使う）
     std::unordered_map<int, bool> projectHasVersions;
@@ -6584,16 +6692,26 @@ static void resolvePollMetadata(const Config& cfg, PollSession& s, bool manualTr
         }
     }
 
-    // 優先度順の順位表を確定する（セッション 1 回。接続エラーは次回ポーリングで再試行）
-    // 未確定の間は buildListRows が priority id を順位にして縮退する
-    if (!s.priorityPositionsResolved) {
-        if (fetchPriorityPositions(cfg, s.priorityPositions)) {
-            s.priorityPositionsResolved = true;
+    // 優先度の一覧と順位表を確定する（セッション 1 回。接続エラーは次回ポーリングで再試行）
+    // 未確定の間は buildListRows が priority id を順位にして縮退し、登録欄は優先度コンボを隠す
+    if (!s.prioritiesResolved) {
+        std::vector<PriorityEntry> list;
+        if (fetchPriorities(cfg, list)) {
+            s.prioritiesResolved = true;
+            // 順位表は無効化済みも含めた全件、登録の選択肢は active のみ
+            std::unordered_map<int, int> positions;
+            std::vector<PriorityEntry>   selectable;
+            for (const auto& e : list) {
+                positions[e.id] = e.position;
+                if (e.active) selectable.push_back(e);
+            }
+            const size_t count = list.size(), active = selectable.size();
             {
                 std::lock_guard<std::mutex> lk(g_mtx);
-                g_priorityPositions = s.priorityPositions;
+                g_priorityPositions = std::move(positions);
+                g_priorities        = std::move(selectable);
             }
-            writeLog("priority positions: " + std::to_string(s.priorityPositions.size()));
+            writeLog("priorities: " + std::to_string(count) + " (active " + std::to_string(active) + ")");
         }
     }
 }

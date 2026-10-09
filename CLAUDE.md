@@ -51,7 +51,7 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
 
 - スレッド構成：メイン（メッセージループ・トレイ UI）／`pollThreadFunc`（HTTP・Toast・音・状態保存）／`soundThread`（WASAPI 再生）／`checkForUpdates`（起動時 1 回、シャットダウン時に join）／`registerIssueThreadFunc`（登録欄の送信 1 回ごとに起動、シャットダウン時に join）
 
-- 共有状態は `g_mtx`（`g_issues`・`g_pins`・`g_unreadIds`・`g_newIds`・`g_hiddenIds`・`g_priorityPositions`・`g_latestVersion`）と atomic（`g_myUserId`・`g_assignedToMeOnly` など）で保護する  
+- 共有状態は `g_mtx`（`g_issues`・`g_pins`・`g_unreadIds`・`g_newIds`・`g_hiddenIds`・`g_priorities`・`g_priorityPositions`・`g_latestVersion`）と atomic（`g_myUserId`・`g_assignedToMeOnly` など）で保護する  
   `g_currentConfig` は起動時に 1 回設定した後は不変で、ロック無しで読み取る。
 
 - 永続化は `state.json`（検知済み）、`pins.json`（ピン留め）、`hidden.json`（非表示チケットの id 配列）で、書き出しは `atomicWriteJson`（tmp 経由の置換）  
@@ -118,7 +118,7 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   旧トグルのレジストリ `SortByDue` は `ListSort` 不在時の移行読み込み専用で、0 以外なら期日順にする。`ListSort` の範囲外の値は更新日順にする。
   更新日順は updated_on 降順（既定）。期日順は期日昇順、期日なしは末尾、同日は更新日時降順。
   作成日順は created_on 降順、優先度順は順位降順で、どちらも同順位は期日順の規則で並べる。
-  優先度の順位は `/enumerations/issue_priorities.json` から取得して `g_priorityPositions` に置く。
+  優先度は `/enumerations/issue_priorities.json` から取得して `g_priorities`（`active` のみ、順位昇順。登録欄の選択肢）と `g_priorityPositions`（id → 順位。無効化済みも含む全件）に置く。
   （API は `position` を返さず配列が position 昇順のため添字 + 1 を順位にし、`position` があればその値を優先する）
   取得は成功するまで毎回のポーリングで再試行し、成功後は再取得も永続化もしない。
   順位表が未取得のときと順位表に無い id は priority id を順位にして縮退する。
@@ -180,7 +180,7 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   オーバーフロー領域のアイコンは、`v4` 化以前の実装では矩形不一致でホバーが機能しなかった。
   `v4` のホバー通知は座標に依存しないため改善が見込めるが未検証。（左クリックでは開ける）
 
-- 一覧末尾の登録欄（登録先の確定時のみ）は件名 Edit・期日 DTP・登録ボタンの子コントロール  
+- 一覧末尾の登録欄（登録先の確定時のみ）は件名 Edit・優先度コンボ・期日 DTP・登録ボタンの子コントロール  
   登録先は `register_project` の明示値を存在確認なしでそのまま使う。
   未設定ならログイン名の `@` より前を小文字にした識別子を作り、そのプロジェクトの存在確認（200）で確定する。（識別子の形に合わないログイン名と 403・404 は登録欄なしで確定、他の失敗は次回ポーリングで再試行。`resolvePollMetadata`）
   登録欄のクリックで入力モードに入り、`WS_EX_NOACTIVATE` を外して一覧をアクティブ化する。
@@ -189,7 +189,11 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   Esc は一覧を閉じ、Enter は登録ボタンと同じ経路（`IDOK`）になる。（メッセージループの `IsDialogMessageW`）
   Alt+F4 も一覧を閉じるだけで破棄しない。（`WM_CLOSE` を `listWndProc` が捕捉する。破棄すると使い回す `g_listWnd` が失効するため）
   件名は前後の空白（全角を含む）を除いて 3 文字以上を必須とする。期日の既定は JST の当日だ。
-  送信は `POST /issues.json`（担当＝自分、トラッカーはプロジェクト既定）で、成功時は入力を空にして `g_registerPoll` で即時ポーリングする。
+  優先度は `g_priorities` の選択肢から選び、既定は `is_default` の項目（無ければ先頭）。
+  `g_priorities` が空の間（未取得、または有効な優先度が 0 件）はコンボを隠し、`priority_id` を送らず Redmine の既定に任せる。（接続不可でも登録を止めない）
+  コンボの選択肢は表示のたびに `syncRegisterPriorities` が `g_priorities` と突き合わせ、id の並びが同じなら選択を保つ。
+  新規表示で書きかけの件名が無ければ、期日と同じく優先度も既定へ戻す。
+  送信は `POST /issues.json`（担当＝自分、トラッカーはプロジェクト既定）で、成功時は入力を空にし期日・優先度を既定へ戻して `g_registerPoll` で即時ポーリングする。
   失敗時は Toast を出して入力を残す。成功の Toast は出さない。（新チケットが一覧に載ることを応答とする）
   DTP の見た目のため common controls v6 のマニフェストを `build.ps1` の `/MANIFEST:EMBED` で埋め込む。
 

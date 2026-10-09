@@ -938,7 +938,12 @@ static void testBuildIssueCreateBody() {
     const std::string expected = reinterpret_cast<const char*>(
         u8"{\"issue\":{\"project_id\":\"my-project\",\"subject\":\"件名 \\\"x\\\"\","
         u8"\"due_date\":\"2026-09-28\",\"assigned_to_id\":3}}");
-    CHECK(buildIssueCreateBody(L"my-project", L"件名 \"x\"", "2026-09-28", 3) == expected);
+    CHECK(buildIssueCreateBody(L"my-project", L"件名 \"x\"", "2026-09-28", 3, 0) == expected);
+    // 優先度 id は正のときだけ送る（0 = 未取得で Redmine の既定に任せる）
+    const std::string withPrio = reinterpret_cast<const char*>(
+        u8"{\"issue\":{\"project_id\":\"p\",\"subject\":\"abc\","
+        u8"\"due_date\":\"2026-09-28\",\"assigned_to_id\":3,\"priority_id\":4}}");
+    CHECK(buildIssueCreateBody(L"p", L"abc", "2026-09-28", 3, 4) == withPrio);
 }
 
 static void testRegisterProjectFromLogin() {

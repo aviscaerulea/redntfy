@@ -33,7 +33,7 @@ The tray icon shows a red badge in the bottom-right corner when there are unread
 
 Each row of the list shows the due date, assignee, project, and days left until the due date, with icons. Unread tickets and tickets with a due date are shown in bold. Tickets notified as new are marked with ✨. The pending count appears in the footer. Clicking a row opens the ticket in the browser and marks it as read. Right-clicking a row cycles through pinned, hidden, and normal. The list order can be chosen from "並び順" (sort order) in the tray menu: by updated date, due date, created date, or priority.
 
-When a target project is available, a subject field, a due date, and a register button appear at the bottom of the list. Enter a subject (at least 3 characters), pick a due date from the calendar, and register it to create a ticket assigned to yourself. The due date defaults to today. If no target project is configured, tickets go to your personal project whose identifier matches your login name, if it exists.
+When a target project is available, a subject field, a priority, a due date, and a register button appear at the bottom of the list. Enter a subject (at least 3 characters), choose a priority (defaults to Redmine's default priority) and a due date (defaults to today), and register it to create a ticket assigned to yourself. If no target project is configured, tickets go to your personal project whose identifier matches your login name, if it exists.
 
 Right-clicking the tray icon opens the tray menu, which provides various settings.
 
