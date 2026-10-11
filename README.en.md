@@ -24,6 +24,7 @@ A sister tool, [gcalntfy](https://github.com/aviscaerulea/gcalntfy), notifies yo
   - Hiding: excludes tickets you do not need to watch from notifications and the pending count
   - Browser display: clicking a row or the footer opens it in the browser
   - Ticket registration: create a ticket assigned to yourself from the list, without opening Redmine
+  - Row menu: right-click a row to copy the ticket, change its priority or due date, or close it
 - Narrowing the target: Redmine custom queries (one or more) freely choose which tickets are notified and listed
 - Zero-configuration start: targets tickets assigned to you and your groups with just a URL and an API access key
 
