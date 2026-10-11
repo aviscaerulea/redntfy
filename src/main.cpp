@@ -3819,8 +3819,8 @@ struct IssueItem {
     std::vector<ColorRange> ranges;
     bool         unread     = false; // 未読（まだ一覧から開いていない）。太字の条件の 1 つ（issueRowBold）
     bool         hasDue     = false; // 期日あり。太字の条件の 1 つ（issueRowBold）。非表示中は効かない
-    bool         pinned = false; // ピン留め中（マーカー列の描画条件。右クリック遷移時にもその場で更新する）
-    bool         hidden = false; // 非表示（グレー＋取消線描画の条件。右クリック遷移時にもその場で更新する）
+    bool         pinned = false; // ピン留め中（マーカー列の描画条件。行メニューでの遷移時にもその場で更新する）
+    bool         hidden = false; // 非表示（グレー＋取消線描画の条件。行メニューでの遷移時にもその場で更新する）
     bool         closed = false; // クローズ済（打ち消し線の描画条件）
 };
 static std::vector<IssueItem> g_issueItems;
@@ -4728,7 +4728,7 @@ static int walkIssueLabel(HDC hdc, const IssueItem& item, const RECT* textRect,
 // 未読行と期日ありの行を太字にする。未読は「まだ読んでいない」、期日ありは「期日が迫りうる」を
 // 示し、どちらも目を止めるべき行として同じ強調にまとめる。
 // 非表示行はグレー＋取消線の参考行なので、期日があっても太字にしない。（未読は buildListRows と
-// cycleIssueState が非表示中は false に落とすため、ここでは hasDue 側だけ hidden を見る）
+// setIssueState が非表示中は false に落とすため、ここでは hasDue 側だけ hidden を見る）
 static bool issueRowBold(const IssueItem& item) {
     return item.unread || (item.hasDue && !item.hidden);
 }
@@ -5158,6 +5158,7 @@ static void submitRegistration() {
 // 自前ポップアップ（WS_EX_NOACTIVATE）で一覧を表示する。
 // 非モーダルのため、フォーカス復元・EndMenu・クローズ直後のクリック猶予といった
 // モーダルメニュー時代の補正処理は存在しない。チケット行はマウス専用の UI。
+// 行の右クリックメニューだけは TrackPopupMenu を使い、表示中は離脱監視を止める。（showRowContextMenu）
 // 例外は末尾の登録欄（登録先の確定時のみ）で、登録欄のクリックでだけ
 // WS_EX_NOACTIVATE を外して一覧をアクティブ化し、キー入力を受ける。（入力モード）
 // 入力モード中は離脱で閉じず、他アプリへの切り替えで入力モードだけ抜ける。
@@ -5199,6 +5200,10 @@ static POINT g_listAnchor = {};                  // 表示位置の基準（新�
 static bool  g_listInOverflow = false;           // 新規表示時にアイコンがフライアウト内にあったか（組み直しで再利用）
 static RECT  g_listOverflowRect = {};            // そのときのフライアウト矩形
 static bool  g_listInputMode = false;            // 入力モード（登録欄のクリックで一覧をアクティブ化している間）
+// 行の右クリックメニューの表示中
+// モーダルループ中も IDT_LIST_WATCH は配送され、カーソルがメニュー上（一覧の矩形外）にあると
+// 離脱と数えて一覧を閉じてしまうため、この間は離脱監視を止める。
+static bool  g_rowMenuOpen = false;
 
 // 一覧ポップアップが画面に出ているか（ウィンドウ未生成は非表示扱い）
 static bool isListPopupVisible() {
@@ -5228,7 +5233,7 @@ static void exitListInputMode() {
 // 後方定義の関数を一覧ウィンドウの WndProc から呼ぶための前方宣言
 static void markIssueRead(int issueId);
 static void handleTrayCommand(UINT id);
-static void cycleIssueState(size_t itemIndex);
+static void showRowContextMenu(int issueId, POINT screenPt);
 
 // クライアント座標 y の行ヒットテスト（セパレータと登録欄は対象外）。ヒットなしは -1
 // 登録欄の行背景のクリックでホット表示やクエリ画面遷移を起こさないため、登録欄も除く。
@@ -5436,8 +5441,11 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     }
     if (msg == WM_RBUTTONUP) {
         int hit = listRowHitTest(static_cast<short>(HIWORD(lParam)));
-        if (hit >= 0 && g_listLayout[hit].kind == ListRowKind::Issue)
-            cycleIssueState(g_listLayout[hit].index);
+        if (hit >= 0 && g_listLayout[hit].kind == ListRowKind::Issue) {
+            POINT pt = { static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
+            ClientToScreen(hWnd, &pt);
+            showRowContextMenu(g_issueItems[g_listLayout[hit].index].id, pt);
+        }
         return 0;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
@@ -5782,13 +5790,18 @@ static void hideListPopup(HWND trayWnd) {
     updateTrayTooltip(trayWnd);
 }
 
-// チケット項目の状態を通常 → ピン留め → 非表示 → 通常の順に遷移させる
-// （一覧ポップアップ上の行右クリック）
+// 一覧行の状態（排他。行の右クリックメニューのラジオ項目に対応する）
+enum class IssueRowState { Normal, Pinned, Hidden };
+
+// チケット項目を指定の状態へ遷移させる（一覧ポップアップの行右クリックメニュー）
 // g_pins・g_hiddenIds と item.pinned/hidden を更新し、当該行を再描画する。
 // （マーカー・グレーの描画自体は drawIssueRow が pinned/hidden を参照して行う）
-// 状態は排他で、ピン留め → 非表示の遷移でピンは解除される。ピンの件数に上限はない。
-// 取得集合外のピン（クローズ・担当変更でクエリから外れた行）はピン留め → 通常へ直接戻し、
-// 集合外の行を通常 → ピン留めにはしない。（理由は各分岐のコメント）
+// 対象は id で探す。メニューのモーダルループ中にポーリングが g_issueItems を組み直し得るため、
+// 添字は使わない。一覧から消えた id、現在と同じ状態の指定は何もしない。
+// 状態は排他で、非表示にするとピンは解除される。ピンの件数に上限はない。
+// 取得集合外の行（クローズ・担当変更でクエリから外れた集合外ピン）はピン留めにも非表示にもしない。
+// 集合外のチケットは非表示にしても一覧に出ず、pruneHidden が次のポーリングで非表示設定ごと消すため、
+// 非表示は一覧に出るチケットにしか意味がない。（メニュー側も両項目を灰色にする）
 // 非表示への遷移で g_unreadIds・g_newIds には触らない。非表示は「見なくて良い」の意思表示で
 // あって既読（開いた）ではないため、非表示を解除すれば未読の太字と ✨ は戻る。
 // 非表示中に太字・✨・未読件数へ出ないのは buildListRows の hidden 判定が担う。
@@ -5797,60 +5810,53 @@ static void hideListPopup(HWND trayWnd) {
 // 遷移直後の再描画では、太字は item.unread と hidden（issueRowBold）で即座に切り替わるが、
 // 組み立て済みラベルが保持する ✨ は非表示中も残る。（IssueItem にマーカー用のフラグを持たせていないため。
 // グレー＋取消線の行なので誤読はなく、次に一覧を開くかポーリングで組み直せば消えるため許容する）
-static void cycleIssueState(size_t itemIndex) {
+static void setIssueState(int issueId, IssueRowState target) {
+    size_t itemIndex = 0;
+    while (itemIndex < g_issueItems.size() && g_issueItems[itemIndex].id != issueId) ++itemIndex;
     if (itemIndex >= g_issueItems.size()) return;
 
     auto& item = g_issueItems[itemIndex];
-    bool nowPinned, nowHidden, nowUnread;
+    const IssueRowState current = item.pinned ? IssueRowState::Pinned
+                                : item.hidden ? IssueRowState::Hidden : IssueRowState::Normal;
+    if (current == target) return;
+    bool nowPinned = false, nowHidden = false, nowUnread = false;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
-        // 取得集合に居るかで遷移先が変わるため先に引く。（一覧行のラベルは省略済みで
+        // 取得集合に居るかで遷移の可否が変わるため先に引く。（一覧行のラベルは省略済みで
         // 復元できないため、ピンの内容も同じ探索結果から写す）
         const Issue* cur = nullptr;
         for (const auto& is : g_issues) {
-            if (is.id == item.id) {
+            if (is.id == issueId) {
                 cur = &is;
                 break;
             }
         }
-        auto it = std::find_if(g_pins.begin(), g_pins.end(),
-            [&](const PinEntry& p) { return p.id == item.id; });
-        if (it != g_pins.end()) {
-            g_pins.erase(it);
-            nowPinned = false;
-            if (cur) {
-                // ピン留め → 非表示
-                g_hiddenIds.insert(item.id);
-                nowHidden = true;
-                nowUnread = false;  // 非表示行は太字にしない（buildListRows と同じ扱い）
-            }
-            else {
-                // 集合外のピン留め → 通常（非表示を経ない）
-                // 集合外のチケットは非表示にしても一覧に出ず、pruneHidden が次のポーリングで
-                // 非表示設定ごと消す。非表示は一覧に出るチケットにしか意味がないため、
-                // ピン解除だけを行う。（行は次の組み直しで一覧から消える）
-                nowHidden = false;
-                nowUnread = item.unread;
-            }
-        }
-        else if (g_hiddenIds.erase(item.id) != 0) {
-            // 非表示 → 通常
-            // 非表示中も g_unreadIds には残しているため、集合の現況から太字を復元する。
-            // （ここで復元しないと、一覧を開き直すまで未読なのに細字のままになる）
-            nowPinned = false;
-            nowHidden = false;
-            nowUnread = g_unreadIds.count(item.id) != 0;
-        }
-        else if (!cur) {
-            // 通常 → ピン留めは取得集合に居る行だけ受け付ける
+        if (target != IssueRowState::Normal && !cur) {
+            // ピン留め・非表示は取得集合に居る行だけ受け付ける
             // 一覧表示中にポーリングが g_issues を差し替えると、古い行が集合外になる。
             // その行をピン留めすると件名・更新日時が空のピンを保存してしまうため、
             // 何もせず次の組み直し（WM_LIST_REFRESH）に任せる。
-            writeLog("issue state: #" + std::to_string(item.id) + " not in current set; pin skipped");
+            writeLog("issue state: #" + std::to_string(issueId) + " not in current set; skipped");
             return;
         }
+        auto it = std::find_if(g_pins.begin(), g_pins.end(),
+            [&](const PinEntry& p) { return p.id == issueId; });
+        if (target == IssueRowState::Normal) {
+            // 非表示中も g_unreadIds には残しているため、集合の現況から太字を復元する。
+            // （ここで復元しないと、一覧を開き直すまで未読なのに細字のままになる）
+            if (it != g_pins.end()) g_pins.erase(it);
+            g_hiddenIds.erase(issueId);
+            nowUnread = g_unreadIds.count(issueId) != 0;
+        }
+        else if (target == IssueRowState::Hidden) {
+            if (it != g_pins.end()) g_pins.erase(it);
+            g_hiddenIds.insert(issueId);
+            nowHidden = true;  // 非表示行は太字にしない（buildListRows と同じ扱い）
+        }
         else {
-            // 通常 → ピン留め
+            // ピン留め（未読には影響しない）
+            g_hiddenIds.erase(issueId);
+            nowUnread = g_unreadIds.count(issueId) != 0;
             PinEntry p;
             p.id              = item.id;
             p.subject         = cur->subject;
@@ -5864,10 +5870,8 @@ static void cycleIssueState(size_t itemIndex) {
             p.isBugTracker    = cur->isBugTracker;
             p.updaterDisplay  = cur->updaterDisplay;
             p.updaterFirst    = cur->updaterFirstName;
-            g_pins.push_back(std::move(p));
+            if (it == g_pins.end()) g_pins.push_back(std::move(p));
             nowPinned = true;
-            nowHidden = false;
-            nowUnread = item.unread;  // ピン留めは未読に影響しない
         }
     }
     // 描画は drawIssueRow が pinned/hidden/unread（と hasDue）を参照するため、フラグ更新と再描画だけで見た目が切り替わる
@@ -5895,6 +5899,100 @@ static void cycleIssueState(size_t itemIndex) {
     if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
     writeLog("issue state: #" + std::to_string(item.id)
         + (nowPinned ? " pinned" : nowHidden ? " hidden" : " normal"));
+}
+
+// クリップボードへ文字列を置く（失敗はログのみ。利用者には貼り付け結果で分かるため通知しない）
+static void setClipboardText(HWND owner, const std::wstring& text) {
+    if (!OpenClipboard(owner)) {
+        writeLog("clipboard: open failed");
+        return;
+    }
+    EmptyClipboard();
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    void* p = mem ? GlobalLock(mem) : nullptr;
+    if (p) {
+        memcpy(p, text.c_str(), bytes);
+        GlobalUnlock(mem);
+        // 成功時はメモリの所有がシステムへ移る。失敗時だけ自分で解放する
+        if (SetClipboardData(CF_UNICODETEXT, mem)) mem = nullptr;
+        else writeLog("clipboard: set failed");
+    }
+    else {
+        writeLog("clipboard: alloc failed");
+    }
+    if (mem) GlobalFree(mem);
+    CloseClipboard();
+}
+
+// 一覧の行の右クリックメニューのコマンド ID（TPM_RETURNCMD で受け、トレイの IDM_* とは混ぜない）
+static constexpr UINT IDM_ROW_COPY_ID  = 41001;  // 番号（#123）をコピー
+static constexpr UINT IDM_ROW_COPY_URL = 41002;  // チケットの URL をコピー
+// 状態のラジオ項目（CheckMenuRadioItem の範囲指定のため連番にする）
+static constexpr UINT IDM_ROW_PIN      = 41003;
+static constexpr UINT IDM_ROW_HIDE     = 41004;
+static constexpr UINT IDM_ROW_NORMAL   = 41005;
+
+// 一覧の行の右クリックメニューを表示して、選ばれた操作を実行する（メインスレッド）
+// issueId は右クリックした行のチケット id、screenPt はメニューを出すスクリーン座標。
+// 所有ウィンドウはトレイウィンドウとし、前面化してから開く。（前面化しないとメニュー外の
+// クリックで閉じない。一覧は WS_EX_NOACTIVATE のため所有者にしない）
+// TrackPopupMenu はモーダルループでメッセージを回し、その間にポーリングが一覧を組み直し得る。
+// そのため対象は id で持ち、行の添字は使わない。表示中は g_rowMenuOpen で離脱監視を止める。
+static void showRowContextMenu(int issueId, POINT screenPt) {
+    if (!g_hWnd) return;
+    // メニュー構築時点の状態（集合外の行はピン留め・非表示にできない。setIssueState を参照）
+    bool pinned = false, hidden = false, inSet = false;
+    for (const auto& it : g_issueItems) {
+        if (it.id == issueId) {
+            pinned = it.pinned;
+            hidden = it.hidden;
+            break;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        inSet = std::any_of(g_issues.begin(), g_issues.end(),
+                            [&](const Issue& is) { return is.id == issueId; });
+    }
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    const std::wstring idText = L"#" + std::to_wstring(issueId);
+    AppendMenuW(menu, MF_STRING, IDM_ROW_COPY_ID, (L"番号をコピー（" + idText + L"）").c_str());
+    AppendMenuW(menu, MF_STRING, IDM_ROW_COPY_URL, L"URL をコピー");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    const UINT stateFlags = MF_STRING | (inSet ? 0 : MF_GRAYED);
+    AppendMenuW(menu, stateFlags, IDM_ROW_PIN, L"ピン留め");
+    AppendMenuW(menu, stateFlags, IDM_ROW_HIDE, L"非表示");
+    AppendMenuW(menu, MF_STRING, IDM_ROW_NORMAL, L"通常");
+    CheckMenuRadioItem(menu, IDM_ROW_PIN, IDM_ROW_NORMAL,
+                       pinned ? IDM_ROW_PIN : hidden ? IDM_ROW_HIDE : IDM_ROW_NORMAL, MF_BYCOMMAND);
+
+    // 前面化で奪うフォアグラウンドを閉じた後に返すため、元の窓を控える
+    const HWND prevFg = GetForegroundWindow();
+    g_rowMenuOpen = true;
+    forceForeground(g_hWnd);
+    const UINT cmd = static_cast<UINT>(TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                                                      screenPt.x, screenPt.y, 0, g_hWnd, nullptr));
+    DestroyMenu(menu);
+
+    if (cmd == IDM_ROW_COPY_ID)       setClipboardText(g_hWnd, idText);
+    else if (cmd == IDM_ROW_COPY_URL) setClipboardText(g_hWnd, issueUrl(g_currentConfig, issueId));
+    else if (cmd == IDM_ROW_PIN)      setIssueState(issueId, IssueRowState::Pinned);
+    else if (cmd == IDM_ROW_HIDE)     setIssueState(issueId, IssueRowState::Hidden);
+    else if (cmd == IDM_ROW_NORMAL)   setIssueState(issueId, IssueRowState::Normal);
+
+    g_rowMenuOpen = false;
+    g_listOutsideTicks = 0;
+    // フォアグラウンドを返す。（一覧はフォーカスを奪わない設計のため、前面化はメニューの間だけに留める）
+    // メニュー外で他アプリをクリックして閉じた場合は、利用者の切り替えを尊重して何もしない。
+    // 自スレッドに残っていれば、入力モード中は一覧（登録欄のキー入力先）へ、それ以外は元の窓へ戻す。
+    HWND fg = GetForegroundWindow();
+    if (fg && GetWindowThreadProcessId(fg, nullptr) == GetCurrentThreadId()) {
+        if (g_listInputMode && g_listWnd) forceForeground(g_listWnd);
+        else if (prevFg && IsWindow(prevFg)) SetForegroundWindow(prevFg);
+    }
 }
 
 // redntfy.local.toml のテンプレートを生成する（既存ファイルは絶対に上書きしない）
@@ -6060,6 +6158,10 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                 if (!fg || GetWindowThreadProcessId(fg, nullptr) != GetCurrentThreadId())
                     exitListInputMode();
                 g_listOutsideTicks = 0;
+                return 0;
+            }
+            if (g_rowMenuOpen) {
+                g_listOutsideTicks = 0;  // 行メニュー表示中は離脱と数えない（g_rowMenuOpen を参照）
                 return 0;
             }
             // 表示中：アイコンとポップアップの両方から離れた状態が連続したら閉じる。
