@@ -5301,19 +5301,51 @@ static bool g_issueUpdateBusy = false;  // 更新要求の送信中（メイン�
 // 更新要求の送信スレッド本体（startIssueUpdate が 1 回の送信ごとに起動する）
 // 成否はログに残し、失敗時は Toast で知らせる。最後に必ず WM_ISSUE_UPDATE_DONE を投函する。
 // 失敗 Toast は showErrorToast を使わない。（ポーリングの接続エラー Toast の 30 分クールダウンと共有させないため）
-static void issueUpdateThreadFunc(int issueId, std::string body) {
+// expectStatusId が正なら、更新の成功後にチケットを取得し直し、ステータスがその id になったかを照合する。
+// Redmine はワークフローで許可されない遷移・未完了の子チケット・ブロック関連などで選べない status_id を
+// エラーにせず黙って捨て、204 を返すため。（ステータスだけの更新では何も変わらないまま成功に見える）
+// 照合の取得に失敗したときは確かめようがないため、更新は成功として扱う。
+static void issueUpdateThreadFunc(int issueId, std::string body, int expectStatusId) {
     WinRtApartment apartment;  // 応答の JSON 解析と Toast のため
     const Config& cfg = g_currentConfig;
     DWORD status = 0;
     const std::string resp = redminePut(issueUrl(cfg, issueId) + L".json", cfg.apiKey, body, &status);
     // Redmine は 204 を返すが、版やプロキシによっては 200 になるため両方を成功とする
-    const bool ok = (status == 204 || status == 200);
+    bool ok = (status == 204 || status == 200);
     writeLog("issue update: #" + std::to_string(issueId) + " " + body
         + (ok ? " ok" : " failed, status=" + std::to_string(status)));
+    std::wstring title = L"チケットを更新できません";
+    std::wstring reason;
+    if (ok && expectStatusId > 0 && apartment.ok) {
+        auto obj = redmineGetJson(cfg, issueUrl(cfg, issueId) + L".json", "issue update verify");
+        int actual = -1;  // -1 = 応答の形が想定外で確かめられない
+        if (obj) {
+            try {
+                actual = static_cast<int>(
+                    obj.GetNamedObject(L"issue").GetNamedObject(L"status").GetNamedNumber(L"id", 0));
+            }
+            catch (...) {}
+        }
+        if (actual >= 0) {
+            if (actual != expectStatusId) {
+                ok = false;
+                title  = L"チケットを終了できません";
+                reason = L"ステータスが変わりませんでした。（ワークフローや、未完了の子チケット・ブロック関連の状態によっては終了できません）";
+                writeLog("issue update: #" + std::to_string(issueId) + " status not changed (expected "
+                    + std::to_string(expectStatusId) + ", actual " + std::to_string(actual) + ")");
+            }
+        }
+        else {
+            writeLog("issue update: #" + std::to_string(issueId) + " status verify skipped ("
+                + (obj ? "unexpected response" : "fetch failed") + ")");
+        }
+    }
+    else if (!ok) {
+        reason = describeUpdateError(status, resp);
+    }
     if (!ok && apartment.ok) {
         try {
-            showToast(L"チケットを更新できません",
-                      L"#" + std::to_wstring(issueId) + L"：" + describeUpdateError(status, resp), L"");
+            showToast(title, L"#" + std::to_wstring(issueId) + L"：" + reason, L"");
         }
         catch (...) {
             writeLog("issue update: error toast failed");
@@ -5323,12 +5355,13 @@ static void issueUpdateThreadFunc(int issueId, std::string body) {
 }
 
 // チケット更新の送信を開始する（メインスレッド。送信中は何もしない）
-static void startIssueUpdate(int issueId, const std::string& body) {
+// expectStatusId はステータス更新のときだけ正の id を渡し、送信後の照合に使う。（issueUpdateThreadFunc を参照）
+static void startIssueUpdate(int issueId, const std::string& body, int expectStatusId = 0) {
     if (g_issueUpdateBusy) return;
     // 前回分は完了通知の受信後（busy = false）なので、join は即座に戻る
     if (g_issueUpdateThread.joinable()) g_issueUpdateThread.join();
     try {
-        g_issueUpdateThread = std::thread(issueUpdateThreadFunc, issueId, body);
+        g_issueUpdateThread = std::thread(issueUpdateThreadFunc, issueId, body, expectStatusId);
     }
     catch (const std::system_error& e) {
         writeLog(std::string("issue update: failed to start thread: ") + e.what());
@@ -6317,7 +6350,8 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
         const std::wstring text = idText + L" を終了しますか？";
         if (MessageBoxW(g_hWnd, text.c_str(), L"redntfy",
                         MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST) == IDOK) {
-            startIssueUpdate(issueId, buildIssueUpdateBody("status_id", std::to_string(closeStatusId)));
+            startIssueUpdate(issueId, buildIssueUpdateBody("status_id", std::to_string(closeStatusId)),
+                             closeStatusId);
         }
     }
 
