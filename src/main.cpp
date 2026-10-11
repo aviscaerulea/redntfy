@@ -5487,7 +5487,7 @@ static void paintListWindow(HWND hWnd) {
 // メッセージループの IsDialogMessageW が WM_COMMAND（IDOK・IDCANCEL）へ変換する。
 // WM_CLOSE（入力モード中の Alt+F4）は破棄ではなく非表示で閉じる。（g_listWnd は使い回すため）
 // 行の左クリック＝チケットを開いて既読化して閉じる。フッタ・0 件行＝クエリ画面を開いて閉じる。
-// 行の右クリック＝状態遷移で、一覧は開いたまま。（通常 → ピン留め → 非表示 → 通常）
+// 行の右クリック＝行メニュー（showRowContextMenu）を開き、一覧は開いたまま。
 // 離脱による自動クローズはトレイ側の IDT_LIST_WATCH が担い、ここでは扱わない。
 static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_PAINT) {
