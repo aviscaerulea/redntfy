@@ -7195,7 +7195,7 @@ static void pollThreadFunc(std::wstring dataDir, Config cfg) {
             // 起動直後の 1 回だけは例外として実行し、一覧を出せる状態にする。
             // calcSleepUntilNextPoll(0) は内部ガードで 1 回/時扱いになり「次の正時まで」を返す。
             // 「今すぐ更新」は明示のユーザ操作のため、休止時間帯・クールダウンの抑止を受けない。
-            // 登録欄での登録直後の反映（registerTriggered）も同じ扱いとする。（応答 Toast は出さない）
+            // 登録欄での登録直後、または行メニューでの更新直後の反映（registerTriggered）も同じ扱いとする。（応答 Toast は出さない）
             bool manualTriggered   = g_manualPoll.exchange(false);
             bool registerTriggered = g_registerPoll.exchange(false);
             bool immediate         = manualTriggered || registerTriggered;
