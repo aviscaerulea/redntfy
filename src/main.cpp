@@ -1748,7 +1748,8 @@ static Config loadConfig(const std::wstring& exeDir) {
     }
 
     // 一覧の表示件数と行フォーマット
-    cfg.listLimit = readAppInt("list_limit", 20, 1, 25);
+    // 上限 40 は LIST_ROW_MAX（50 行）の内側に、ピン・非表示の行を足す余地を残す値
+    cfg.listLimit = readAppInt("list_limit", 20, 1, 40);
 
     // 一覧の行フォーマット（空・未指定は既定テンプレート）
     std::wstring fmtStr = readAppString("list_format");
