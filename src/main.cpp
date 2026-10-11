@@ -572,9 +572,9 @@ static std::unordered_set<int> g_unreadIds;
 static std::unordered_set<int> g_newIds;
 
 // 非表示チケットの id 集合（g_mtx で保護。hidden.json で永続化）
-// 一覧の右クリックループ（通常 → ピン留め → 非表示 → 通常）で出入りする。
+// 一覧の行右クリックメニューの状態ラジオ（setIssueState）で出入りする。
 // 含まれる id は通知（Toast・音・未読）の対象外で、未処理件数にも数えない。
-// ピン留めとは排他。（ループ遷移でピン → 非表示になるときピンは解除される）
+// ピン留めとは排他。（非表示にするとピンは解除され、ピン留めにすると非表示は解除される）
 // クエリの取得集合から外れた id はポーリング成功時に自動削除する。（pruneHidden。
 // 後日クエリへ戻ったチケットは通常状態で再出現し、必要なら改めて非表示にする）
 static std::unordered_set<int> g_hiddenIds;
