@@ -5679,6 +5679,7 @@ static HWND ensureListWindow() {
 // 離脱監視の状態（猶予・タイマー）は引き継ぐ。ホット行は現在のカーソル位置から求め直す。
 // 登録欄（登録先の確定時）は常に末尾の行で、作業領域による打ち切りでも必ず残す。
 // 子コントロールは組み直しのたびに置き直し、入力中の内容とフォーカスはそのまま保つ。
+// 組み直しでは Z 順を変えない。（最前面へ上げ直すと、表示中の行メニュー・終了の確認ダイアログを一覧が覆うため）
 static void showListPopup(HWND trayWnd, bool refresh) {
     HWND hWnd = ensureListWindow();
     if (!hWnd) return;
@@ -5895,8 +5896,9 @@ static void showListPopup(HWND trayWnd, bool refresh) {
                         (std::min)(wy, static_cast<int>(mi.rcWork.bottom) - h));
     }
 
-    // SWP_NOACTIVATE でフォーカスを奪わずに表示する
-    SetWindowPos(hWnd, HWND_TOPMOST, wx, wy, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    // SWP_NOACTIVATE でフォーカスを奪わずに表示する。組み直し（refresh）では Z 順を変えない
+    SetWindowPos(hWnd, HWND_TOPMOST, wx, wy, w, h,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW | (refresh ? SWP_NOZORDER : 0));
     InvalidateRect(hWnd, nullptr, FALSE);
 
     // 組み直しではホット行をカーソル位置から復元し、離脱監視は引き継ぐ。
