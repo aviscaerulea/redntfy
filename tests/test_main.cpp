@@ -897,6 +897,66 @@ static void testBuildListRowsSort() {
     g_currentConfig.listLimit = savedLimit;
 }
 
+// 優先度順（期日考慮）：期日が当日以前の行を「最上位の 1 つ下」へ繰り上げる
+// 期日は実行日の JST 当日からの相対で作る。（固定日付だと日が経つと全件が期限切れになる）
+static void testBuildListRowsSortPriorityDue() {
+    const int today = todayJstYmd();
+    auto due = [today](int days) { return ymdToIsoDate(addDaysYmd(today, days)); };
+    auto mk = [](int id, const std::string& dueDate, int prio) {
+        Issue is;
+        is.id = id; is.updatedOn = "2026-08-01T00:00:00Z"; is.dueDate = dueDate; is.priorityId = prio;
+        return is;
+    };
+    auto ids = [](const std::vector<ListRow>& rows) {
+        std::vector<int> v;
+        for (const auto& r : rows) v.push_back(r.id);
+        return v;
+    };
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        // 低め 1 ／通常 2 ／高め 3 ／急いで 4 ／今すぐ 5（順位昇順）
+        g_priorities.clear();
+        g_priorityPositions.clear();
+        for (int i = 1; i <= 5; ++i) {
+            g_priorities.push_back({.id = i, .name = "p" + std::to_string(i), .position = i});
+            g_priorityPositions[i] = i;
+        }
+        g_issues = {mk(1, due(-1), 1),    // 低め・期限切れ → 急いで（4）へ繰り上げ
+                    mk(2, "",      3),    // 高め・期日なし
+                    mk(3, due(5),  5),    // 今すぐ・期日先
+                    mk(4, due(1),  2),    // 通常・明日（繰り上げない）
+                    mk(5, due(10), 4),    // 急いで・期日先
+                    mk(6, due(0),  5),    // 今すぐ・当日（繰り上げで下がらない）
+                    mk(7, due(-2), 1)};   // 低め・期限切れだがクローズ済み（繰り上げない）
+        g_issues.back().closed = true;
+        g_pins.clear(); g_unreadIds.clear(); g_hiddenIds.clear();
+    }
+    int savedLimit = g_currentConfig.listLimit;
+    int savedSort  = g_listSort.load();
+    g_currentConfig.listLimit = 10;
+    g_excludeHidden.store(false);
+    int visible = 0;
+    using V = std::vector<int>;
+
+    g_listSort.store(static_cast<int>(ListSort::Priority));
+    CHECK((ids(buildListRows(visible)) == V{6, 3, 5, 2, 4, 7, 1}));  // 繰り上げなし（1・7 同順位は期日順）
+    g_listSort.store(static_cast<int>(ListSort::PriorityDue));
+    CHECK((ids(buildListRows(visible)) == V{6, 3, 1, 5, 2, 4, 7}));  // 1 が 4 へ繰り上がり（同順位の 5 より期日が早い）、クローズ済みの 7 は据え置き
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_priorities.clear();  // 未取得は繰り上げずに優先度順と同じ
+    }
+    CHECK((ids(buildListRows(visible)) == V{6, 3, 5, 2, 4, 7, 1}));
+
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_issues.clear();
+        g_priorityPositions.clear();
+    }
+    g_listSort.store(savedSort);
+    g_currentConfig.listLimit = savedLimit;
+}
+
 // 最終 journal と updated_on の突き合わせ（journal を伴わない更新の検出）
 static void testJournalMatchesUpdate() {
     CHECK(isoUtcToEpoch("1970-01-01T00:00:00Z") == 0);
@@ -1047,6 +1107,7 @@ int main() {
     testBuildListRowsHidden();
     testBuildListRowsRowMax();
     testBuildListRowsSort();
+    testBuildListRowsSortPriorityDue();
     testRoundToDivisorOf60();
     testJournalMatchesUpdate();
     testAlignTowardCenter();

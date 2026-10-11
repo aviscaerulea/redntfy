@@ -169,7 +169,7 @@ static constexpr UINT IDM_OPEN_QUERY          = 40009; // Redmine の代表画�
 static constexpr UINT IDM_STARTUP             = 40010; // Windows スタートアップ登録トグル
 static constexpr UINT IDM_ASSIGNED_TO_ME      = 40011; // 担当が自分個人以外（グループ・他ユーザ・未割当）のチケットを一覧・tooltip・通知から除外するトグル
 static constexpr UINT IDM_UPDATE_NOW          = 40012; // 休止時間帯・クールダウンを無視した即時ポーリング
-// 40013（旧 IDM_SORT_BY_DUE）は欠番。並び順はサブメニュー「並び順」のラジオ 4 択へ移行した
+// 40013（旧 IDM_SORT_BY_DUE）は欠番。並び順はサブメニュー「並び順」のラジオへ移行した
 static constexpr UINT IDM_EXCLUDE_NO_VERSION  = 40014; // バージョン未指定を一覧・tooltip・通知から除外するトグル（期日ありは例外的に残す）
 static constexpr UINT IDM_MUTE_OWN_CHANGES    = 40015; // 自分の操作による起票・更新を通知抑止するトグル（一覧・tooltip は変更しない）
 static constexpr UINT IDM_OPEN_GUIDE          = 40016; // セットアップガイド（GitHub Pages）を開く
@@ -181,6 +181,7 @@ static constexpr UINT IDM_SORT_UPDATED        = 40019; // 更新日順（既定�
 static constexpr UINT IDM_SORT_DUE            = 40020; // 期日順（昇順、期日なしは末尾）
 static constexpr UINT IDM_SORT_CREATED        = 40021; // 作成日順（created_on 降順、同順位は期日順）
 static constexpr UINT IDM_SORT_PRIORITY       = 40022; // 優先度順（高→低、同順位は期日順）
+static constexpr UINT IDM_SORT_PRIORITY_DUE   = 40023; // 優先度順（期日考慮）。期日が当日以前の行を「最上位の 1 つ下」へ繰り上げる
 
 static constexpr wchar_t GITHUB_URL[]                 = L"https://github.com/aviscaerulea/redntfy";
 // セットアップガイド（GitHub Pages。docs/ 配下の内容が公開される）
@@ -263,9 +264,13 @@ static std::atomic<bool> g_muteInMeeting{true};
 // 対価として、ON 中に抑止した更新は state.json に記録済みのため OFF に戻しても再通知されない。
 static std::atomic<bool> g_assignedToMeOnly{false};
 
-// 一覧の並び順（トレイメニュー「並び順」のラジオ 4 択。レジストリ ListSort で永続化）
+// 一覧の並び順（トレイメニュー「並び順」のラジオ 5 択。レジストリ ListSort で永続化）
 // 値は IDM_SORT_* の連番と CheckMenuRadioItem の対応に使うため、0 から欠番なく振る。
-enum class ListSort { Updated = 0, Due = 1, Created = 2, Priority = 3 };
+// PriorityDue（優先度順（期日考慮））は、期日が当日以前の行の順位を「最上位の 1 つ下」まで繰り上げて
+// 優先度順に並べる。（優先度が低いまま期日を過ぎた行が埋もれるのを防ぐ。詳細は buildListRows）
+// 繰り上げで多数の行が上位に集まると結局埋もれるため、優先度順とは独立の方式にして使うかを選べるようにする。
+enum class ListSort { Updated = 0, Due = 1, Created = 2, Priority = 3, PriorityDue = 4 };
+static constexpr ListSort LIST_SORT_LAST = ListSort::PriorityDue;  // 範囲判定の上端（末尾の値）
 // 現在の並び順（ListSort の整数値。範囲外は buildListRows が Updated として扱う）
 // 期日順のタイブレークは期日昇順・期日なし末尾・同日は更新日時降順。作成日順と優先度順の
 // 同順位はこの期日順規則で安定させる。
@@ -3583,8 +3588,12 @@ struct ListRow {
 //   2. 1 に含まれないピンを追加する（保存クエリの集合外ピンはキャッシュ内容で表示）
 //   3. 全体を g_listSort の方式で並べ替える（ピンも同じ規則で本来の位置に置く）
 //      更新日順：updated_on 降順（既定）／期日順：期日昇順、期日なし末尾、同日は更新日時降順／
-//      作成日順：created_on 降順、同順位は期日順の規則／優先度順：順位降順、同順位は期日順の規則。
-//      優先度の順位は g_priorityPositions（未取得・未知 id は priority id で縮退）
+//      作成日順：created_on 降順、同順位は期日順の規則／優先度順：順位降順、同順位は期日順の規則／
+//      優先度順（期日考慮）：期日が当日以前（JST）の未クローズ行の順位を「最上位の 1 つ下」まで繰り上げたうえで優先度順。
+//      優先度の順位は g_priorityPositions（未取得・未知 id は priority id で縮退）。
+//      「最上位の 1 つ下」は有効な優先度（順位昇順の g_priorities）の末尾から 2 番目の順位で、標準構成の「急いで」に当たる。
+//      名前で探さないのは表記の違うサーバでも効かせるためだ。有効な優先度が 1 つならその順位、
+//      未取得なら繰り上げずに優先度順と同じに縮退する。繰り上げは下げる方向には働かない。（最上位の行はそのまま）
 //   4. 先頭 list_limit 件へ絞る（ピン留めと非表示チケットは上限適用外で常に残す）
 //   5. 全体を LIST_ROW_MAX 件へ打ち切る（ピン・非表示も含めた行数上限。超過分は
 //      非表示行 → ピン行 → 通常行の順に、各種別の末尾から落とす）
@@ -3607,6 +3616,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
     std::unordered_set<int> hiddenIds;
     std::unordered_map<int, int> priorityPositions;
     std::string personalProject;
+    int urgentRank = 0;  // 優先度順（期日考慮）の繰り上げ先の順位（0 = 未取得で繰り上げない）
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         issues    = g_issues;
@@ -3616,6 +3626,9 @@ static std::vector<ListRow> buildListRows(int& visible) {
         hiddenIds = g_hiddenIds;
         priorityPositions = g_priorityPositions;
         personalProject   = g_personalProjectName;
+        // g_priorities は順位昇順のため、末尾の 1 つ手前が「最上位の 1 つ下」
+        if (!g_priorities.empty())
+            urgentRank = g_priorities[g_priorities.size() >= 2 ? g_priorities.size() - 2 : 0].position;
     }
     // 登録先プロジェクトの行はプロジェクト名を空にする（{project} が括弧ごと消える。g_personalProjectName を参照）
     auto projectLabel = [&personalProject](const std::string& name) {
@@ -3702,6 +3715,23 @@ static std::vector<ListRow> buildListRows(int& visible) {
             return dueLess(a, b);
         });
         break;
+    case ListSort::PriorityDue: {
+        // 期日が当日以前の行は順位を urgentRank まで繰り上げる。（表示や Redmine 上の優先度は変えない）
+        // 当日以前の判定は一覧の期限切れ表示（makeDueDateView の overdue）と同じ基準にする。
+        // クローズ済み（ピンで一覧に残る行）は対応不要のため繰り上げない。（期日超過のまま閉じた行が上位に居座らないため）
+        const int todayYmd = todayJstYmd();
+        auto effRank = [&](const ListRow& r) {
+            if (urgentRank > 0 && !r.closed && makeDueDateView(r.dueDate, todayYmd).overdue)
+                return (std::max)(r.priorityRank, urgentRank);  // windows.h の max マクロを避ける
+            return r.priorityRank;
+        };
+        std::sort(rows.begin(), rows.end(), [&](const ListRow& a, const ListRow& b) {
+            const int ra = effRank(a), rb = effRank(b);
+            if (ra != rb) return ra > rb;
+            return dueLess(a, b);
+        });
+        break;
+    }
     default:  // Updated と範囲外
         std::sort(rows.begin(), rows.end(),
             [](const ListRow& a, const ListRow& b) { return a.updatedOn > b.updatedOn; });
@@ -3736,7 +3766,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
     // （list_limit の予算外にした非表示・ピンが、予算内の未読通常行を押し出さないため。
     // 通常行が落ちるのは非表示とピンをすべて落としてもまだ超過するときだけ）
     // 末尾から落とすため、更新日順なら更新の古い行、期日順なら期日の遠い行と期日なしの行、
-    // 作成日順・優先度順なら作成の古い行・優先度の低い行から落ちる。残す行の並び順は変えない。
+    // 作成日順・優先度順（期日考慮を含む）なら作成の古い行・優先度の低い行から落ちる。残す行の並び順は変えない。
     if (rows.size() > LIST_ROW_MAX) {
         size_t excess = rows.size() - LIST_ROW_MAX;
         auto dropFromTail = [&rows, &excess](auto pred) {
@@ -4470,7 +4500,7 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, MF_STRING | (g_muteOwnChanges ? MF_CHECKED : MF_UNCHECKED),
         IDM_MUTE_OWN_CHANGES, L"自分の操作による更新を通知しない");
 
-    // 一覧の並び順（サブメニューのラジオ 4 択。レジストリ永続化。既定は更新日順）
+    // 一覧の並び順（サブメニューのラジオ 5 択。レジストリ永続化。既定は更新日順）
     // 子メニューは MF_POPUP で親に預けるため、親の DestroyMenu が一緒に破棄する
     HMENU hSort = CreatePopupMenu();
     if (hSort) {
@@ -4478,9 +4508,10 @@ static void showTrayContextMenu(HWND hWnd) {
         AppendMenuW(hSort, MF_STRING, IDM_SORT_DUE,      L"期日順");
         AppendMenuW(hSort, MF_STRING, IDM_SORT_CREATED,  L"作成日順");
         AppendMenuW(hSort, MF_STRING, IDM_SORT_PRIORITY, L"優先度順");
+        AppendMenuW(hSort, MF_STRING, IDM_SORT_PRIORITY_DUE, L"優先度順（期日考慮）");
         int sort = g_listSort.load();
-        if (sort < 0 || sort > static_cast<int>(ListSort::Priority)) sort = 0;
-        CheckMenuRadioItem(hSort, IDM_SORT_UPDATED, IDM_SORT_PRIORITY,
+        if (sort < 0 || sort > static_cast<int>(LIST_SORT_LAST)) sort = 0;
+        CheckMenuRadioItem(hSort, IDM_SORT_UPDATED, IDM_SORT_PRIORITY_DUE,
                            IDM_SORT_UPDATED + static_cast<UINT>(sort), MF_BYCOMMAND);
         AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hSort), L"並び順");
     }
@@ -4605,7 +4636,7 @@ static void handleTrayCommand(UINT id) {
         g_manualPoll.store(true);
         return;
     }
-    if (id >= IDM_SORT_UPDATED && id <= IDM_SORT_PRIORITY) {
+    if (id >= IDM_SORT_UPDATED && id <= IDM_SORT_PRIORITY_DUE) {
         // ラジオ項目の id は ListSort の値と連番で対応する
         g_listSort.store(static_cast<int>(id - IDM_SORT_UPDATED));
         writeRegDword(REG_LIST_SORT, id - IDM_SORT_UPDATED);
@@ -7509,7 +7540,7 @@ int wmain() {
                 sort = readRegDword(REG_SORT_BY_DUE, 0u) != 0
                     ? static_cast<DWORD>(ListSort::Due) : static_cast<DWORD>(ListSort::Updated);
             }
-            if (sort > static_cast<DWORD>(ListSort::Priority)) sort = static_cast<DWORD>(ListSort::Updated);
+            if (sort > static_cast<DWORD>(LIST_SORT_LAST)) sort = static_cast<DWORD>(ListSort::Updated);
             g_listSort = static_cast<int>(sort);
         }
         g_excludeNoVersion = readRegDword(REG_EXCLUDE_NO_VERSION, 0u) != 0;
