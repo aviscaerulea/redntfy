@@ -155,6 +155,8 @@ static constexpr UINT WM_ENTER_DISABLED  = WM_USER + 3;
 static constexpr UINT WM_LIST_REFRESH    = WM_USER + 4;
 // 登録スレッド（registerIssueThreadFunc）→ トレイ WndProc の完了通知（wParam 1 = 成功、0 = 失敗）
 static constexpr UINT WM_REGISTER_DONE   = WM_USER + 5;
+// 更新スレッド（issueUpdateThreadFunc）→ トレイ WndProc の完了通知（wParam 1 = 成功、0 = 失敗）
+static constexpr UINT WM_ISSUE_UPDATE_DONE = WM_USER + 6;
 
 // コンテキストメニューコマンド ID
 static constexpr UINT IDM_EXIT             = 40002;
@@ -334,7 +336,7 @@ static std::atomic<bool> g_forcePoll{false};
 // 明示のユーザ操作のため、g_forcePoll と違い休止時間帯・クールダウンの抑止を受けない
 static std::atomic<bool> g_manualPoll{false};
 
-// 登録欄でのチケット登録直後の即時ポーリングフラグ
+// 登録欄でチケットを登録した直後、または一覧の行メニューでチケットを更新した直後に行う即時ポーリングのフラグ
 // 明示操作の結果を一覧へ反映するため休止時間帯・クールダウンを無視するが、
 // 「今すぐ更新」と違い応答 Toast・エラー Toast の強制・メタ情報の再取得は行わない
 static std::atomic<bool> g_registerPoll{false};
@@ -478,6 +480,9 @@ struct Config {
     std::vector<int> queryIds;
     // 登録欄へ明示する登録先（識別子または数値 id）。空ならログイン名から自動判定する（g_registerProject を参照）
     std::wstring registerProject;
+    // 一覧の行メニュー「チケットを終了」で設定するステータス id（0 = 未設定。メニューに項目を出さない）
+    // Redmine のステータス id はサーバごとに異なり、名前からの推測は誤った状態へ更新しかねないため明示設定とする。
+    int closeStatusId = 0;
 
     // 添字は JST（UTC+9）固定の時。OS のタイムゾーン設定に依存しない。
     // 待機時間の計算とログ表示はローカル時刻基準。
@@ -708,6 +713,25 @@ static int todayJstYmd() {
     SYSTEMTIME st;
     GetSystemTime(&st);
     st = utcToJst(st);
+    return st.wYear * 10000 + st.wMonth * 100 + st.wDay;
+}
+
+// YYYYMMDD の日付に days 日を加えた日付を YYYYMMDD で返す（月末・年末・閏日をまたぐ加算用）
+// 暦の計算は OS の FILETIME 変換に任せる。ymd が実在しない日付なら ymd をそのまま返す。
+static int addDaysYmd(int ymd, int days) {
+    SYSTEMTIME st = {};
+    st.wYear  = static_cast<WORD>(ymd / 10000);
+    st.wMonth = static_cast<WORD>(ymd / 100 % 100);
+    st.wDay   = static_cast<WORD>(ymd % 100);
+    FILETIME ft;
+    if (!SystemTimeToFileTime(&st, &ft)) return ymd;
+    ULARGE_INTEGER u;
+    u.LowPart  = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    u.QuadPart += static_cast<ULONGLONG>(days) * HNS_PER_DAY;
+    ft.dwLowDateTime  = u.LowPart;
+    ft.dwHighDateTime = u.HighPart;
+    if (!FileTimeToSystemTime(&ft, &st)) return ymd;
     return st.wYear * 10000 + st.wMonth * 100 + st.wDay;
 }
 
@@ -957,7 +981,7 @@ static DWORD calcSleepUntilNextPoll(int pollsPerHour) {
 // ==================== HTTP ====================
 
 // WinHTTP で HTTPS リクエストを実行する
-// method: L"GET" or L"POST"
+// method: L"GET"・L"POST"・L"PUT"
 // authHeader: 空でなければ "名前: 値" 形式のヘッダ 1 行としてそのまま付与
 // authHeader 付きのリクエストは自動リダイレクトを無効化し、3xx をそのままステータスとして返す。
 // （WinHTTP の既定はカスタムヘッダを保持したまま追従するため、別ドメインへの 3xx で
@@ -1082,6 +1106,14 @@ static std::string redminePost(const std::wstring& url, const std::wstring& apiK
     const std::string& jsonBody, DWORD* outStatusCode = nullptr)
 {
     return httpRequest(L"POST", url, jsonBody, L"application/json; charset=utf-8",
+                       L"X-Redmine-API-Key: " + apiKey, outStatusCode);
+}
+
+// Redmine API の PUT（API キーヘッダ付き、JSON 本文。チケット更新は成功時 204 で本文なし）
+static std::string redminePut(const std::wstring& url, const std::wstring& apiKey,
+    const std::string& jsonBody, DWORD* outStatusCode = nullptr)
+{
+    return httpRequest(L"PUT", url, jsonBody, L"application/json; charset=utf-8",
                        L"X-Redmine-API-Key: " + apiKey, outStatusCode);
 }
 
@@ -1685,6 +1717,15 @@ static Config loadConfig(const std::wstring& exeDir) {
         cfg.redmineUrl.pop_back();  // 末尾スラッシュを除去して URL 連結を単純化する
     cfg.apiKey  = readRedmineString("api_key");
     cfg.registerProject = readRegisterProject();
+    // close_status_id は local のキーを優先し、1〜INT_MAX の整数だけ採用する（範囲外・非整数は未設定扱い）
+    for (const auto* tbl : { local ? &*local : nullptr, base ? &*base : nullptr }) {
+        if (!tbl) continue;
+        const auto& node = (*tbl)["redmine"]["close_status_id"];
+        if (!node) continue;  // キーが無い側だけ base へ進む（local の不正値で base を拾わない）
+        auto v = node.value<int64_t>();
+        if (v && *v > 0 && *v <= INT_MAX) cfg.closeStatusId = static_cast<int>(*v);
+        break;
+    }
     if (auto q = readRedmineIntArray(local, "query_ids"))     cfg.queryIds = std::move(*q);
     else if (auto q = readRedmineIntArray(base, "query_ids")) cfg.queryIds = std::move(*q);
 
@@ -5062,6 +5103,22 @@ static void updateRegisterControls() {
     EnableWindow(g_regButton, !g_registerBusy && isRegisterSubjectValid(getRegisterSubject()));
 }
 
+// Redmine の検証エラー応答（422）の errors[] を「／」で連結する（解析できない・空なら空文字）
+static std::wstring joinRedmineErrors(const std::string& resp) {
+    std::wstring msg;
+    try {
+        auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(resp));
+        for (auto e : obj.GetNamedArray(L"errors")) {
+            if (!msg.empty()) msg += L"／";
+            msg += e.GetString().c_str();
+        }
+    }
+    catch (...) {
+        return {};
+    }
+    return msg;
+}
+
 // 登録失敗の Toast 本文（ステータス別の案内。422 は Redmine の検証エラー文言をそのまま示す）
 static std::wstring describeRegisterError(DWORD status, const std::string& resp) {
     switch (status) {
@@ -5069,16 +5126,7 @@ static std::wstring describeRegisterError(DWORD status, const std::string& resp)
     case 403: return L"登録先プロジェクトへの登録権限がありません";
     case 404: return L"register_project のプロジェクトが見つかりません";
     case 422:
-        try {
-            auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(resp));
-            std::wstring msg;
-            for (auto e : obj.GetNamedArray(L"errors")) {
-                if (!msg.empty()) msg += L"／";
-                msg += e.GetString().c_str();
-            }
-            if (!msg.empty()) return msg;
-        }
-        catch (...) {}
+        if (auto msg = joinRedmineErrors(resp); !msg.empty()) return msg;
         return L"入力内容が受け付けられませんでした";
     default:
         return L"HTTP ステータス " + std::to_wstring(status);
@@ -5153,6 +5201,77 @@ static void submitRegistration() {
     updateRegisterControls();
 }
 
+// ==================== 一覧の行メニューからのチケット更新 ====================
+// 優先度・期日・終了（close_status_id）を PUT /issues/{id}.json で 1 項目ずつ更新する。
+// 送信は専用スレッド（issueUpdateThreadFunc）で行い、完了を WM_ISSUE_UPDATE_DONE でメインへ返す。
+// 成功時は g_registerPoll で即時ポーリングし、一覧の組み直しを更新の応答とする。（成功 Toast は出さない）
+// 自分の操作による更新は g_muteOwnChanges（既定 ON）が通知を抑止するため、更新で Toast は鳴らない。
+
+// チケット更新 API（PUT /issues/{id}.json）の要求本文
+// key は issue の属性名、jsonValue は JSON の値表現そのもの。（数値 "3"、文字列 "\"2026-10-12\""、"null"）
+// 値の書式を呼び出し側に任せるのは、期日なし（null）と数値・文字列を 1 つの関数で扱うため。
+static std::string buildIssueUpdateBody(const char* key, const std::string& jsonValue) {
+    return std::string("{\"issue\":{\"") + key + "\":" + jsonValue + "}}";
+}
+
+// 更新失敗の Toast 本文（ステータス別の案内。422 は Redmine の検証エラー文言をそのまま示す）
+static std::wstring describeUpdateError(DWORD status, const std::string& resp) {
+    switch (status) {
+    case 0:   return L"Redmine に接続できません";
+    case 403: return L"このチケットを更新する権限がありません";
+    case 404: return L"チケットが見つかりません";
+    case 422:
+        if (auto msg = joinRedmineErrors(resp); !msg.empty()) return msg;
+        return L"変更内容が受け付けられませんでした";
+    default:
+        return L"HTTP ステータス " + std::to_wstring(status);
+    }
+}
+
+// 更新要求の送信スレッド。WM_ISSUE_UPDATE_DONE を投函し得るため、wmain の終了処理で
+// DestroyWindow より前に join する。（メインスレッド専用で起動・join する）
+static std::thread g_issueUpdateThread;
+static bool g_issueUpdateBusy = false;  // 更新要求の送信中（メインスレッド専用。完了通知で戻す）
+
+// 更新要求の送信スレッド本体（startIssueUpdate が 1 回の送信ごとに起動する）
+// 成否はログに残し、失敗時は Toast で知らせる。最後に必ず WM_ISSUE_UPDATE_DONE を投函する。
+// 失敗 Toast は showErrorToast を使わない。（ポーリングの接続エラー Toast の 30 分クールダウンと共有させないため）
+static void issueUpdateThreadFunc(int issueId, std::string body) {
+    WinRtApartment apartment;  // 応答の JSON 解析と Toast のため
+    const Config& cfg = g_currentConfig;
+    DWORD status = 0;
+    const std::string resp = redminePut(issueUrl(cfg, issueId) + L".json", cfg.apiKey, body, &status);
+    // Redmine は 204 を返すが、版やプロキシによっては 200 になるため両方を成功とする
+    const bool ok = (status == 204 || status == 200);
+    writeLog("issue update: #" + std::to_string(issueId) + " " + body
+        + (ok ? " ok" : " failed, status=" + std::to_string(status)));
+    if (!ok && apartment.ok) {
+        try {
+            showToast(L"チケットを更新できません",
+                      L"#" + std::to_wstring(issueId) + L"：" + describeUpdateError(status, resp), L"");
+        }
+        catch (...) {
+            writeLog("issue update: error toast failed");
+        }
+    }
+    if (g_hWnd) PostMessage(g_hWnd, WM_ISSUE_UPDATE_DONE, ok ? 1 : 0, 0);
+}
+
+// チケット更新の送信を開始する（メインスレッド。送信中は何もしない）
+static void startIssueUpdate(int issueId, const std::string& body) {
+    if (g_issueUpdateBusy) return;
+    // 前回分は完了通知の受信後（busy = false）なので、join は即座に戻る
+    if (g_issueUpdateThread.joinable()) g_issueUpdateThread.join();
+    try {
+        g_issueUpdateThread = std::thread(issueUpdateThreadFunc, issueId, body);
+    }
+    catch (const std::system_error& e) {
+        writeLog(std::string("issue update: failed to start thread: ") + e.what());
+        return;
+    }
+    g_issueUpdateBusy = true;
+}
+
 // ==================== 一覧ポップアップウィンドウ ====================
 // TrackPopupMenu のモーダルメニューをやめ、フォーカスを奪わない非アクティブの
 // 自前ポップアップ（WS_EX_NOACTIVATE）で一覧を表示する。
@@ -5200,7 +5319,7 @@ static POINT g_listAnchor = {};                  // 表示位置の基準（新�
 static bool  g_listInOverflow = false;           // 新規表示時にアイコンがフライアウト内にあったか（組み直しで再利用）
 static RECT  g_listOverflowRect = {};            // そのときのフライアウト矩形
 static bool  g_listInputMode = false;            // 入力モード（登録欄のクリックで一覧をアクティブ化している間）
-// 行の右クリックメニューの表示中
+// 行の右クリックメニュー（と終了の確認ダイアログ）の表示中
 // モーダルループ中も IDT_LIST_WATCH は配送され、カーソルがメニュー上（一覧の矩形外）にあると
 // 離脱と数えて一覧を閉じてしまうため、この間は離脱監視を止める。
 static bool  g_rowMenuOpen = false;
@@ -5932,6 +6051,14 @@ static constexpr UINT IDM_ROW_COPY_URL = 41002;  // チケットの URL をコ�
 static constexpr UINT IDM_ROW_PIN      = 41003;
 static constexpr UINT IDM_ROW_HIDE     = 41004;
 static constexpr UINT IDM_ROW_NORMAL   = 41005;
+static constexpr UINT IDM_ROW_CLOSE    = 41006;  // close_status_id へ更新（確認ダイアログあり）
+// 期日のプリセット（サブメニュー「期日」）
+static constexpr UINT IDM_ROW_DUE_TODAY    = 41010;
+static constexpr UINT IDM_ROW_DUE_TOMORROW = 41011;
+static constexpr UINT IDM_ROW_DUE_WEEK     = 41012;  // 1 週間後（今日 + 7 日）
+static constexpr UINT IDM_ROW_DUE_NONE     = 41013;  // 期日なし（due_date を null にする）
+// 優先度（サブメニュー「優先度」。g_priorities の添字を加える）
+static constexpr UINT IDM_ROW_PRIORITY_BASE = 41100;
 
 // 一覧の行の右クリックメニューを表示して、選ばれた操作を実行する（メインスレッド）
 // issueId は右クリックした行のチケット id、screenPt はメニューを出すスクリーン座標。
@@ -5939,10 +6066,18 @@ static constexpr UINT IDM_ROW_NORMAL   = 41005;
 // クリックで閉じない。一覧は WS_EX_NOACTIVATE のため所有者にしない）
 // TrackPopupMenu はモーダルループでメッセージを回し、その間にポーリングが一覧を組み直し得る。
 // そのため対象は id で持ち、行の添字は使わない。表示中は g_rowMenuOpen で離脱監視を止める。
+// （終了の確認ダイアログの表示中も、メニューと同じ理由で立てたままにする）
+// 優先度・期日・終了は Redmine への更新で、startIssueUpdate へ渡す。送信中は灰色にして重ねて送らない。
+// 優先度は g_priorities が空（未取得・有効 0 件）なら項目ごと出さず、終了は close_status_id 未設定なら出さない。
 static void showRowContextMenu(int issueId, POINT screenPt) {
-    if (!g_hWnd) return;
+    // 終了の確認ダイアログ表示中も一覧は右クリックを受けるため、入れ子で開かない
+    // （入れ子側の終了処理が g_rowMenuOpen を戻し、外側の表示中に離脱監視が再開してしまう）
+    if (!g_hWnd || g_rowMenuOpen) return;
     // メニュー構築時点の状態（集合外の行はピン留め・非表示にできない。setIssueState を参照）
-    bool pinned = false, hidden = false, inSet = false;
+    // 優先度・クローズ済みは取得集合を優先し、集合外ピンはピンのキャッシュから引く。
+    bool pinned = false, hidden = false, inSet = false, closed = false;
+    int priorityId = 0;
+    std::vector<PriorityEntry> priorities;
     for (const auto& it : g_issueItems) {
         if (it.id == issueId) {
             pinned = it.pinned;
@@ -5952,9 +6087,25 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
     }
     {
         std::lock_guard<std::mutex> lk(g_mtx);
-        inSet = std::any_of(g_issues.begin(), g_issues.end(),
-                            [&](const Issue& is) { return is.id == issueId; });
+        auto cur = std::find_if(g_issues.begin(), g_issues.end(),
+                                [&](const Issue& is) { return is.id == issueId; });
+        inSet = (cur != g_issues.end());
+        if (inSet) {
+            closed     = cur->closed;
+            priorityId = cur->priorityId;
+        }
+        else {
+            auto pin = std::find_if(g_pins.begin(), g_pins.end(),
+                                    [&](const PinEntry& p) { return p.id == issueId; });
+            if (pin != g_pins.end()) {
+                closed     = pin->closed;
+                priorityId = pin->priorityId;
+            }
+        }
+        priorities = g_priorities;  // モーダルループ中の差し替えに備え、選んだ添字の解釈用に写す
     }
+    const int closeStatusId = g_currentConfig.closeStatusId;
+    const UINT updateFlags  = MF_STRING | (g_issueUpdateBusy ? MF_GRAYED : 0);
 
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
@@ -5968,6 +6119,29 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
     AppendMenuW(menu, MF_STRING, IDM_ROW_NORMAL, L"通常");
     CheckMenuRadioItem(menu, IDM_ROW_PIN, IDM_ROW_NORMAL,
                        pinned ? IDM_ROW_PIN : hidden ? IDM_ROW_HIDE : IDM_ROW_NORMAL, MF_BYCOMMAND);
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    // サブメニューは AppendMenuW(MF_POPUP) で親へ渡した後、親の DestroyMenu で一緒に破棄される
+    if (!priorities.empty()) {
+        if (HMENU sub = CreatePopupMenu()) {
+            for (size_t i = 0; i < priorities.size(); ++i) {
+                const UINT id = IDM_ROW_PRIORITY_BASE + static_cast<UINT>(i);
+                AppendMenuW(sub, updateFlags, id, toWide(priorities[i].name).c_str());
+                if (priorities[i].id == priorityId)
+                    CheckMenuRadioItem(sub, id, id, id, MF_BYCOMMAND);
+            }
+            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sub), L"優先度");
+        }
+    }
+    if (HMENU sub = CreatePopupMenu()) {
+        AppendMenuW(sub, updateFlags, IDM_ROW_DUE_TODAY, L"今日");
+        AppendMenuW(sub, updateFlags, IDM_ROW_DUE_TOMORROW, L"明日");
+        AppendMenuW(sub, updateFlags, IDM_ROW_DUE_WEEK, L"1 週間後");
+        AppendMenuW(sub, updateFlags, IDM_ROW_DUE_NONE, L"期日なし");
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sub), L"期日");
+    }
+    if (closeStatusId > 0) {
+        AppendMenuW(menu, updateFlags | (closed ? MF_GRAYED : 0), IDM_ROW_CLOSE, L"チケットを終了");
+    }
 
     // 前面化で奪うフォアグラウンドを閉じた後に返すため、元の窓を控える
     const HWND prevFg = GetForegroundWindow();
@@ -5982,6 +6156,30 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
     else if (cmd == IDM_ROW_PIN)      setIssueState(issueId, IssueRowState::Pinned);
     else if (cmd == IDM_ROW_HIDE)     setIssueState(issueId, IssueRowState::Hidden);
     else if (cmd == IDM_ROW_NORMAL)   setIssueState(issueId, IssueRowState::Normal);
+    else if (cmd >= IDM_ROW_PRIORITY_BASE && cmd < IDM_ROW_PRIORITY_BASE + priorities.size()) {
+        const int newId = priorities[cmd - IDM_ROW_PRIORITY_BASE].id;
+        if (newId != priorityId)
+            startIssueUpdate(issueId, buildIssueUpdateBody("priority_id", std::to_string(newId)));
+    }
+    else if (cmd == IDM_ROW_DUE_NONE) {
+        startIssueUpdate(issueId, buildIssueUpdateBody("due_date", "null"));
+    }
+    else if (cmd == IDM_ROW_DUE_TODAY || cmd == IDM_ROW_DUE_TOMORROW || cmd == IDM_ROW_DUE_WEEK) {
+        // 期日の基準は登録欄と同じ JST の当日
+        const int days = (cmd == IDM_ROW_DUE_TODAY) ? 0 : (cmd == IDM_ROW_DUE_TOMORROW) ? 1 : 7;
+        const int ymd  = addDaysYmd(todayJstYmd(), days);
+        startIssueUpdate(issueId, buildIssueUpdateBody("due_date", "\"" + ymdToIsoDate(ymd) + "\""));
+    }
+    else if (cmd == IDM_ROW_CLOSE) {
+        // 取り消しにくい操作のため終了だけ確認する。（優先度・期日は選び直せるため確認しない）
+        // 所有者は前面化済みのトレイウィンドウとし、閉じた後のフォアグラウンドを自スレッドに残す。
+        // （下の返却処理が元の窓へ戻す。TOPMOST の一覧より前に出すため MB_TOPMOST を付ける）
+        const std::wstring text = idText + L" を終了しますか？";
+        if (MessageBoxW(g_hWnd, text.c_str(), L"redntfy",
+                        MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST) == IDOK) {
+            startIssueUpdate(issueId, buildIssueUpdateBody("status_id", std::to_string(closeStatusId)));
+        }
+    }
 
     g_rowMenuOpen = false;
     g_listOutsideTicks = 0;
@@ -6214,6 +6412,12 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         }
         updateRegisterControls();
         if (g_listInputMode && g_regEdit) SetFocus(g_regEdit);  // 送信中の無効化で失ったフォーカスを戻す
+        return 0;
+    }
+    // 行メニューからの更新の完了通知（成功なら即時ポーリングで更新結果を一覧へ反映する）
+    if (msg == WM_ISSUE_UPDATE_DONE) {
+        g_issueUpdateBusy = false;
+        if (wParam) g_registerPoll.store(true);
         return 0;
     }
     if (msg == WM_COMMAND) {
@@ -7183,6 +7387,8 @@ int wmain() {
         }
         writeLog("register_project: " + (cfg.registerProject.empty()
             ? std::string("(auto from login)") : wideToUtf8(cfg.registerProject)));
+        writeLog("close_status_id: " + (cfg.closeStatusId > 0
+            ? std::to_string(cfg.closeStatusId) : std::string("(unset)")));
 
         // 更新チェックスレッド起動（起動時に 1 回のみ実行）
         // detach しない。プロセス終了時の静的破棄と競合しないよう、シャットダウン時に join する。
@@ -7247,9 +7453,10 @@ int wmain() {
         // トレイアイコン削除より後に置き、ユーザから見た終了は即座に完了させる。
         // ただし PostMessage(g_hWnd, ...) を発火し得るため DestroyWindow より前で必ず join する。
         if (pollThread.joinable()) pollThread.join();
-        // 登録スレッドも WM_REGISTER_DONE を投函し得るため DestroyWindow より前に join する。
+        // 登録・更新スレッドも完了通知を投函し得るため DestroyWindow より前に join する。
         // （静的な std::thread を joinable のまま破棄すると std::terminate になるため必ず join する）
         if (g_registerThread.joinable()) g_registerThread.join();
+        if (g_issueUpdateThread.joinable()) g_issueUpdateThread.join();
 
         DestroyWindow(g_hWnd);
         g_hWnd = nullptr;  // 破棄済みハンドルの再利用を防ぐ（catch の後始末ガードが誤発火しないため）
@@ -7273,6 +7480,7 @@ int wmain() {
         if (pollThread.joinable()) pollThread.join();
         if (updateThread.joinable()) updateThread.join();
         if (g_registerThread.joinable()) g_registerThread.join();
+        if (g_issueUpdateThread.joinable()) g_issueUpdateThread.join();
         // 正常終了パスと同様にトレイ登録を後始末する。（怠るとプロセス消滅後も
         // ゴーストアイコンが残る）通知音スレッドも待ち、静的破棄との競合を防ぐ
         if (g_hWnd) {

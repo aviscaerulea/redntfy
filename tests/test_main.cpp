@@ -946,6 +946,21 @@ static void testBuildIssueCreateBody() {
     CHECK(buildIssueCreateBody(L"p", L"abc", "2026-09-28", 3, 4) == withPrio);
 }
 
+static void testBuildIssueUpdateBody() {
+    CHECK(buildIssueUpdateBody("priority_id", "3") == "{\"issue\":{\"priority_id\":3}}");
+    CHECK(buildIssueUpdateBody("due_date", "\"2026-10-12\"") == "{\"issue\":{\"due_date\":\"2026-10-12\"}}");
+    CHECK(buildIssueUpdateBody("due_date", "null") == "{\"issue\":{\"due_date\":null}}");
+}
+
+static void testAddDaysYmd() {
+    CHECK(addDaysYmd(20261011, 0) == 20261011);
+    CHECK(addDaysYmd(20261011, 1) == 20261012);
+    CHECK(addDaysYmd(20261031, 1) == 20261101);  // 月またぎ
+    CHECK(addDaysYmd(20261231, 7) == 20270107);  // 年またぎ
+    CHECK(addDaysYmd(20280228, 1) == 20280229);  // 閏日
+    CHECK(addDaysYmd(20261340, 1) == 20261340);  // 実在しない日付はそのまま
+}
+
 static void testRegisterProjectFromLogin() {
     CHECK_WSTR(registerProjectFromLogin(L"t_nikai"), L"t_nikai");
     CHECK_WSTR(registerProjectFromLogin(L"t_nikai@example.com"), L"t_nikai");
@@ -986,6 +1001,8 @@ int main() {
     testAlignTowardCenter();
     testRegisterSubject();
     testBuildIssueCreateBody();
+    testBuildIssueUpdateBody();
+    testAddDaysYmd();
     testRegisterProjectFromLogin();
     printf("checks: %d, failed: %d\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

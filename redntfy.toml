@@ -91,11 +91,15 @@ bug_trackers = ["*バグ*", "*障害*"]
 #             省略時はログイン名（@ より前を小文字にした値）と同じ識別子のプロジェクトが
 #             あればそこへ登録し、無ければ登録欄を表示しない。担当者は自分、期日と優先度は
 #             登録欄で選んだ値になり、トラッカー・ステータスはプロジェクトの既定に従う。
+# close_status_id：一覧の行メニュー「チケットを終了」で設定するステータスの id。
+#             Redmine の「管理」→「チケットのステータス」で確認する。
+#             省略時はメニューに「チケットを終了」を出さない。
 [redmine]
 # url       = "https://redmine.example.com"
 # api_key   = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 # query_ids = [12, 34]
 # register_project = "my-project"
+# close_status_id = 5
 
 # ガードトーン設定
 [guard]

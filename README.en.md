@@ -31,7 +31,7 @@ A sister tool, [gcalntfy](https://github.com/aviscaerulea/gcalntfy), notifies yo
 
 The tray icon shows a red badge in the bottom-right corner when there are unread tickets.
 
-Each row of the list shows the due date, assignee, project, and days left until the due date, with icons. Unread tickets and tickets with a due date are shown in bold. Tickets notified as new are marked with ✨. The pending count appears in the footer. Clicking a row opens the ticket in the browser and marks it as read. Right-clicking a row cycles through pinned, hidden, and normal. The list order can be chosen from "並び順" (sort order) in the tray menu: by updated date, due date, created date, or priority.
+Each row of the list shows the due date, assignee, project, and days left until the due date, with icons. Unread tickets and tickets with a due date are shown in bold. Tickets notified as new are marked with ✨. The pending count appears in the footer. Clicking a row opens the ticket in the browser and marks it as read. Right-clicking a row opens a menu to copy the ticket number or URL, switch between pinned and hidden, change the priority or due date, and close the ticket. The list order can be chosen from "並び順" (sort order) in the tray menu: by updated date, due date, created date, or priority.
 
 When a target project is available, a subject field, a priority, a due date, and a register button appear at the bottom of the list. Enter a subject (at least 3 characters), choose a priority (defaults to Redmine's default priority) and a due date (defaults to today), and register it to create a ticket assigned to yourself. If no target project is configured, tickets go to your personal project whose identifier matches your login name, if it exists.
 
@@ -94,7 +94,7 @@ See the setup guide for the detailed steps.
 Runtime settings live in `redntfy.toml` next to `redntfy.exe`.
 Placing `redntfy.local.toml` overrides values of the same keys on a per-key basis, which is useful for separating connection settings or per-environment differences.
 
-Configurable items are the connection settings, the custom queries to target, the project that receives tickets registered from the list (`register_project`), the number of polls per hour for each hour of the day, the row count and row format of the list, loudness normalization for the notification sound, and the update check at startup.
+Configurable items are the connection settings, the custom queries to target, the project that receives tickets registered from the list (`register_project`), the status used when closing a ticket from the row menu (`close_status_id`), the number of polls per hour for each hour of the day, the row count and row format of the list, loudness normalization for the notification sound, and the update check at startup.
 See the comments in `redntfy.toml` for the meaning and default value of each key.
 
 ### Example of `query_ids`
