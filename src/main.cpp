@@ -5845,8 +5845,10 @@ static void showListPopup(HWND trayWnd, bool refresh) {
             pushRow(ListRowKind::Issue, static_cast<int>(sz.cy), idx);
             ++idx;
         }
+        // 右クリックの案内は項目を列挙せず総称にする。（フッタ幅が一覧の最小幅を決めるため短く保ち、
+        // 行メニューの項目が増えても文言を追随させずに済ませる）
         g_listFooterText = L"未処理 " + std::to_wstring(visible)
-            + L" 件（クリックでブラウザ表示 ／ 右クリックでピン留め・非表示）";
+            + L" 件（クリックでブラウザ表示 ／ 右クリックでメニュー）";
         width = (std::max)(width, textRowWidth(g_listFooterText.c_str()));
         pushRow(ListRowKind::Separator, 9, 0);  // メニューのセパレータ相当（余白込み）
         pushRow(ListRowKind::Footer, textRowHeight, 0);
