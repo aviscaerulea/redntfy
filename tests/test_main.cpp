@@ -952,6 +952,35 @@ static void testBuildIssueUpdateBody() {
     CHECK(buildIssueUpdateBody("due_date", "null") == "{\"issue\":{\"due_date\":null}}");
 }
 
+// CF_HTML のヘッダの値を取り出す（見つからなければ -1）
+static long long clipboardHtmlOffset(const std::string& html, const char* key) {
+    const size_t pos = html.find(key);
+    if (pos == std::string::npos) return -1;
+    return std::stoll(html.substr(pos + strlen(key), 10));
+}
+
+static void testBuildClipboardHtml() {
+    for (const char* frag : { "<a href=\"https://example.com/issues/1\">#1 abc</a>",
+                              reinterpret_cast<const char*>(u8"<a href=\"x\">#2 日本語の件名</a>") }) {
+        const std::string fragment = frag;
+        const std::string html = buildClipboardHtml(fragment);
+        const long long startHtml = clipboardHtmlOffset(html, "StartHTML:");
+        const long long endHtml   = clipboardHtmlOffset(html, "EndHTML:");
+        const long long startFrag = clipboardHtmlOffset(html, "StartFragment:");
+        const long long endFrag   = clipboardHtmlOffset(html, "EndFragment:");
+        CHECK(html.compare(static_cast<size_t>(startHtml), 6, "<html>") == 0);
+        CHECK(endHtml == static_cast<long long>(html.size()));
+        CHECK(html.substr(static_cast<size_t>(startFrag), static_cast<size_t>(endFrag - startFrag)) == fragment);
+    }
+}
+
+static void testBuildMarkdownLink() {
+    CHECK_WSTR(buildMarkdownLink(L"#1 abc", L"https://example.com/issues/1"),
+               L"[#1 abc](https://example.com/issues/1)");
+    // 角括弧とバックスラッシュはエスケープする
+    CHECK_WSTR(buildMarkdownLink(L"#2 [WIP] a\\b", L"u"), L"[#2 \\[WIP\\] a\\\\b](u)");
+}
+
 static void testAddDaysYmd() {
     CHECK(addDaysYmd(20261011, 0) == 20261011);
     CHECK(addDaysYmd(20261011, 1) == 20261012);
@@ -1003,6 +1032,8 @@ int main() {
     testBuildIssueCreateBody();
     testBuildIssueUpdateBody();
     testAddDaysYmd();
+    testBuildClipboardHtml();
+    testBuildMarkdownLink();
     testRegisterProjectFromLogin();
     printf("checks: %d, failed: %d\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

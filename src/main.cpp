@@ -6020,33 +6020,79 @@ static void setIssueState(int issueId, IssueRowState target) {
         + (nowPinned ? " pinned" : nowHidden ? " hidden" : " normal"));
 }
 
+// HTML 断片をクリップボードの CF_HTML（"HTML Format"）の書式で包む
+// fragmentUtf8 は UTF-8 の HTML 断片。戻り値は UTF-8 のヘッダ＋本文で、ヘッダの各オフセットは先頭からのバイト数。
+// オフセットを 10 桁ゼロ埋めの固定長にして、ヘッダ長がオフセットの値に依存しないようにする。
+static std::string buildClipboardHtml(const std::string& fragmentUtf8) {
+    static constexpr char kHeaderFmt[] =
+        "Version:0.9\r\nStartHTML:%010zu\r\nEndHTML:%010zu\r\n"
+        "StartFragment:%010zu\r\nEndFragment:%010zu\r\n";
+    static constexpr char kPrefix[] = "<html><body><!--StartFragment-->";
+    static constexpr char kSuffix[] = "<!--EndFragment--></body></html>";
+    // 固定長のため、仮の値で書式化した長さがそのままヘッダ長になる
+    char header[160];
+    const size_t headerLen = static_cast<size_t>(snprintf(header, sizeof(header), kHeaderFmt,
+                                                          size_t{0}, size_t{0}, size_t{0}, size_t{0}));
+    const size_t startFragment = headerLen + sizeof(kPrefix) - 1;
+    const size_t endFragment   = startFragment + fragmentUtf8.size();
+    const size_t endHtml       = endFragment + sizeof(kSuffix) - 1;
+    snprintf(header, sizeof(header), kHeaderFmt, headerLen, endHtml, startFragment, endFragment);
+    return std::string(header) + kPrefix + fragmentUtf8 + kSuffix;
+}
+
+// Markdown のリンク "[label](url)" を組み立てる
+// label 中の "\"・"["・"]" はバックスラッシュでエスケープする。（件名の角括弧でリンク記法が壊れるのを防ぐ）
+// url はチケット URL（Redmine の URL ＋ /issues/{id}）で丸括弧・空白を含まない前提のため、手を加えない。
+static std::wstring buildMarkdownLink(const std::wstring& label, const std::wstring& url) {
+    std::wstring r = L"[";
+    for (wchar_t c : label) {
+        if (c == L'\\' || c == L'[' || c == L']') r += L'\\';
+        r += c;
+    }
+    return r + L"](" + url + L")";
+}
+
 // クリップボードへ文字列を置く（失敗はログのみ。利用者には貼り付け結果で分かるため通知しない）
-static void setClipboardText(HWND owner, const std::wstring& text) {
+// html が空でなければ、同じ内容の CF_HTML（buildClipboardHtml の出力）も併せて置く。
+// 貼り付け先は、リッチテキストを受けるなら HTML を、受けなければ text を使う。
+static void setClipboardText(HWND owner, const std::wstring& text, const std::string& html = {}) {
     if (!OpenClipboard(owner)) {
         writeLog("clipboard: open failed");
         return;
     }
     EmptyClipboard();
-    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
-    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-    void* p = mem ? GlobalLock(mem) : nullptr;
-    if (p) {
-        memcpy(p, text.c_str(), bytes);
-        GlobalUnlock(mem);
-        // 成功時はメモリの所有がシステムへ移る。失敗時だけ自分で解放する
-        if (SetClipboardData(CF_UNICODETEXT, mem)) mem = nullptr;
-        else writeLog("clipboard: set failed");
+    // data（NUL 終端込みで bytes バイト）を format で置く
+    auto put = [](UINT format, const void* data, size_t bytes) {
+        HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        void* p = mem ? GlobalLock(mem) : nullptr;
+        if (p) {
+            memcpy(p, data, bytes);
+            GlobalUnlock(mem);
+            // 成功時はメモリの所有がシステムへ移る。失敗時だけ自分で解放する
+            if (SetClipboardData(format, mem)) mem = nullptr;
+            else writeLog("clipboard: set failed, format=" + std::to_string(format));
+        }
+        else {
+            writeLog("clipboard: alloc failed");
+        }
+        if (mem) GlobalFree(mem);
+    };
+    put(CF_UNICODETEXT, text.c_str(), (text.size() + 1) * sizeof(wchar_t));
+    if (!html.empty()) {
+        const UINT cfHtml = RegisterClipboardFormatW(L"HTML Format");
+        if (cfHtml) put(cfHtml, html.c_str(), html.size() + 1);
+        else writeLog("clipboard: HTML Format registration failed");
     }
-    else {
-        writeLog("clipboard: alloc failed");
-    }
-    if (mem) GlobalFree(mem);
     CloseClipboard();
 }
 
 // 一覧の行の右クリックメニューのコマンド ID（TPM_RETURNCMD で受け、トレイの IDM_* とは混ぜない）
+// サブメニュー「コピー」（ID は追加順の採番で、値の連続には依存しない）
 static constexpr UINT IDM_ROW_COPY_ID  = 41001;  // 番号（#123）をコピー
 static constexpr UINT IDM_ROW_COPY_URL = 41002;  // チケットの URL をコピー
+static constexpr UINT IDM_ROW_COPY_LINK = 41007; // 「#123 件名」を URL へのリンクとしてコピー（CF_HTML＋テキスト）
+static constexpr UINT IDM_ROW_COPY_TEXT = 41008; // 「#123 件名」と URL の 2 行テキストとしてコピー
+static constexpr UINT IDM_ROW_COPY_MARKDOWN = 41009; // Markdown のリンク [#123 件名](URL) としてコピー
 // 状態のラジオ項目（CheckMenuRadioItem の範囲指定のため連番にする）
 static constexpr UINT IDM_ROW_PIN      = 41003;
 static constexpr UINT IDM_ROW_HIDE     = 41004;
@@ -6067,6 +6113,8 @@ static constexpr UINT IDM_ROW_PRIORITY_BASE = 41100;
 // TrackPopupMenu はモーダルループでメッセージを回し、その間にポーリングが一覧を組み直し得る。
 // そのため対象は id で持ち、行の添字は使わない。表示中は g_rowMenuOpen で離脱監視を止める。
 // （終了の確認ダイアログの表示中も、メニューと同じ理由で立てたままにする）
+// コピー系（番号・URL・テキスト・Markdown・リンク）はサブメニュー「コピー」にまとめる。
+// リンクのコピーだけは CF_HTML とプレーンテキストを同時に置く。（貼り付け先に応じてリンクかテキストになる）
 // 優先度・期日・終了は Redmine への更新で、startIssueUpdate へ渡す。送信中は灰色にして重ねて送らない。
 // 優先度は g_priorities が空（未取得・有効 0 件）なら項目ごと出さず、終了は close_status_id 未設定なら出さない。
 static void showRowContextMenu(int issueId, POINT screenPt) {
@@ -6077,6 +6125,7 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
     // 優先度・クローズ済みは取得集合を優先し、集合外ピンはピンのキャッシュから引く。
     bool pinned = false, hidden = false, inSet = false, closed = false;
     int priorityId = 0;
+    std::string subject;  // コピー系の表示文字列用（UTF-8）
     std::vector<PriorityEntry> priorities;
     for (const auto& it : g_issueItems) {
         if (it.id == issueId) {
@@ -6093,6 +6142,7 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
         if (inSet) {
             closed     = cur->closed;
             priorityId = cur->priorityId;
+            subject    = cur->subject;
         }
         else {
             auto pin = std::find_if(g_pins.begin(), g_pins.end(),
@@ -6100,6 +6150,7 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
             if (pin != g_pins.end()) {
                 closed     = pin->closed;
                 priorityId = pin->priorityId;
+                subject    = pin->subject;
             }
         }
         priorities = g_priorities;  // モーダルループ中の差し替えに備え、選んだ添字の解釈用に写す
@@ -6110,9 +6161,17 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
     const std::wstring idText = L"#" + std::to_wstring(issueId);
-    AppendMenuW(menu, MF_STRING, IDM_ROW_COPY_ID, (L"番号をコピー（" + idText + L"）").c_str());
-    AppendMenuW(menu, MF_STRING, IDM_ROW_COPY_URL, L"URL をコピー");
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    // コピー系はサブメニュー「コピー」へまとめる（親の DestroyMenu がサブメニューも破棄する）
+    if (HMENU sub = CreatePopupMenu()) {
+        AppendMenuW(sub, MF_STRING, IDM_ROW_COPY_ID, (L"番号（" + idText + L"）").c_str());
+        AppendMenuW(sub, MF_STRING, IDM_ROW_COPY_URL, L"URL");
+        AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(sub, MF_STRING, IDM_ROW_COPY_TEXT, L"テキストとしてコピー");
+        AppendMenuW(sub, MF_STRING, IDM_ROW_COPY_MARKDOWN, L"Markdown としてコピー");
+        AppendMenuW(sub, MF_STRING, IDM_ROW_COPY_LINK, L"リンクとしてコピー");
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sub), L"コピー");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    }
     const UINT stateFlags = MF_STRING | (inSet ? 0 : MF_GRAYED);
     AppendMenuW(menu, stateFlags, IDM_ROW_PIN, L"ピン留め");
     AppendMenuW(menu, stateFlags, IDM_ROW_HIDE, L"非表示");
@@ -6151,8 +6210,20 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
                                                       screenPt.x, screenPt.y, 0, g_hWnd, nullptr));
     DestroyMenu(menu);
 
+    // コピー系の共通素材（表示文字列は「#123 件名」、件名が空なら「#123」のみ）
+    const std::wstring url   = issueUrl(g_currentConfig, issueId);
+    const std::wstring label = subject.empty() ? idText : idText + L" " + toWide(subject);
     if (cmd == IDM_ROW_COPY_ID)       setClipboardText(g_hWnd, idText);
-    else if (cmd == IDM_ROW_COPY_URL) setClipboardText(g_hWnd, issueUrl(g_currentConfig, issueId));
+    else if (cmd == IDM_ROW_COPY_URL) setClipboardText(g_hWnd, url);
+    else if (cmd == IDM_ROW_COPY_TEXT) setClipboardText(g_hWnd, label + L"\r\n" + url);
+    else if (cmd == IDM_ROW_COPY_MARKDOWN) setClipboardText(g_hWnd, buildMarkdownLink(label, url));
+    else if (cmd == IDM_ROW_COPY_LINK) {
+        // 「#123 件名」を URL へリンクした HTML と、「#123 件名 URL」のテキストを同時に置く
+        // （Google Chat などリッチテキストの貼り付け先ではリンクになり、それ以外ではテキストで貼れる）
+        const std::string fragment = "<a href=\"" + wideToUtf8(escapeXml(url)) + "\">"
+                                   + wideToUtf8(escapeXml(label)) + "</a>";
+        setClipboardText(g_hWnd, label + L" " + url, buildClipboardHtml(fragment));
+    }
     else if (cmd == IDM_ROW_PIN)      setIssueState(issueId, IssueRowState::Pinned);
     else if (cmd == IDM_ROW_HIDE)     setIssueState(issueId, IssueRowState::Hidden);
     else if (cmd == IDM_ROW_NORMAL)   setIssueState(issueId, IssueRowState::Normal);
