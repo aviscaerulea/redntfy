@@ -579,6 +579,13 @@ static std::unordered_set<int> g_newIds;
 // 後日クエリへ戻ったチケットは通常状態で再出現し、必要なら改めて非表示にする）
 static std::unordered_set<int> g_hiddenIds;
 
+// 登録先プロジェクトの表示名（g_mtx で保護。空 = 未確定または登録先なし）
+// 一覧ではこの名前のチケットの {project} を空にする。（通常は自分の個人プロジェクトで、名前が情報にならないため）
+// 判定は名前の一致で行う。集合外ピン（PinEntry）はプロジェクト id を持たず名前しか比べられないため、
+// 取得集合の行も同じ規則に揃える。同名の別プロジェクトの名前も省くが、登録先プロジェクト名の重複は起きないものとして許容する。
+// ポーリングスレッドが resolvePollMetadata でセッション 1 回だけ確定する。
+static std::string g_personalProjectName;
+
 // 自分の Redmine user id（起動時に /users/current.json で確定。0 = 取得失敗＝自分除外判定なし）
 // ポーリングスレッドが書き込み、担当者フィルタのため WndProc スレッドも読むので atomic とする。
 static std::atomic<int>        g_myUserId{0};
@@ -3553,7 +3560,7 @@ static void clearTrayTooltip(HWND hWnd) {
 struct ListRow {
     int         id = 0;
     std::string subject;
-    std::string projectName;          // 空 = 未取得（旧形式の pins.json 由来など）
+    std::string projectName;          // 空 = 未取得（旧形式の pins.json 由来など）または登録先プロジェクト
     std::string updater;              // 最終更新者の姓（{lastname}。取得できない場合はフルネーム）
     std::string updaterFirst;         // 最終更新者の名（{firstname}。未取得は空）
     std::string dueDate;              // "YYYY-MM-DD"（期日なしは空）
@@ -3599,6 +3606,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
     std::unordered_set<int> newIds;
     std::unordered_set<int> hiddenIds;
     std::unordered_map<int, int> priorityPositions;
+    std::string personalProject;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         issues    = g_issues;
@@ -3607,7 +3615,12 @@ static std::vector<ListRow> buildListRows(int& visible) {
         newIds    = g_newIds;
         hiddenIds = g_hiddenIds;
         priorityPositions = g_priorityPositions;
+        personalProject   = g_personalProjectName;
     }
+    // 登録先プロジェクトの行はプロジェクト名を空にする（{project} が括弧ごと消える。g_personalProjectName を参照）
+    auto projectLabel = [&personalProject](const std::string& name) {
+        return (!personalProject.empty() && name == personalProject) ? std::string() : name;
+    };
     // 優先度の順位。順位表に無い id（未取得・未知）は id そのものを順位にして縮退する
     auto rankOf = [&priorityPositions](int priorityId) {
         auto it = priorityPositions.find(priorityId);
@@ -3639,7 +3652,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
         else if (!hidden) {
             ++visible;
         }
-        rows.push_back({.id = is.id, .subject = is.subject, .projectName = is.projectName,
+        rows.push_back({.id = is.id, .subject = is.subject, .projectName = projectLabel(is.projectName),
                         .updater = is.updaterDisplay, .updaterFirst = is.updaterFirstName,
                         .dueDate = is.dueDate,
                         .updatedOn = is.updatedOn, .createdOn = is.createdOn,
@@ -3653,7 +3666,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
     }
     for (const auto& p : pins) {
         if (shown.count(p.id)) continue;
-        rows.push_back({.id = p.id, .subject = p.subject, .projectName = p.projectName,
+        rows.push_back({.id = p.id, .subject = p.subject, .projectName = projectLabel(p.projectName),
                         .updater = p.updaterDisplay, .updaterFirst = p.updaterFirst,
                         .dueDate = p.dueDate,
                         .updatedOn = p.updatedOn, .createdOn = p.createdOn,
@@ -4052,6 +4065,8 @@ static constexpr wchar_t NEW_MARK[] = L"✨ ";
 //   識別子的な要素（プロジェクト名・姓・名など）は横幅を優先して付けない。
 //   空に展開された要素（期限なし・更新者不明など）は、直後のリテラル先頭空白を
 //   出力末尾が空白または行頭なら取り除いて詰める。（従来の「詰めて省く」を再現）
+//   空に展開された要素を括弧対（[] ［］ () （） 【】 「」）が直接囲んでいれば、括弧ごと取り除く。
+//   （登録先プロジェクトや旧形式ピンで {project} が空のとき、既定書式の "[]" を残さないため）
 //   {group}＝"👥 "・{new}＝"✨ "・{bug}＝"💥 "・{ago}＝"（3 日前）"・{left}＝"（2 日遅れ）" は
 //   装飾込みで展開し、
 //   空なら装飾ごと消える。
@@ -4063,11 +4078,21 @@ static constexpr wchar_t NEW_MARK[] = L"✨ ";
 // ピン記号はラベルに含めない。drawIssueRow が IssueItem::pinned を見てマーカー列に描く。
 static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
                                   long long todayDays) {
+    // 空要素を囲む括弧対（開き → 閉じ）
+    static constexpr std::pair<wchar_t, wchar_t> BRACKETS[] = {
+        { L'[', L']' }, { L'［', L'］' }, { L'(', L')' }, { L'（', L'）' }, { L'【', L'】' }, { L'「', L'」' },
+    };
     IssueLabel r;
-    bool prevEmpty = false;  // 直前のプレースホルダが空に展開されたか（空白整理の条件）
+    bool prevEmpty = false;    // 直前のプレースホルダが空に展開されたか（空白整理の条件）
+    wchar_t pendingClose = 0;  // 空要素の直前が開き括弧だったときの対の閉じ括弧（0 = なし）
     for (const auto& tk : g_currentConfig.listFormat) {
         if (tk.element == FMT_LITERAL) {
             std::wstring lit = tk.literal;
+            if (prevEmpty && pendingClose && !lit.empty() && lit[0] == pendingClose) {
+                r.text.pop_back();  // 開き括弧
+                lit.erase(0, 1);    // 閉じ括弧
+            }
+            pendingClose = 0;
             if (prevEmpty && (r.text.empty() || r.text.back() == L' ')) {
                 size_t i = 0;
                 while (i < lit.size() && lit[i] == L' ') ++i;
@@ -4096,9 +4121,17 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
         if (tk.maxChars > 0)
             val = truncateText(val, static_cast<size_t>(tk.maxChars), tk.element == FMT_SUBJECT);
         if (val.empty()) {
+            // 連続する空要素では最初の要素の判定を保つ。（"[{a}{b}]" の両方が空なら括弧ごと消す）
+            if (!prevEmpty) {
+                pendingClose = 0;
+                for (const auto& [open, close] : BRACKETS) {
+                    if (!r.text.empty() && r.text.back() == open) pendingClose = close;
+                }
+            }
             prevEmpty = true;
             continue;
         }
+        pendingClose = 0;
         bool alertNow = tk.alert && due.overdue;  // "!" 指定かつ期限切れ行
         ColorRange range{.offset = r.text.size(), .len = val.size(), .color = ALERT_TEXT_COLOR,
                          .keepColor = true, .sizePct = tk.sizePct};
@@ -6961,6 +6994,7 @@ struct PollSession {
     std::vector<int> ownGroups;        // 自分の所属グループ（fetchMyUserId が設定）
     std::wstring login;                // 自分のログイン名（fetchMyUserId が設定）
     bool registerProjectResolved = false;  // 登録先の自動判定が確定したか（明示設定時は判定しない）
+    bool personalProjectResolved = false;  // 登録先プロジェクトの表示名（g_personalProjectName）が確定したか
     std::vector<int> groupIds;         // グループ担当判定に使う集合（全グループ、権限不足時は所属グループ）
     bool groupIdsResolved = false;
 
@@ -7037,6 +7071,40 @@ static void resolvePollMetadata(const Config& cfg, PollSession& s, bool manualTr
             else if (status == 403 || status == 404) {
                 s.registerProjectResolved = true;
                 writeLog("register project: " + wideToUtf8(id) + " not found (disabled)");
+            }
+        }
+    }
+
+    // 登録先プロジェクトの表示名を確定する（一覧で {project} を省く判定用。セッション 1 回）
+    // 明示値と自動判定の確定値を同じ経路で扱うため、上の存在確認の応答は流用しない。
+    // 403・404 は名前なしで確定（省略しない）、それ以外の失敗は次回ポーリングで再試行する。
+    // 登録先が「無し」で確定した場合は currentRegisterProject() が空のため何もしない。
+    if (!s.personalProjectResolved) {
+        const std::wstring project = currentRegisterProject();
+        if (!project.empty()) {
+            DWORD status = 0;
+            const std::string resp = redmineGet(cfg.redmineUrl + L"/projects/" + project + L".json",
+                                                cfg.apiKey, &status);
+            if (status == 200) {
+                std::string name;
+                try {
+                    auto obj = winrt::Windows::Data::Json::JsonObject::Parse(winrt::to_hstring(resp));
+                    // 一覧側の projectName と同じ正規化を通す（全角空白の有無で名前一致が外れないため）
+                    name = normalizeSpaces(wideToUtf8(obj.GetNamedObject(L"project").GetNamedString(L"name").c_str()));
+                }
+                catch (...) {}
+                if (!name.empty()) {
+                    {
+                        std::lock_guard<std::mutex> lk(g_mtx);
+                        g_personalProjectName = name;
+                    }
+                    s.personalProjectResolved = true;
+                    writeLog("personal project name: " + name);
+                }
+            }
+            else if (status == 403 || status == 404) {
+                s.personalProjectResolved = true;
+                writeLog("personal project: not found");
             }
         }
     }

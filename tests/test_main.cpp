@@ -187,6 +187,28 @@ static void testBuildIssueLabel() {
         return row;
     };
 
+    // 空要素を囲む括弧対は括弧ごと消える（登録先プロジェクト・旧形式ピンの {project} が空の行）
+    g_currentConfig.listFormat = parseListFormat(LIST_FORMAT_DEFAULT);
+    {
+        auto row = makeRow();
+        row.projectName = "";
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"#12345  山田  👥 7/28 💥 テスト件名（6 日遅れ）");
+        row.assignedToGroup = false;
+        lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"#12345  山田  7/28 💥 テスト件名（6 日遅れ）");
+    }
+    g_currentConfig.listFormat = parseListFormat(L"#{id} ({lastname}) {subject}");
+    {
+        auto row = makeRow();
+        row.updater = "";
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"#12345 テスト件名");
+        row.updater = "山田";
+        lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"#12345 (山田) テスト件名");
+    }
+
     // 全要素あり＋既定テンプレート：従来の固定並びと一致すること
     g_currentConfig.listFormat = parseListFormat(LIST_FORMAT_DEFAULT);
     {
