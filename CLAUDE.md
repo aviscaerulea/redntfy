@@ -51,7 +51,7 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
 
 - スレッド構成：メイン（メッセージループ・トレイ UI）／`pollThreadFunc`（HTTP・Toast・音・状態保存）／`soundThread`（WASAPI 再生）／`checkForUpdates`（起動時 1 回、シャットダウン時に join）／`registerIssueThreadFunc`（登録欄の送信 1 回ごとに起動、シャットダウン時に join）／`issueUpdateThreadFunc`（行メニューの更新送信 1 回ごとに起動、シャットダウン時に join）
 
-- 共有状態は `g_mtx`（`g_issues`・`g_pins`・`g_unreadIds`・`g_newIds`・`g_hiddenIds`・`g_priorities`・`g_priorityPositions`・`g_latestVersion`）と atomic（`g_myUserId`・`g_assignedToMeOnly` など）で保護する  
+- 共有状態は `g_mtx`（`g_issues`・`g_pins`・`g_unreadIds`・`g_newIds`・`g_hiddenIds`・`g_priorities`・`g_priorityPositions`・`g_latestVersion`・`g_registerProject`・`g_personalProjectName`）と atomic（`g_myUserId`・`g_assignedToMeOnly` など）で保護する  
   `g_currentConfig` は起動時に 1 回設定した後は不変で、ロック無しで読み取る。
 
 - 永続化は `state.json`（検知済み）、`pins.json`（ピン留め）、`hidden.json`（非表示チケットの id 配列）で、書き出しは `atomicWriteJson`（tmp 経由の置換）  
