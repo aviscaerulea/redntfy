@@ -59,25 +59,28 @@ static void testParseListFormat() {
     // 既定テンプレートの全トークン（並び・要素・最大文字数）
     {
         auto t = parseListFormat(LIST_FORMAT_DEFAULT);
-        CHECK(t.size() == 15);
-        if (t.size() == 15) {
+        CHECK(t.size() == 18);
+        if (t.size() == 18) {
             CHECK(t[0].element == FMT_LITERAL);   CHECK_WSTR(t[0].literal, L"#");
             CHECK(t[1].element == FMT_ID);        CHECK(t[1].maxChars == 0);  CHECK(!t[1].alert);
             CHECK(t[1].sizePct == 100);
             CHECK(t[2].element == FMT_LITERAL);   CHECK_WSTR(t[2].literal, L"  ");
-            CHECK(t[3].element == FMT_LASTNAME);
-            CHECK(t[4].element == FMT_LITERAL);   CHECK_WSTR(t[4].literal, L"  ");
-            CHECK(t[5].element == FMT_GROUP);
-            CHECK(t[6].element == FMT_LITERAL);   CHECK_WSTR(t[6].literal, L"[");
-            CHECK(t[7].element == FMT_PROJECT);   CHECK(t[7].maxChars == 5);
-            CHECK(t[8].element == FMT_LITERAL);   CHECK_WSTR(t[8].literal, L"] ");
-            CHECK(t[9].element == FMT_DUE);       CHECK(t[9].alert);
-            CHECK(t[10].element == FMT_LITERAL);  CHECK_WSTR(t[10].literal, L" ");
-            CHECK(t[11].element == FMT_NEW);
-            CHECK(t[12].element == FMT_BUG);
-            CHECK(t[13].element == FMT_SUBJECT);  CHECK(t[13].maxChars == 40);  CHECK(t[13].alert);
-            CHECK(t[14].element == FMT_LEFT);     CHECK(t[14].maxChars == 0);   CHECK(t[14].alert);
-            CHECK(t[14].sizePct == 90);
+            CHECK(t[3].element == FMT_AUTHOR);
+            CHECK(t[4].element == FMT_LITERAL);   CHECK_WSTR(t[4].literal, L"/");
+            CHECK(t[5].element == FMT_COMMENTER);
+            CHECK(t[6].element == FMT_LITERAL);   CHECK_WSTR(t[6].literal, L"  ");
+            CHECK(t[7].element == FMT_GROUP);
+            CHECK(t[8].element == FMT_LITERAL);   CHECK_WSTR(t[8].literal, L"[");
+            CHECK(t[9].element == FMT_PROJECT);   CHECK(t[9].maxChars == 5);
+            CHECK(t[10].element == FMT_LITERAL);  CHECK_WSTR(t[10].literal, L"] ");
+            CHECK(t[11].element == FMT_DUE);      CHECK(t[11].alert);
+            CHECK(t[12].element == FMT_LEFT);     CHECK(t[12].maxChars == 0);   CHECK(t[12].alert);
+            CHECK(t[12].sizePct == 90);
+            CHECK(t[13].element == FMT_LITERAL);  CHECK_WSTR(t[13].literal, L" ");
+            CHECK(t[14].element == FMT_NEW);
+            CHECK(t[15].element == FMT_BUG);
+            CHECK(t[16].element == FMT_SUBJECT);  CHECK(t[16].maxChars == 40);  CHECK(t[16].alert);
+            CHECK(t[17].element == FMT_AGO);      CHECK(!t[17].alert);          CHECK(t[17].sizePct == 90);
         }
     }
 
@@ -180,15 +183,33 @@ static void testBuildIssueLabel() {
         row.projectName     = "ロケモニプロジェクト";
         row.updater         = "山田";
         row.updaterFirst    = "太郎";
-        row.dueDate         = "2026-07-28";
+        row.author          = "山田";
+        row.commenter       = "佐藤";
+        row.dueDate        = "2026-07-28";
         row.updatedOn       = "2026-07-31T12:00:00Z";  // 基準日から 3 日前
         row.assignedToGroup = true;
         row.isBugTracker    = true;
         return row;
     };
 
-    // 空要素を囲む括弧対は括弧ごと消える（登録先プロジェクト・旧形式ピンの {project} が空の行）
+    // 既定テンプレート：起票者/最後のコメント投稿者、期日の直後に残り日数、末尾に経過日数
     g_currentConfig.listFormat = parseListFormat(LIST_FORMAT_DEFAULT);
+    {
+        auto row = makeRow();
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"#12345  山田/佐藤  👥 [ロケモニプ] 7/28（6 日遅れ） 💥 テスト件名（3 日前）");
+        // コメントなし：区切りの "/" ごと消える
+        row.commenter.clear();
+        lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28（6 日遅れ） 💥 テスト件名（3 日前）");
+    }
+
+    // 以降は書式の仕組みの検査で、旧既定（最終更新者の姓・末尾に残り日数）の並びを使う
+    static constexpr wchar_t LEGACY_FORMAT[] =
+        L"#{id}  {lastname}  {group}[{project:5}] {due!} {new}{bug}{subject:40!}{left@90!}";
+
+    // 空要素を囲む括弧対は括弧ごと消える（登録先プロジェクト・旧形式ピンの {project} が空の行）
+    g_currentConfig.listFormat = parseListFormat(LEGACY_FORMAT);
     {
         auto row = makeRow();
         row.projectName = "";
@@ -209,8 +230,8 @@ static void testBuildIssueLabel() {
         CHECK_WSTR(lbl.text, L"#12345 (山田) テスト件名");
     }
 
-    // 全要素あり＋既定テンプレート：従来の固定並びと一致すること
-    g_currentConfig.listFormat = parseListFormat(LIST_FORMAT_DEFAULT);
+    // 全要素あり＋旧既定テンプレート：従来の固定並びと一致すること
+    g_currentConfig.listFormat = parseListFormat(LEGACY_FORMAT);
     {
         auto row = makeRow();
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);

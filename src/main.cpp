@@ -422,6 +422,8 @@ struct Issue {
     std::string updaterName;       // フルネーム（Toast の「更新：○○」表示用）
     std::string updaterDisplay;    // 一覧の表示名（姓。取得できない場合はフルネーム）
     std::string updaterFirstName;  // 一覧の {firstname} 用（姓と違いフォールバックせず、未取得は空）
+    std::string authorDisplay;     // 一覧の {author} 用（起票者の姓。取得できない場合はフルネーム）
+    std::string commenterDisplay;  // 一覧の {commenter} 用（最後のコメント投稿者の姓。コメントなしは空）
 };
 
 // ピン留め 1 件分
@@ -439,6 +441,8 @@ struct PinEntry {
     bool isBugTracker    = false;  // バグ・障害トラッカー（💥 マーカー。集合外ピンも表示できるよう永続化）
     std::string updaterDisplay;    // 最終更新者の表示名（姓。集合外ピンも表示できるよう永続化）
     std::string updaterFirst;      // 最終更新者の名（{firstname} 用。集合外ピンも表示できるよう永続化）
+    std::string authorDisplay;     // 起票者の姓（{author} 用。集合外ピンも表示できるよう永続化）
+    std::string commenterDisplay;  // 最後のコメント投稿者の姓（{commenter} 用。同上。コメントなしは空）
 
     // 全フィールドの一致で等価とする（refreshPins の変更検知が使う）
     // 既定実装にする理由は、フィールド追加時に比較の追記漏れで更新が黙って捨てられるのを防ぐため。
@@ -448,7 +452,7 @@ struct PinEntry {
 // 一覧行フォーマットの要素種別（FormatToken::element の値）
 enum FormatElement {
     FMT_LITERAL = -1,  // リテラル文字列（未知プレースホルダの原文もこれで保持）
-    FMT_ID, FMT_LASTNAME, FMT_FIRSTNAME, FMT_GROUP, FMT_PROJECT,
+    FMT_ID, FMT_LASTNAME, FMT_FIRSTNAME, FMT_AUTHOR, FMT_COMMENTER, FMT_GROUP, FMT_PROJECT,
     FMT_DUE, FMT_NEW, FMT_BUG, FMT_SUBJECT, FMT_AGO, FMT_LEFT,
 };
 
@@ -463,11 +467,13 @@ struct FormatToken {
 };
 
 // list_format の既定値
-// v1.4 までの固定並びへ新規流入マーカー {new} を 💥 マーカーの直前に加え、末尾の経過日数 {ago} を
-// 期日の残り日数 {left} に置き換えた並び。期限切れ行で赤にするのは期日、件名、残り日数とする。
-// 残り日数は件名より目立たせないため 90% に縮める。
+// 番号、起票者/最後のコメント投稿者、グループ担当マーカー、[プロジェクト名]、期日と残り日数、
+// 新規流入マーカー、バグマーカー、件名、経過日数の並び。名前を最終更新者でなく起票者と
+// コメント投稿者にするのは、優先度・期日の変更だけで名前が操作者に変わらないようにするため。
+// 期限切れ行で赤にするのは期日、件名、残り日数とする。
+// 残り日数と経過日数は件名より目立たせないため 90% に縮める。
 static constexpr wchar_t LIST_FORMAT_DEFAULT[] =
-    L"#{id}  {lastname}  {group}[{project:5}] {due!} {new}{bug}{subject:40!}{left@90!}";
+    L"#{id}  {author}/{commenter}  {group}[{project:5}] {due!}{left@90!} {new}{bug}{subject:40!}{ago@90}";
 
 // フォールバックモード（query_ids 省略）の擬似クエリ id
 // Redmine のクエリ id は正の整数のため 0 は衝突しない。state.json の queries／
@@ -1220,6 +1226,10 @@ struct StateEntry {
     int              updaterId = 0;
     std::string      updaterDisplay;
     std::string      updaterFirst;  // 名（旧形式はキー不在＝空で読まれ、チケット更新時に埋まる）
+    // 起票者と最後のコメント投稿者の姓（旧形式はキー不在＝空で読まれ、author が空のため
+    // キャッシュミスして journals を取り直す）
+    std::string      authorDisplay;
+    std::string      commenterDisplay;
 };
 
 // state.json の読み込み結果
@@ -1268,6 +1278,8 @@ static PollState loadState(const std::wstring& dir) {
                 e.updaterId      = static_cast<int>(o.GetNamedNumber(L"updater_id", 0));
                 e.updaterDisplay = winrt::to_string(o.GetNamedString(L"updater", L""));
                 e.updaterFirst   = winrt::to_string(o.GetNamedString(L"updater_first", L""));
+                e.authorDisplay    = winrt::to_string(o.GetNamedString(L"author", L""));
+                e.commenterDisplay = winrt::to_string(o.GetNamedString(L"commenter", L""));
                 if (o.HasKey(L"queries")) {
                     e.hasQueries = true;
                     for (auto q : o.GetNamedArray(L"queries")) {
@@ -1325,6 +1337,8 @@ static bool saveState(const std::wstring& dir, const Config& cfg, const std::vec
             o.Insert(L"updater_id", JsonValue::CreateNumberValue(is.updaterId));
             o.Insert(L"updater",    JsonValue::CreateStringValue(winrt::to_hstring(is.updaterDisplay)));
             o.Insert(L"updater_first", JsonValue::CreateStringValue(winrt::to_hstring(is.updaterFirstName)));
+            o.Insert(L"author",     JsonValue::CreateStringValue(winrt::to_hstring(is.authorDisplay)));
+            o.Insert(L"commenter",  JsonValue::CreateStringValue(winrt::to_hstring(is.commenterDisplay)));
             JsonArray iq;
             for (int q : is.queryIds) iq.Append(JsonValue::CreateNumberValue(q));
             o.Insert(L"queries", iq);
@@ -1369,6 +1383,8 @@ static void savePins(const std::wstring& dir) {
                 o.Insert(L"bug_tracker", JsonValue::CreateBooleanValue(p.isBugTracker));
                 o.Insert(L"updater",    JsonValue::CreateStringValue(winrt::to_hstring(p.updaterDisplay)));
                 o.Insert(L"updater_first", JsonValue::CreateStringValue(winrt::to_hstring(p.updaterFirst)));
+                o.Insert(L"author",     JsonValue::CreateStringValue(winrt::to_hstring(p.authorDisplay)));
+                o.Insert(L"commenter",  JsonValue::CreateStringValue(winrt::to_hstring(p.commenterDisplay)));
                 arr.Append(o);
             }
         }
@@ -1415,10 +1431,12 @@ static void loadPins(const std::wstring& dir) {
             p.projectName     = normalizeSpaces(winrt::to_string(o.GetNamedString(L"project", L"")));
             p.assignedToGroup = o.GetNamedBoolean(L"assigned_to_group", false);
             p.isBugTracker    = o.GetNamedBoolean(L"bug_tracker", false);
-            // updater は集合内ピンのみ refreshPins で実値になる。（集合外ピンの個別取得は
-            // journals を含まないため、保存値のまま維持される）
+            // updater・author・commenter は集合内ピンのみ refreshPins で実値になる。（集合外ピンの
+            // 個別取得は journals を含まないため、保存値のまま維持される）
             p.updaterDisplay  = winrt::to_string(o.GetNamedString(L"updater", L""));
             p.updaterFirst    = winrt::to_string(o.GetNamedString(L"updater_first", L""));
+            p.authorDisplay    = winrt::to_string(o.GetNamedString(L"author", L""));
+            p.commenterDisplay = winrt::to_string(o.GetNamedString(L"commenter", L""));
             if (p.id > 0) g_pins.push_back(std::move(p));
         }
         writeLog("pins: loaded " + std::to_string(g_pins.size()) + " entries");
@@ -1482,6 +1500,7 @@ static void loadHidden(const std::wstring& dir) {
 static std::vector<FormatToken> parseListFormat(const std::wstring& fmt) {
     static const std::pair<const wchar_t*, int> NAMES[] = {
         { L"id", FMT_ID }, { L"lastname", FMT_LASTNAME }, { L"firstname", FMT_FIRSTNAME },
+        { L"author", FMT_AUTHOR }, { L"commenter", FMT_COMMENTER },
         { L"group", FMT_GROUP }, { L"project", FMT_PROJECT }, { L"due", FMT_DUE },
         { L"new", FMT_NEW }, { L"bug", FMT_BUG }, { L"subject", FMT_SUBJECT },
         { L"ago", FMT_AGO }, { L"left", FMT_LEFT },
@@ -2294,6 +2313,10 @@ struct LastUpdater {
     bool        ok     = false;
     int         userId = 0;
     std::string userName;
+    // notes が空白以外を含む最後の journal の投稿者（一覧の {commenter} 用。0 = コメントなし）
+    // updated_on との突き合わせはしない。（一覧の表示専用で、抑止判定に使わないため）
+    int         commenterId = 0;
+    std::string commenterName;
 };
 
 // 指定チケットの最終 journal の更新者を取得する
@@ -2302,6 +2325,7 @@ struct LastUpdater {
 // 取得失敗時は userId 0 のまま返し、呼び出し側の抑止判定は通知する側に倒れる。
 // 最終 journal の created_on が updated_on と一致しない（journalMatchesUpdate が false）場合も
 // userId 0 で返す。自分の古い journal を根拠に他人の更新を自分の操作として抑止しないため。
+// 一覧の {commenter} 用に、最後のコメント投稿者も同じ取得で返す。
 static LastUpdater fetchLastUpdater(const Config& cfg, int id) {
     LastUpdater lu;
     auto obj = redmineGetJson(cfg, issueUrl(cfg, id) + L".json?include=journals",
@@ -2313,6 +2337,21 @@ static LastUpdater fetchLastUpdater(const Config& cfg, int id) {
         auto journals = issue.GetNamedArray(L"journals");
         lu.ok = true;  // journals を取得できた（空でも成功。呼び出し側が失敗時の再解決を判断する）
         if (journals.Size() == 0) return lu;
+        // 一覧の {commenter} 用に、末尾から遡って最後のコメントの投稿者を探す
+        // （最終 journal の突き合わせ失敗でも確定させるため、早期 return より前に置く）
+        for (uint32_t i = journals.Size(); i-- > 0;) {
+            auto j  = journals.GetObjectAt(i);
+            auto nv = j.GetNamedValue(L"notes", nullptr);
+            // null・欠落はコメントなし（GetNamedString は null で例外を投げるため型を見る）
+            if (!nv || nv.ValueType() != winrt::Windows::Data::Json::JsonValueType::String) continue;
+            std::wstring notes(nv.GetString());
+            if (notes.find_first_not_of(L" \t\r\n　") == std::wstring::npos) continue;
+            auto cu = j.GetNamedObject(L"user", nullptr);
+            if (!cu) continue;
+            lu.commenterId   = static_cast<int>(cu.GetNamedNumber(L"id", 0));
+            lu.commenterName = winrt::to_string(cu.GetNamedString(L"name", L""));
+            break;
+        }
         auto last = journals.GetObjectAt(journals.Size() - 1);
         auto createdOn = winrt::to_string(last.GetNamedString(L"created_on", L""));
         auto updatedOn = winrt::to_string(issue.GetNamedString(L"updated_on", L""));
@@ -2375,6 +2414,7 @@ static UserNames resolveUserNames(const Config& cfg, int userId,
 // 更新）は起票者を表示名にし、updaterId は 0 のまま抑止しない。取得失敗は表示名を空のまま残して
 // 次回ポーリングで再解決する。通知抑止（deliverPollResults）もここで確定した updaterId を
 // 使うため、journals の取得は本関数だけで行う。
+// 一覧の {author}（起票者の姓）と {commenter}（最後のコメント投稿者の姓）も同じ取得で確定する。
 static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
                             const PollState& prev,
                             std::unordered_map<int, UserNames>& nameCache)
@@ -2383,10 +2423,12 @@ static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
         if (g_shutdownRequested) return;
         auto it = prev.issues.find(is.id);
         if (it != prev.issues.end() && it->second.updatedOn == is.updatedOn
-            && !it->second.updaterDisplay.empty()) {
+            && !it->second.updaterDisplay.empty() && !it->second.authorDisplay.empty()) {
             is.updaterId        = it->second.updaterId;
             is.updaterDisplay   = it->second.updaterDisplay;
             is.updaterFirstName = it->second.updaterFirst;
+            is.authorDisplay    = it->second.authorDisplay;
+            is.commenterDisplay = it->second.commenterDisplay;
             continue;
         }
         LastUpdater lu = fetchLastUpdater(cfg, is.id);
@@ -2403,6 +2445,14 @@ static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
         is.updaterDisplay   = names.lastName;
         is.updaterFirstName = names.firstName;
         if (is.updaterDisplay.empty()) is.updaterDisplay = dispName;
+        // 起票者と最後のコメント投稿者の姓（{author}・{commenter}）。姓が取れなければフルネーム
+        auto authorNames = resolveUserNames(cfg, is.authorId, nameCache);
+        is.authorDisplay = authorNames.lastName.empty() ? is.authorName : authorNames.lastName;
+        is.commenterDisplay.clear();
+        if (lu.commenterId != 0) {
+            auto cn = resolveUserNames(cfg, lu.commenterId, nameCache);
+            is.commenterDisplay = cn.lastName.empty() ? lu.commenterName : cn.lastName;
+        }
     }
 }
 
@@ -3569,6 +3619,8 @@ struct ListRow {
     std::string projectName;          // 空 = 未取得（旧形式の pins.json 由来など）または登録先プロジェクト
     std::string updater;              // 最終更新者の姓（{lastname}。取得できない場合はフルネーム）
     std::string updaterFirst;         // 最終更新者の名（{firstname}。未取得は空）
+    std::string author;               // 起票者の姓（{author}。取得できない場合はフルネーム）
+    std::string commenter;            // 最後のコメント投稿者の姓（{commenter}。コメントなしは空）
     std::string dueDate;              // "YYYY-MM-DD"（期日なしは空）
     std::string updatedOn;
     std::string createdOn;            // created_on（作成日順の並べ替え用。未取得は空で末尾側へ）
@@ -3668,6 +3720,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
         }
         rows.push_back({.id = is.id, .subject = is.subject, .projectName = projectLabel(is.projectName),
                         .updater = is.updaterDisplay, .updaterFirst = is.updaterFirstName,
+                        .author = is.authorDisplay, .commenter = is.commenterDisplay,
                         .dueDate = is.dueDate,
                         .updatedOn = is.updatedOn, .createdOn = is.createdOn,
                         .priorityRank = rankOf(is.priorityId),
@@ -3682,6 +3735,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
         if (shown.count(p.id)) continue;
         rows.push_back({.id = p.id, .subject = p.subject, .projectName = projectLabel(p.projectName),
                         .updater = p.updaterDisplay, .updaterFirst = p.updaterFirst,
+                        .author = p.authorDisplay, .commenter = p.commenterDisplay,
                         .dueDate = p.dueDate,
                         .updatedOn = p.updatedOn, .createdOn = p.createdOn,
                         .priorityRank = rankOf(p.priorityId),
@@ -4089,15 +4143,16 @@ static constexpr wchar_t NEW_MARK[] = L"✨ ";
 
 // 一覧行のラベルを組み立てる
 //   並びは list_format（g_currentConfig.listFormat）のトークン列に従う。
-//   既定は「番号、姓、グループ担当マーカー、[プロジェクト名]、期日、新規流入マーカー、
-//   バグマーカー、件名、期日の残り日数」
-//   （例："#12345  山田  👥 [ロケモニ] 7/28 ✨ 💥 件名…（6 日遅れ）"）。
+//   既定は「番号、起票者/最後のコメント投稿者、グループ担当マーカー、[プロジェクト名]、期日、
+//   期日の残り日数、新規流入マーカー、バグマーカー、件名、経過日数」
+//   （例："#12345  山田/佐藤  👥 [ロケモニ] 7/28（6 日遅れ） ✨ 💥 件名…（3 日前）"）。
 //   {要素:N} の最大文字数で切り詰める。「…」は自由文の {subject} のみ付け、
 //   識別子的な要素（プロジェクト名・姓・名など）は横幅を優先して付けない。
 //   空に展開された要素（期限なし・更新者不明など）は、直後のリテラル先頭空白を
 //   出力末尾が空白または行頭なら取り除いて詰める。（従来の「詰めて省く」を再現）
 //   空に展開された要素を括弧対（[] ［］ () （） 【】 「」）が直接囲んでいれば、括弧ごと取り除く。
 //   （登録先プロジェクトや旧形式ピンで {project} が空のとき、既定書式の "[]" を残さないため）
+//   空に展開された要素の直前が "/"・"／" なら区切りごと取り除く。（コメントなしの {commenter}）
 //   {group}＝"👥 "・{new}＝"✨ "・{bug}＝"💥 "・{ago}＝"（3 日前）"・{left}＝"（2 日遅れ）" は
 //   装飾込みで展開し、
 //   空なら装飾ごと消える。
@@ -4140,6 +4195,8 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
         case FMT_ID:        val = std::to_wstring(row.id); break;
         case FMT_LASTNAME:  val = toWide(row.updater); break;
         case FMT_FIRSTNAME: val = toWide(row.updaterFirst); break;
+        case FMT_AUTHOR:    val = toWide(row.author); break;
+        case FMT_COMMENTER: val = toWide(row.commenter); break;
         case FMT_GROUP:     if (row.assignedToGroup) val = GROUP_MARK; break;
         case FMT_PROJECT:   val = toWide(row.projectName); break;
         case FMT_DUE:       val = due.text; break;
@@ -4152,6 +4209,9 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
         if (tk.maxChars > 0)
             val = truncateText(val, static_cast<size_t>(tk.maxChars), tk.element == FMT_SUBJECT);
         if (val.empty()) {
+            // 空要素の直前が区切りの "/" "／" なら消す。（"{author}/{commenter}" でコメントが無い行に
+            // "山田/" を残さないため）
+            if (!r.text.empty() && (r.text.back() == L'/' || r.text.back() == L'／')) r.text.pop_back();
             // 連続する空要素では最初の要素の判定を保つ。（"[{a}{b}]" の両方が空なら括弧ごと消す）
             if (!prevEmpty) {
                 pendingClose = 0;
@@ -6091,6 +6151,8 @@ static void setIssueState(int issueId, IssueRowState target) {
             p.isBugTracker    = cur->isBugTracker;
             p.updaterDisplay  = cur->updaterDisplay;
             p.updaterFirst    = cur->updaterFirstName;
+            p.authorDisplay    = cur->authorDisplay;
+            p.commenterDisplay = cur->commenterDisplay;
             if (it == g_pins.end()) g_pins.push_back(std::move(p));
             nowPinned = true;
         }
@@ -6712,11 +6774,13 @@ static void refreshPins(const std::wstring& dataDir, const Config& cfg,
         // 判定集合が未解決の間はグループフラグを書き込まない。空集合との突合結果（全 false）で
         // 保存済みの true を潰してしまうため。（解決後のポーリングで追いつく）
         if (groupIdsResolved) candidate.assignedToGroup = src->assignedToGroup;
-        // 最終更新者は src 側で確定している場合だけ書き込む。集合外ピンの個別取得
+        // 最終更新者・起票者・最後のコメント投稿者は src 側で確定している場合だけ書き込む。集合外ピンの個別取得
         // （fetchIssue）は journals を含まず updaterDisplay が空のため、保存済みの値を保つ
         if (!src->updaterDisplay.empty()) {
-            candidate.updaterDisplay = src->updaterDisplay;
-            candidate.updaterFirst   = src->updaterFirstName;
+            candidate.updaterDisplay   = src->updaterDisplay;
+            candidate.updaterFirst     = src->updaterFirstName;
+            candidate.authorDisplay    = src->authorDisplay;
+            candidate.commenterDisplay = src->commenterDisplay;
         }
         if (candidate != p) {
             p       = candidate;
