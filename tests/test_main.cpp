@@ -268,7 +268,7 @@ static void testBuildIssueLabel() {
         }
     }
 
-    // 新規流入：💥 の直前に ✨ が入り、後続の色範囲がその分だけ後ろへずれる
+    // 新規：💥 の直前に ✨ が入り、後続の色範囲がその分だけ後ろへずれる
     {
         auto row = makeRow();
         row.isNew = true;
@@ -996,6 +996,19 @@ static void testJournalMatchesUpdate() {
     CHECK(journalMatchesUpdate("2026-08-01T10:00:00Z", ""));
 }
 
+// 起票から指定時間以内か（一覧の ✨ マーカー）
+static void testIsRecentlyCreated() {
+    const long long now = isoUtcToEpoch("2026-08-02T10:00:00Z");
+    // 24 時間の境界：ちょうど 24 時間前は対象外、1 秒手前は対象
+    CHECK(isRecentlyCreated("2026-08-01T10:00:01Z", now, 24));
+    CHECK(!isRecentlyCreated("2026-08-01T10:00:00Z", now, 24));
+    // 未来の created_on（時計のずれ）は新規とみなす
+    CHECK(isRecentlyCreated("2026-08-02T10:05:00Z", now, 24));
+    // 0 時間は無効、解釈不能（未取得）は対象外
+    CHECK(!isRecentlyCreated("2026-08-02T10:00:00Z", now, 0));
+    CHECK(!isRecentlyCreated("", now, 24));
+}
+
 // schedule の回数を 60 の約数へ丸める
 static void testRoundToDivisorOf60() {
     CHECK(roundToDivisorOf60(0) == 0);    // 休止はそのまま
@@ -1131,6 +1144,7 @@ int main() {
     testBuildListRowsSortPriorityDue();
     testRoundToDivisorOf60();
     testJournalMatchesUpdate();
+    testIsRecentlyCreated();
     testAlignTowardCenter();
     testRegisterSubject();
     testBuildIssueCreateBody();

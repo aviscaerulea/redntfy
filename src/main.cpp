@@ -404,7 +404,7 @@ struct Issue {
                                    // 一致するかを見るだけでグループ担当を弾ける。型の判別は不要。
     bool        closed    = false; // status.is_closed（一覧で打ち消し線表示）
     std::string dueDate;           // due_date（"YYYY-MM-DD"、期限なしは空。一覧の日付表示に使う）
-    std::string createdOn;         // created_on（UTC ISO 8601。作成日順の並べ替え専用。辞書順比較可）
+    std::string createdOn;         // created_on（UTC ISO 8601。作成日順の並べ替えと ✨ の判定に使う。辞書順比較可）
     int         priorityId = 0;    // priority.id（優先度順の並べ替え専用。0 = 不明）
     std::vector<int> queryIds;     // このチケットが現れた保存クエリ id（昇順）。クエリ流入の検知に使う
     bool assignedToGroup = false;  // 担当がグループ（一覧の 👥 マーカー。取得後にグループ id 集合と突合して設定）
@@ -435,7 +435,7 @@ struct PinEntry {
     std::string updatedOn;
     bool        closed = false;
     std::string dueDate;           // due_date（"YYYY-MM-DD"、期限なしは空。一覧の日付表示に使う）
-    std::string createdOn;         // created_on（作成日順の並べ替え用。集合外ピンも並べられるよう永続化）
+    std::string createdOn;         // created_on（作成日順の並べ替えと ✨ の判定用。集合外ピンにも効くよう永続化。旧形式は空で ✨ なし）
     int         priorityId = 0;    // priority.id（優先度順の並べ替え用。同上）
     bool assignedToGroup = false;  // 担当がグループ（👥 マーカー。集合外ピンも表示できるよう永続化）
     bool isBugTracker    = false;  // バグ・障害トラッカー（💥 マーカー。集合外ピンも表示できるよう永続化）
@@ -468,7 +468,7 @@ struct FormatToken {
 
 // list_format の既定値
 // 番号、起票者/最後のコメント投稿者、グループ担当マーカー、[プロジェクト名]、期日と残り日数、
-// 新規流入マーカー、バグマーカー、件名、経過日数の並び。名前を最終更新者でなく起票者と
+// 新規マーカー、バグマーカー、件名、経過日数の並び。名前を最終更新者でなく起票者と
 // コメント投稿者にするのは、優先度・期日の変更だけで名前が操作者に変わらないようにするため。
 // 期限切れ行で赤にするのは期日、件名、残り日数とする。
 // 残り日数と経過日数は件名より目立たせないため 90% に縮める。
@@ -508,6 +508,8 @@ struct Config {
     // バージョン欄判定情報（トラッカー定義・プロジェクトのバージョン定義）の再取得間隔（時間）
     // 超過していたら次のポーリングで直ちに再取得する。デフォルト 24。（1〜168）
     int versionMetaRefreshHours;
+    // 一覧の ✨ を付ける期間（起票からの時間。0〜720、0 で付けない、デフォルト 24）
+    int newMarkHours;
     // ホバーで一覧を表示するまでの遅延（ms、0〜5000、0 で即時、デフォルト 100）
     long long hoverDelayMs;
 
@@ -571,16 +573,6 @@ static Config                  g_currentConfig;
 // 刈り取りはしないので、再び一覧に出た時点で未読として現れる。
 // 永続化しない。
 static std::unordered_set<int> g_unreadIds;
-
-// 新規流入チケットの id 集合（g_mtx で保護。一覧の ✨ マーカーの唯一の根拠）
-// NotifyKind::New で通知した id だけを入れる。自分の起票、query_ids 追加直後の「黙って採用」、
-// ベースライン未確立の回は通知対象にならないため印も付かない。
-// （把握済みのチケットや大量流入の場面で印が溢れるのを防ぐ意図と一致する）
-// g_unreadIds の部分集合として維持する契約：挿入は通知時、削除は行クリックの既読化時に、
-// 未読と必ず同じ箇所で行い、「新規かつ既読」という状態は作らない。
-// 未読と分けるのは概念が別で、未読側の意味（まだ開いていない）を新規の都合で変えないため。
-// 永続化しない。（再起動で消える。未読と同じ扱い）
-static std::unordered_set<int> g_newIds;
 
 // 非表示チケットの id 集合（g_mtx で保護。hidden.json で永続化）
 // 一覧の行右クリックメニューの状態ラジオ（setIssueState）で出入りする。
@@ -1787,6 +1779,9 @@ static Config loadConfig(const std::wstring& exeDir) {
     // バージョン欄判定情報の再取得間隔（時間）
     cfg.versionMetaRefreshHours = readAppInt("version_meta_refresh_hours", 24, 1, 168);
 
+    // 一覧の ✨ を付ける期間（起票からの時間）
+    cfg.newMarkHours = readAppInt("new_mark_hours", 24, 0, 720);
+
     // hover_delay_ms（OS のホバー検出から一覧を表示するまでの追加遅延、ms 単位。
     // デフォルト 100、0〜5000 にクランプ、0 でホバー検出と同時に表示）
     cfg.hoverDelayMs = readAppInt("hover_delay_ms",
@@ -2289,6 +2284,16 @@ static long long isoUtcToEpoch(const std::string& iso) {
     t.tm_sec  = s;
     long long e = static_cast<long long>(_mkgmtime(&t));
     return e < 0 ? -1 : e;
+}
+
+// 起票から hours 時間以内か（一覧の ✨ マーカーの判定）
+// hours が 0 以下（new_mark_hours = 0 で無効）、または createdOn が解釈不能（未取得の旧形式ピン）なら false。
+// 未来の created_on（サーバとローカルの時計のずれ）は差が負になり、新規とみなす。
+static bool isRecentlyCreated(const std::string& createdOn, long long nowEpoch, int hours) {
+    if (hours <= 0) return false;
+    long long created = isoUtcToEpoch(createdOn);
+    if (created < 0) return false;
+    return nowEpoch - created < static_cast<long long>(hours) * 3600;
 }
 
 // 最終 journal がチケットの updated_on を作った更新かを判定する
@@ -3623,7 +3628,7 @@ struct ListRow {
     std::string commenter;            // 最後のコメント投稿者の姓（{commenter}。コメントなしは空）
     std::string dueDate;              // "YYYY-MM-DD"（期日なしは空）
     std::string updatedOn;
-    std::string createdOn;            // created_on（作成日順の並べ替え用。未取得は空で末尾側へ）
+    std::string createdOn;            // created_on（作成日順の並べ替え用。未取得は空で末尾側へ。✨ は isNew で判定済み）
     int         priorityRank = 0;     // 優先度の順位（大きいほど高優先。順位表に無ければ priority id）
     bool        assignedToGroup = false;
     bool        isBugTracker    = false;
@@ -3631,7 +3636,7 @@ struct ListRow {
     bool        hidden          = false;  // 非表示チケット（グレー＋取消線描画。件数・未読に数えない）
     bool        closed          = false;
     bool        unread          = false;
-    bool        isNew           = false;  // 新規流入（{new} の ✨ マーカー。非表示行は常に false）
+    bool        isNew           = false;  // 起票から new_mark_hours 時間以内（{new} の ✨ マーカー。非表示行は常に false）
 };
 
 // 一覧に出す行を選定し、並べ替えて list_limit 件へ絞る
@@ -3665,7 +3670,6 @@ static std::vector<ListRow> buildListRows(int& visible) {
     std::vector<Issue>      issues;
     std::vector<PinEntry>   pins;
     std::unordered_set<int> unread;
-    std::unordered_set<int> newIds;
     std::unordered_set<int> hiddenIds;
     std::unordered_map<int, int> priorityPositions;
     std::string personalProject;
@@ -3675,7 +3679,6 @@ static std::vector<ListRow> buildListRows(int& visible) {
         issues    = g_issues;
         pins      = g_pins;
         unread    = g_unreadIds;
-        newIds    = g_newIds;
         hiddenIds = g_hiddenIds;
         priorityPositions = g_priorityPositions;
         personalProject   = g_personalProjectName;
@@ -3691,6 +3694,12 @@ static std::vector<ListRow> buildListRows(int& visible) {
     auto rankOf = [&priorityPositions](int priorityId) {
         auto it = priorityPositions.find(priorityId);
         return it != priorityPositions.end() ? it->second : priorityId;
+    };
+
+    // ✨ は起票から new_mark_hours 時間以内の行に付ける。（通知の有無・既読によらない）
+    const long long nowEpoch = static_cast<long long>(_time64(nullptr));
+    auto isNewRow = [nowEpoch](const std::string& createdOn) {
+        return isRecentlyCreated(createdOn, nowEpoch, g_currentConfig.newMarkHours);
     };
 
     auto isPinned = [&pins](int id) {
@@ -3728,7 +3737,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
                         .isBugTracker = is.isBugTracker,
                         .pinned = pinned, .hidden = hidden, .closed = is.closed,
                         .unread = !hidden && unread.count(is.id) != 0,
-                        .isNew = !hidden && newIds.count(is.id) != 0});
+                        .isNew = !hidden && isNewRow(is.createdOn)});
         shown.insert(is.id);
     }
     for (const auto& p : pins) {
@@ -3743,7 +3752,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
                         .isBugTracker = p.isBugTracker,
                         .pinned = true, .closed = p.closed,
                         .unread = unread.count(p.id) != 0,
-                        .isNew = newIds.count(p.id) != 0});
+                        .isNew = isNewRow(p.createdOn)});
     }
 
     // 期日順の比較規則。期日は ISO 形式のため文字列辞書順で昇順に比較でき、期日なしは末尾、
@@ -4135,7 +4144,7 @@ static constexpr wchar_t GROUP_MARK[] = L"👥 ";
 // 扱いは GROUP_MARK と同じ。（ラベル埋め込みの GDI 単色描画）
 static constexpr wchar_t BUG_MARK[] = L"💥 ";
 
-// 新規流入マーカー（✨ + 半角スペース）
+// 新規マーカー（✨ + 半角スペース。起票から new_mark_hours 時間以内の行に付ける）
 // 扱いは GROUP_MARK と同じ。（ラベル埋め込みの GDI 単色描画）
 // 色は既定の文字色に据え置く。赤は期限切れと 💥 に予約済みで、緊急度ではない新規に使うと
 // 意味が混ざるためだ。
@@ -4144,7 +4153,7 @@ static constexpr wchar_t NEW_MARK[] = L"✨ ";
 // 一覧行のラベルを組み立てる
 //   並びは list_format（g_currentConfig.listFormat）のトークン列に従う。
 //   既定は「番号、起票者/最後のコメント投稿者、グループ担当マーカー、[プロジェクト名]、期日、
-//   期日の残り日数、新規流入マーカー、バグマーカー、件名、経過日数」
+//   期日の残り日数、新規マーカー、バグマーカー、件名、経過日数」
 //   （例："#12345  山田/佐藤  👥 [ロケモニ] 7/28（6 日遅れ） ✨ 💥 件名…（3 日前）"）。
 //   {要素:N} の最大文字数で切り詰める。「…」は自由文の {subject} のみ付け、
 //   識別子的な要素（プロジェクト名・姓・名など）は横幅を優先して付けない。
@@ -4672,18 +4681,16 @@ static std::wstring getCurrentLogTarget() {
     return logExists ? logPath : g_logDir;
 }
 
-// 開いたチケット 1 件を既読にする（新規流入マーカーも同時に外す）
+// 開いたチケット 1 件を既読にする
 // 行クリック時点では一覧ポップアップがまだ可視で、g_popupShowing 中の直接呼びは
 // updateTrayTooltip に捨てられる。PostMessage でキューに積んでおけば、
 // この後の hideListPopup（フラグ解除）を経てから必ず反映される。
-// 再描画の要否は未読の有無だけで判断してよい。g_newIds は g_unreadIds の部分集合のため、
-// 新規側だけが変わることはない。
+// ✨ は起票日時だけで決まるため、既読化では外れない。
 static void markIssueRead(int issueId) {
     bool wasUnread;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         wasUnread = g_unreadIds.erase(issueId) != 0;
-        g_newIds.erase(issueId);
     }
     if (wasUnread && g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
 }
@@ -6083,8 +6090,9 @@ enum class IssueRowState { Normal, Pinned, Hidden };
 // 取得集合外の行（クローズ・担当変更でクエリから外れた集合外ピン）はピン留めにも非表示にもしない。
 // 集合外のチケットは非表示にしても一覧に出ず、pruneHidden が次のポーリングで非表示設定ごと消すため、
 // 非表示は一覧に出るチケットにしか意味がない。（メニュー側も両項目を灰色にする）
-// 非表示への遷移で g_unreadIds・g_newIds には触らない。非表示は「見なくて良い」の意思表示で
-// あって既読（開いた）ではないため、非表示を解除すれば未読の太字と ✨ は戻る。
+// 非表示への遷移で g_unreadIds には触らない。非表示は「見なくて良い」の意思表示で
+// あって既読（開いた）ではないため、非表示を解除すれば未読の太字は戻る。
+// ✨ も、解除時点で起票から new_mark_hours 時間以内なら戻る。
 // 非表示中に太字・✨・未読件数へ出ないのは buildListRows の hidden 判定が担う。
 // 開いたままの一覧でも同じ見え方にするため、非表示への遷移で item.unread を落とし、
 // 解除では g_unreadIds の現況から復元する。
@@ -6988,14 +6996,9 @@ static void emitNotifications(const Config& cfg, const std::vector<NotifyTarget>
     if (g_soundEnabled.load() && !(g_muteInMeeting.load() && isMeetingActive()))
         launchSound(cfg);
     {
-        // 未読 id と新規流入 id を記録する。（一覧の太字・未読件数と ✨ マーカー。
-        // どちらも行クリックで開いた分だけ取り除く。g_newIds を g_unreadIds の
-        // 部分集合に保つため、挿入は必ずこの 1 箇所で同時に行う）
+        // 未読 id を記録する。（一覧の太字・未読件数。行クリックで開いた分だけ取り除く）
         std::lock_guard<std::mutex> lk(g_mtx);
-        for (const auto& t : targets) {
-            g_unreadIds.insert(t.issue->id);
-            if (t.kind == NotifyKind::New) g_newIds.insert(t.issue->id);
-        }
+        for (const auto& t : targets) g_unreadIds.insert(t.issue->id);
     }
     int nNew = 0, nUpd = 0, nEnt = 0;
     for (const auto& t : targets) {

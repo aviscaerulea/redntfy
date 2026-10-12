@@ -51,7 +51,7 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
 
 - スレッド構成：メイン（メッセージループ・トレイ UI）／`pollThreadFunc`（HTTP・Toast・音・状態保存）／`soundThread`（WASAPI 再生）／`checkForUpdates`（起動時 1 回、シャットダウン時に join）／`registerIssueThreadFunc`（登録欄の送信 1 回ごとに起動、シャットダウン時に join）／`issueUpdateThreadFunc`（行メニューの更新送信 1 回ごとに起動、シャットダウン時に join）
 
-- 共有状態は `g_mtx`（`g_issues`・`g_pins`・`g_unreadIds`・`g_newIds`・`g_hiddenIds`・`g_priorities`・`g_priorityPositions`・`g_latestVersion`・`g_registerProject`・`g_personalProjectName`）と atomic（`g_myUserId`・`g_assignedToMeOnly` など）で保護する  
+- 共有状態は `g_mtx`（`g_issues`・`g_pins`・`g_unreadIds`・`g_hiddenIds`・`g_priorities`・`g_priorityPositions`・`g_latestVersion`・`g_registerProject`・`g_personalProjectName`）と atomic（`g_myUserId`・`g_assignedToMeOnly` など）で保護する  
   `g_currentConfig` は起動時に 1 回設定した後は不変で、ロック無しで読み取る。
 
 - 永続化は `state.json`（検知済み）、`pins.json`（ピン留め）、`hidden.json`（非表示チケットの id 配列）で、書き出しは `atomicWriteJson`（tmp 経由の置換）  
@@ -154,11 +154,12 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   打ち切りは非表示 → ピン → 通常の順に落とすため、通常行の未読が落ちるのは非表示とピンを使い切った後だけだ。
   （クリックできない行でバッジが消せなくなるのを防ぐため、表示範囲を判定の基準に揃えた）
   Toast の「チケットを開く」は OS がブラウザを直接起動するため既読化されない。
-  新規流入マーカー（✨）は `NotifyKind::New` で通知した id（`g_newIds`）を根拠とし、
-  未読と同じく既読化でのみ外れ、永続化しない。
-  非表示への遷移では未読・新規のどちらも取り除かない。（非表示は「見なくて良い」であって
+  新規マーカー（✨）は起票から `new_mark_hours`（[app]、デフォルト 24、0 で無効）時間以内の行に付け、
+  通知の有無・既読化によらない。（判定は `isRecentlyCreated`。状態を持たないため永続化も不要）
+  非表示行と、created_on の無い旧形式ピン（次の `refreshPins` で実値になる）には ✨ を付けない。
+  非表示への遷移では未読を取り除かない。（非表示は「見なくて良い」であって
   「読んだ」ではない。非表示中の表示除外は `buildListRows` の hidden 判定が担い、
-  解除すれば太字と ✨ は戻る）
+  解除すれば太字は戻る。✨ は解除時点で起票から `new_mark_hours` 時間以内なら戻る）
 
 - 一覧は `WS_EX_NOACTIVATE` の自前ポップアップ（クラス `redntfy_list`）で、登録欄のクリック以外ではフォーカスを奪わない  
   モーダルメニューではないため、フォーカス復元・EndMenu・クローズ直後のクリック猶予は存在しない。
