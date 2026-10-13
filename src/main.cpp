@@ -5055,6 +5055,11 @@ static constexpr int    REG_EDIT_MIN_WIDTH = 240;
 static constexpr int    REG_DESC_ROWS = 4;
 // 説明欄の最大文字数（Edit の入力上限。Redmine の description は text 型で実質上限がないため UI 側で制限する）
 static constexpr int    REG_DESC_MAX_CHARS = 65535;
+// 説明トグルの表示記号（閉＝下向きで「下に開く」、開＝上向きで「畳む」）
+// 文字で「説明」と書くより登録ボタンと並べたときに主張が弱く、開閉の向きも伝わるため記号にした。
+// 小三角はドロップダウンや折りたたみの表示として見慣れた形のため選んだ。
+static constexpr wchar_t REG_DESC_MARK_CLOSED[] = L"▾";
+static constexpr wchar_t REG_DESC_MARK_OPEN[]   = L"▴";
 
 // 登録欄の入力（件名・説明）の前後から空白（全角空白を含む）を除去する
 static std::wstring trimRegisterText(const std::wstring& s) {
@@ -5821,7 +5826,8 @@ static void createRegisterControls(HWND parent, HINSTANCE hInst) {
     g_regButton = CreateWindowExW(0, L"BUTTON", L"登録", base | BS_DEFPUSHBUTTON,
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), hInst, nullptr);
     // 説明欄の開閉トグル（Tab 順は生成順。登録ボタンの次、説明欄の前）
-    g_regDescToggle = CreateWindowExW(0, L"BUTTON", L"説明", base | BS_AUTOCHECKBOX | BS_PUSHLIKE,
+    // 表示記号は開閉に合わせて showListPopup が切り替える
+    g_regDescToggle = CreateWindowExW(0, L"BUTTON", REG_DESC_MARK_CLOSED, base | BS_AUTOCHECKBOX | BS_PUSHLIKE,
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_REG_DESC_TOGGLE)), hInst, nullptr);
     // 説明欄はトグル ON の間だけ表示する。（WS_VISIBLE を付けず、showListPopup が表示を決める）
     // ES_WANTRETURN で Enter は改行。送信は Ctrl+Enter（regDescSubclassProc）
@@ -5841,7 +5847,7 @@ static void createRegisterControls(HWND parent, HINSTANCE hInst) {
     SendMessageW(g_regEdit, EM_LIMITTEXT, REG_SUBJECT_MAX_CHARS, 0);
     SendMessageW(g_regEdit, EM_SETCUEBANNER, TRUE,
                  reinterpret_cast<LPARAM>(L"新しいチケットの件名"));
-    // 説明欄にキューバナーは置かない。（EM_SETCUEBANNER は ES_MULTILINE に効かない。ラベルはトグルの「説明」が兼ねる）
+    // 説明欄にキューバナーは置かない。（EM_SETCUEBANNER は ES_MULTILINE に効かない。欄の用途はトグルの開閉と位置で示す）
     SendMessageW(g_regDesc, EM_LIMITTEXT, REG_DESC_MAX_CHARS, 0);
     if (!SetWindowSubclass(g_regDesc, regDescSubclassProc, REG_DESC_SUBCLASS_ID, 0))
         writeLog("list: SetWindowSubclass(description) failed");  // Ctrl+Enter・Esc・Tab が効かないだけで入力はできる
@@ -5982,7 +5988,7 @@ static void showListPopup(HWND trayWnd, bool refresh) {
 
     // 登録欄の寸法（コントロールの高さは文字高＋枠、DTP の幅は固定書式の見本＋ドロップダウンボタン、
     // 優先度コンボの幅は最長の優先度名＋ドロップダウンボタン。未取得で隠すときは幅 0 で余白も詰める。
-    // 説明トグルの幅は登録ボタンと同じ式）
+    // 説明トグルの幅は記号＋左右の余白で、行高より細くしない）
     const bool regEnabled = (g_regEdit != nullptr);
     const bool regPrio    = regEnabled && syncRegisterPriorities();
     // 新規表示では書きかけの説明があるときだけ説明欄を開く。（組み直しではトグルの状態を保つ。
@@ -5998,7 +6004,8 @@ static void showListPopup(HWND trayWnd, bool refresh) {
     const int  regRowH    = regCtrlH + 2 * REG_PAD + (regDesc ? regDescH + REG_PAD : 0);
     const int  regDateW   = textWidth(L"0000/00/00") + GetSystemMetrics(SM_CXVSCROLL) + 8;
     const int  regButtonW = textWidth(L"登録") + 32;
-    const int  regToggleW = textWidth(L"説明") + 32;
+    const int  regToggleW = (std::max)(textWidth(REG_DESC_MARK_CLOSED) + 16, regCtrlH);
+    if (regEnabled) SetWindowTextW(g_regDescToggle, regDesc ? REG_DESC_MARK_OPEN : REG_DESC_MARK_CLOSED);
     int regPrioW = 0;
     if (regPrio) {
         std::vector<PriorityEntry> list;

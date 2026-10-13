@@ -219,7 +219,7 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   新規表示で書きかけの件名が無ければ、期日と同じく優先度も既定へ戻す。
   送信は `POST /issues.json`（担当＝自分、トラッカーはプロジェクト既定）で、成功時は入力を空にし期日・優先度を既定へ戻して `g_registerPoll` で即時ポーリングする。
   失敗時は Toast を出して入力を残す。成功の Toast は出さない。（新チケットが一覧に載ることを応答とする）
-  説明欄はトグル（登録ボタンの右端。`BS_PUSHLIKE`）で開閉し、閉じていても入力があれば `description` として送る。
+  説明欄はトグル（登録ボタンの右端。`BS_PUSHLIKE`。表示は閉で ▾、開で ▴）で開閉し、閉じていても入力があれば `description` として送る。
   新規表示では入力の有無に合わせてトグルを開閉し、登録が成功すると入力を消して説明欄を閉じる。（永続化なし）
   説明欄では Enter で改行し、Ctrl+Enter で登録し、Esc で一覧を閉じる。（`regDescSubclassProc` が `WM_GETDLGCODE` で Tab・Esc・Ctrl+Enter の 3 キーだけ `IsDialogMessageW` へ返す）
   DTP の見た目のため common controls v6 のマニフェストを `build.ps1` の `/MANIFEST:EMBED` で埋め込む。
