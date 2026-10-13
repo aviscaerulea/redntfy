@@ -19,7 +19,7 @@
  * 非表示チケットは hidden.json に永続化し、グレー＋取消線で表示・通知と件数から除外・
  * 「非表示チケットを除外」トグル ON で一覧からも出さない。
  * 登録先プロジェクト（register_project、未設定ならログイン名と同じ識別子のプロジェクト）が
- * ある場合は、一覧末尾の登録欄から件名・優先度・期日を入力して
+ * ある場合は、一覧末尾の登録欄から件名・優先度・期日（と任意の説明）を入力して
  * 自分担当のチケットを登録できる。（登録欄のクリック時だけ一覧をアクティブ化してキー入力を受ける）
  *
  * 終了コード：
@@ -5034,12 +5034,14 @@ static void drawIssueRow(HDC hdc, const RECT& rcItem, const IssueItem& item, boo
 }
 
 // ==================== 一覧の登録欄 ====================
-// 登録先の確定時に一覧の末尾へ置く「件名 Edit・優先度コンボ・期日 DTP・登録ボタン」の簡易チケット登録。
+// 登録先の確定時に一覧の末尾へ置く「件名 Edit・優先度コンボ・期日 DTP・登録ボタン・説明トグル・説明 Edit」の簡易チケット登録。
 // 登録先は register_project の明示値、未設定ならログイン名と同じ識別子の実在プロジェクト。
 // 送信は POST /issues.json で、担当は自分、トラッカー・ステータスはプロジェクト既定に任せる。
 // 優先度は g_priorities（取得済みのとき）から選び、既定は is_default の項目。未取得の間はコンボを隠して
 // priority_id を送らず Redmine の既定に任せる。（接続不可でも登録操作は止めない）
 // 送信は専用スレッド（registerIssueThreadFunc）で行い、完了を WM_REGISTER_DONE でメインへ返す。
+// 説明は任意で、トグルで開閉する。閉じていても入力があれば送る。新規表示では入力の有無でトグルを合わせ、
+// 登録成功で消して閉じる。（状態の永続化はしない）
 
 // 件名の最小文字数（前後の空白を除いた文字数。空白だけ・短すぎる件名の誤登録を防ぐ）
 static constexpr size_t REG_SUBJECT_MIN_CHARS = 3;
@@ -5049,6 +5051,10 @@ static constexpr int    REG_SUBJECT_MAX_CHARS = 255;
 static constexpr int    REG_PAD = 4;
 // 件名欄の最小幅（px。一覧の幅がこれより狭いときは一覧側を広げる）
 static constexpr int    REG_EDIT_MIN_WIDTH = 240;
+// 説明欄の行数（表示時の高さ＝文字高 × 行数 + 枠。超える分は縦スクロール）
+static constexpr int    REG_DESC_ROWS = 4;
+// 説明欄の最大文字数（Edit の入力上限。Redmine の description は text 型で実質上限がないため UI 側で制限する）
+static constexpr int    REG_DESC_MAX_CHARS = 65535;
 
 // 登録欄の入力（件名・説明）の前後から空白（全角空白を含む）を除去する
 static std::wstring trimRegisterText(const std::wstring& s) {
@@ -5224,6 +5230,11 @@ static bool syncRegisterPriorities() {
     return true;
 }
 
+// 説明欄を表示中か（トグルの押下状態。未生成は非表示）
+static bool isRegisterDescShown() {
+    return g_regDescToggle && SendMessageW(g_regDescToggle, BM_GETCHECK, 0, 0) == BST_CHECKED;
+}
+
 // 優先度コンボの選択項目の優先度 id（非表示・未選択は 0 = 送らない）
 static int getRegisterPriorityId() {
     if (!g_regPriority || g_regPriorityIds.empty() || !IsWindowVisible(g_regPriority)) return 0;
@@ -5259,6 +5270,8 @@ static void updateRegisterControls() {
     EnableWindow(g_regEdit, !g_registerBusy);
     EnableWindow(g_regPriority, !g_registerBusy);
     EnableWindow(g_regDate, !g_registerBusy);
+    EnableWindow(g_regDescToggle, !g_registerBusy);
+    EnableWindow(g_regDesc, !g_registerBusy);
     EnableWindow(g_regButton, !g_registerBusy && isRegisterSubjectValid(getRegisterSubject()));
 }
 
@@ -5645,6 +5658,7 @@ static void paintListWindow(HWND hWnd) {
 // 通常は非アクティブ（WS_EX_NOACTIVATE + MA_NOACTIVATE）のためキー入力は届かない。
 // キー入力を受けるのは登録欄のクリックで入った入力モードの間だけで、Tab・Enter・Esc は
 // メッセージループの IsDialogMessageW が WM_COMMAND（IDOK・IDCANCEL）へ変換する。
+// 説明欄では Enter は改行で、Ctrl+Enter が IDOK になる。（regDescSubclassProc）
 // WM_CLOSE（入力モード中の Alt+F4）は破棄ではなく非表示で閉じる。（g_listWnd は使い回すため）
 // 行の左クリック＝チケットを開いて既読化して閉じる。フッタ・0 件行＝クエリ画面を開いて閉じる。
 // 行の右クリック＝行メニュー（showRowContextMenu）を開き、一覧は開いたまま。
@@ -5695,6 +5709,12 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         }
         if (id == IDC_REG_EDIT && HIWORD(wParam) == EN_CHANGE) {
             updateRegisterControls();
+            return 0;
+        }
+        if (id == IDC_REG_DESC_TOGGLE && HIWORD(wParam) == BN_CLICKED) {
+            // 説明欄の開閉（クリック・Space）。組み直しで行高と位置を取り直し、開いたら説明欄へフォーカスを移す
+            if (g_hWnd) showListPopup(g_hWnd, true);
+            if (isRegisterDescShown()) SetFocus(g_regDesc);
             return 0;
         }
     }
@@ -5763,7 +5783,29 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-// 登録欄の子コントロールを生成する（登録先の確定後、最初の一覧表示時に 1 回。失敗時は次の表示で再試行）
+// 説明欄のキー処理（SetWindowSubclass）
+// 複数行 Edit は WM_GETDLGCODE で DLGC_WANTALLKEYS を返し、Tab・Esc も自分で処理して親へ渡さない。
+// Tab・Esc・Ctrl+Enter の 3 キーだけ DLGC_WANTALLKEYS を落とし、件名欄と同じく IsDialogMessageW に
+// Tab 移動・Esc（IDCANCEL）・Enter（IDOK）へ変換させる。Enter 単独は Edit に残して改行にする。（ES_WANTRETURN）
+// IsDialogMessageW が処理したキーは TranslateMessage を通らないため、Ctrl+Enter の WM_CHAR による改行は混ざらない。
+static LRESULT CALLBACK regDescSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                            UINT_PTR, DWORD_PTR) {
+    if (msg == WM_GETDLGCODE) {
+        LRESULT code = DefSubclassProc(hWnd, msg, wParam, lParam);
+        const MSG* m = reinterpret_cast<const MSG*>(lParam);
+        if (m && m->message == WM_KEYDOWN &&
+            (m->wParam == VK_TAB || m->wParam == VK_ESCAPE ||
+             (m->wParam == VK_RETURN && GetKeyState(VK_CONTROL) < 0))) {
+            code &= ~DLGC_WANTALLKEYS;
+        }
+        return code;
+    }
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(hWnd, regDescSubclassProc, REG_DESC_SUBCLASS_ID);
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+}
+
+// 登録欄の子コントロール（件名・優先度・期日・登録・説明トグル・説明）を生成する
+// 登録先の確定後、最初の一覧表示時に 1 回。失敗時は次の表示で再試行する。
 // 位置と大きさは showListPopup が表示のたびに決める。
 // 1 つでも生成に失敗したら全部破棄して登録欄なしで動かす。（一覧そのものは使えるようにする）
 static void createRegisterControls(HWND parent, HINSTANCE hInst) {
@@ -5778,19 +5820,31 @@ static void createRegisterControls(HWND parent, HINSTANCE hInst) {
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_REG_DATE)), hInst, nullptr);
     g_regButton = CreateWindowExW(0, L"BUTTON", L"登録", base | BS_DEFPUSHBUTTON,
         0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), hInst, nullptr);
-    if (!g_regEdit || !g_regPriority || !g_regDate || !g_regButton) {
+    // 説明欄の開閉トグル（Tab 順は生成順。登録ボタンの次、説明欄の前）
+    g_regDescToggle = CreateWindowExW(0, L"BUTTON", L"説明", base | BS_AUTOCHECKBOX | BS_PUSHLIKE,
+        0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_REG_DESC_TOGGLE)), hInst, nullptr);
+    // 説明欄はトグル ON の間だけ表示する。（WS_VISIBLE を付けず、showListPopup が表示を決める）
+    // ES_WANTRETURN で Enter は改行。送信は Ctrl+Enter（regDescSubclassProc）
+    g_regDesc = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
+        0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_REG_DESC)), hInst, nullptr);
+    if (!g_regEdit || !g_regPriority || !g_regDate || !g_regButton || !g_regDescToggle || !g_regDesc) {
         writeLog("list: register controls creation failed: " + std::to_string(GetLastError()));
-        for (HWND* h : { &g_regEdit, &g_regPriority, &g_regDate, &g_regButton }) {
+        for (HWND* h : { &g_regEdit, &g_regPriority, &g_regDate, &g_regButton, &g_regDescToggle, &g_regDesc }) {
             if (*h) DestroyWindow(*h);
             *h = nullptr;
         }
         return;
     }
-    for (HWND h : { g_regEdit, g_regPriority, g_regDate, g_regButton })
+    for (HWND h : { g_regEdit, g_regPriority, g_regDate, g_regButton, g_regDescToggle, g_regDesc })
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g_hMenuFont), FALSE);
     SendMessageW(g_regEdit, EM_LIMITTEXT, REG_SUBJECT_MAX_CHARS, 0);
     SendMessageW(g_regEdit, EM_SETCUEBANNER, TRUE,
                  reinterpret_cast<LPARAM>(L"新しいチケットの件名"));
+    // 説明欄にキューバナーは置かない。（EM_SETCUEBANNER は ES_MULTILINE に効かない。ラベルはトグルの「説明」が兼ねる）
+    SendMessageW(g_regDesc, EM_LIMITTEXT, REG_DESC_MAX_CHARS, 0);
+    if (!SetWindowSubclass(g_regDesc, regDescSubclassProc, REG_DESC_SUBCLASS_ID, 0))
+        writeLog("list: SetWindowSubclass(description) failed");  // Ctrl+Enter・Esc・Tab が効かないだけで入力はできる
     // 書式はロケールに依存させない（幅の計測を固定の見本文字列で行うため）
     SendMessageW(g_regDate, DTM_SETFORMATW, 0, reinterpret_cast<LPARAM>(L"yyyy/MM/dd"));
     SendMessageW(g_regDate, DTM_SETMCFONT, reinterpret_cast<WPARAM>(g_hMenuFont), FALSE);
@@ -5927,13 +5981,24 @@ static void showListPopup(HWND trayWnd, bool refresh) {
     auto textRowWidth = [&](const wchar_t* text) { return textWidth(text) + 20; };
 
     // 登録欄の寸法（コントロールの高さは文字高＋枠、DTP の幅は固定書式の見本＋ドロップダウンボタン、
-    // 優先度コンボの幅は最長の優先度名＋ドロップダウンボタン。未取得で隠すときは幅 0 で余白も詰める）
+    // 優先度コンボの幅は最長の優先度名＋ドロップダウンボタン。未取得で隠すときは幅 0 で余白も詰める。
+    // 説明トグルの幅は登録ボタンと同じ式）
     const bool regEnabled = (g_regEdit != nullptr);
     const bool regPrio    = regEnabled && syncRegisterPriorities();
+    // 新規表示では書きかけの説明があるときだけ説明欄を開く。（組み直しではトグルの状態を保つ。
+    // 行高が表示状態に依存するため、ここで先に決める）
+    if (regEnabled && !refresh) {
+        SendMessageW(g_regDescToggle, BM_SETCHECK,
+                     GetWindowTextLengthW(g_regDesc) > 0 ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+    const bool regDesc    = regEnabled && isRegisterDescShown();
     const int  regCtrlH   = tm.tmHeight + 8;
-    const int  regRowH    = regCtrlH + 2 * REG_PAD;
+    const int  regDescH   = tm.tmHeight * REG_DESC_ROWS + 8;
+    // 説明欄の表示中はコントロール行の下に説明欄を足す。（この行高が regTailH 経由で打ち切りの予約にも効く）
+    const int  regRowH    = regCtrlH + 2 * REG_PAD + (regDesc ? regDescH + REG_PAD : 0);
     const int  regDateW   = textWidth(L"0000/00/00") + GetSystemMetrics(SM_CXVSCROLL) + 8;
     const int  regButtonW = textWidth(L"登録") + 32;
+    const int  regToggleW = textWidth(L"説明") + 32;
     int regPrioW = 0;
     if (regPrio) {
         std::vector<PriorityEntry> list;
@@ -5945,7 +6010,7 @@ static void showListPopup(HWND trayWnd, bool refresh) {
         regPrioW += GetSystemMetrics(SM_CXVSCROLL) + 12;
     }
     const int  regPrioSpan = regPrio ? REG_PAD + regPrioW : 0;
-    const int  regMinW    = REG_PAD * 4 + REG_EDIT_MIN_WIDTH + regPrioSpan + regDateW + regButtonW;
+    const int  regMinW    = REG_PAD * 5 + REG_EDIT_MIN_WIDTH + regPrioSpan + regDateW + regButtonW + regToggleW;
     // 登録欄とその上のセパレータの高さ（無効時は 0）
     const int  regTailH   = regEnabled ? 9 + regRowH : 0;
 
@@ -5990,10 +6055,13 @@ static void showListPopup(HWND trayWnd, bool refresh) {
     }
     ReleaseDC(hWnd, hdc);
 
-    // 登録欄の子コントロールを右から「登録・期日・優先度」と詰め、件名欄を残りの幅に広げる
+    // 登録欄の子コントロールを右から「説明トグル・登録・期日・優先度」と詰め、件名欄を残りの幅に広げる。
+    // 説明欄はその下に全幅で置き、閉じている間は隠す。（隠しても入力内容は保持し、送信にも含める）
     if (regEnabled) {
         const int cy = regTop + REG_PAD;
-        int x = width - REG_PAD - regButtonW;
+        int x = width - REG_PAD - regToggleW;
+        SetWindowPos(g_regDescToggle, nullptr, x, cy, regToggleW, regCtrlH, SWP_NOZORDER | SWP_NOACTIVATE);
+        x -= REG_PAD + regButtonW;
         SetWindowPos(g_regButton, nullptr, x, cy, regButtonW, regCtrlH, SWP_NOZORDER | SWP_NOACTIVATE);
         x -= REG_PAD + regDateW;
         SetWindowPos(g_regDate, nullptr, x, cy, regDateW, regCtrlH, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -6006,6 +6074,9 @@ static void showListPopup(HWND trayWnd, bool refresh) {
         }
         SetWindowPos(g_regEdit, nullptr, REG_PAD, cy, x - REG_PAD * 2, regCtrlH,
                      SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(g_regDesc, nullptr, REG_PAD, cy + regCtrlH + REG_PAD, width - 2 * REG_PAD, regDescH,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        ShowWindow(g_regDesc, regDesc ? SW_SHOWNA : SW_HIDE);
         // 新規表示で書きかけの件名が無ければ期日と優先度を既定に戻す。（日をまたいで開き直した場合の既定値）
         if (!refresh && GetWindowTextLengthW(g_regEdit) == 0) {
             resetRegisterDate();
@@ -6673,14 +6744,17 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         if (isListPopupVisible()) showListPopup(hWnd, true);
         return 0;
     }
-    // 登録スレッドの完了通知（成功なら入力をクリアし、即時ポーリングで新チケットを一覧へ反映する）
+    // 登録スレッドの完了通知（成功なら件名・説明をクリアして説明欄を閉じ、即時ポーリングで新チケットを一覧へ反映する）
     if (msg == WM_REGISTER_DONE) {
         g_registerBusy = false;
         if (wParam && g_regEdit) {
             SetWindowTextW(g_regEdit, L"");
+            SetWindowTextW(g_regDesc, L"");
+            SendMessageW(g_regDescToggle, BM_SETCHECK, BST_UNCHECKED, 0);
             resetRegisterDate();
             resetRegisterPriority();
             g_registerPoll.store(true);
+            if (isListPopupVisible()) showListPopup(hWnd, true);  // 説明欄を閉じた行高で組み直す
         }
         updateRegisterControls();
         if (g_listInputMode && g_regEdit) SetFocus(g_regEdit);  // 送信中の無効化で失ったフォーカスを戻す
@@ -7735,7 +7809,8 @@ int wmain() {
         // WM_QUIT は IDM_EXIT 等の終了経路で PostQuitMessage(0) により投函される。
         MSG msg;
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-            // 一覧の登録欄の Tab（移動）・Enter（IDOK）・Esc（IDCANCEL）をダイアログ同様に処理する
+            // 一覧の登録欄の Tab（移動）・Enter（IDOK）・Esc（IDCANCEL）をダイアログ同様に処理する。
+            // 説明欄は regDescSubclassProc が Tab・Esc・Ctrl+Enter だけを同じ経路へ流す
             if (g_listWnd && IsDialogMessageW(g_listWnd, &msg)) continue;
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
