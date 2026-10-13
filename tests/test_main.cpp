@@ -1042,9 +1042,9 @@ static void testAlignTowardCenter() {
 // ==================== 登録欄 ====================
 
 static void testRegisterSubject() {
-    CHECK_WSTR(trimRegisterSubject(L"  abc \t"), L"abc");
-    CHECK_WSTR(trimRegisterSubject(L"　タスク　"), L"タスク");  // 全角空白も除去
-    CHECK(!isRegisterSubjectValid(trimRegisterSubject(L" 　 ")));  // 空白のみ
+    CHECK_WSTR(trimRegisterText(L"  abc \t"), L"abc");
+    CHECK_WSTR(trimRegisterText(L"　タスク　"), L"タスク");  // 全角空白も除去
+    CHECK(!isRegisterSubjectValid(trimRegisterText(L" 　 ")));  // 空白のみ
     CHECK(!isRegisterSubjectValid(L"ab"));
     CHECK(isRegisterSubjectValid(L"abc"));
     CHECK(isRegisterSubjectValid(L"あいう"));
@@ -1058,12 +1058,19 @@ static void testBuildIssueCreateBody() {
     const std::string expected = reinterpret_cast<const char*>(
         u8"{\"issue\":{\"project_id\":\"my-project\",\"subject\":\"件名 \\\"x\\\"\","
         u8"\"due_date\":\"2026-09-28\",\"assigned_to_id\":3}}");
-    CHECK(buildIssueCreateBody(L"my-project", L"件名 \"x\"", "2026-09-28", 3, 0) == expected);
+    CHECK(buildIssueCreateBody(L"my-project", L"件名 \"x\"", "2026-09-28", 3, 0, L"") == expected);
     // 優先度 id は正のときだけ送る（0 = 未取得で Redmine の既定に任せる）
     const std::string withPrio = reinterpret_cast<const char*>(
         u8"{\"issue\":{\"project_id\":\"p\",\"subject\":\"abc\","
         u8"\"due_date\":\"2026-09-28\",\"assigned_to_id\":3,\"priority_id\":4}}");
-    CHECK(buildIssueCreateBody(L"p", L"abc", "2026-09-28", 3, 4) == withPrio);
+    CHECK(buildIssueCreateBody(L"p", L"abc", "2026-09-28", 3, 4, L"") == withPrio);
+    // 説明は trim して空でないときだけ送る。（改行は JSON エスケープで通す）
+    CHECK(buildIssueCreateBody(L"p", L"abc", "2026-09-28", 3, 4, L" 　\r\n ") == withPrio);
+    const std::string withDesc = reinterpret_cast<const char*>(
+        u8"{\"issue\":{\"project_id\":\"p\",\"subject\":\"abc\","
+        u8"\"due_date\":\"2026-09-28\",\"assigned_to_id\":3,\"priority_id\":4,"
+        u8"\"description\":\"説明\\r\\n2 行目\"}}");
+    CHECK(buildIssueCreateBody(L"p", L"abc", "2026-09-28", 3, 4, L" 説明\r\n2 行目 ") == withDesc);
 }
 
 static void testBuildIssueUpdateBody() {

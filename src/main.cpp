@@ -5050,8 +5050,8 @@ static constexpr int    REG_PAD = 4;
 // 件名欄の最小幅（px。一覧の幅がこれより狭いときは一覧側を広げる）
 static constexpr int    REG_EDIT_MIN_WIDTH = 240;
 
-// 登録欄の件名の前後から空白（全角空白を含む）を除去する
-static std::wstring trimRegisterSubject(const std::wstring& s) {
+// 登録欄の入力（件名・説明）の前後から空白（全角空白を含む）を除去する
+static std::wstring trimRegisterText(const std::wstring& s) {
     static constexpr wchar_t SPACES[] = L" \t\r\n　";
     const size_t b = s.find_first_not_of(SPACES);
     if (b == std::wstring::npos) return {};
@@ -5106,14 +5106,18 @@ static std::string ymdToIsoDate(int ymd) {
 // チケット作成 API（POST /issues.json）の要求本文
 // project は識別子または数値 id の文字列、dueIso は "YYYY-MM-DD"、assigneeId は担当者（自分）の user id。
 // priorityId は 0 なら送らない。（優先度一覧が未取得のとき。Redmine の既定に任せる）
+// description は trim して空なら送らない。（説明なしのチケットに空文字の説明を持たせない。改行は jsonEscape が通す）
 // tracker_id は送らない。（プロジェクトで有効な先頭のトラッカー＝プロジェクト既定に任せる）
 static std::string buildIssueCreateBody(const std::wstring& project, const std::wstring& subject,
-                                        const std::string& dueIso, int assigneeId, int priorityId) {
+                                        const std::string& dueIso, int assigneeId, int priorityId,
+                                        const std::wstring& description) {
     std::string body = "{\"issue\":{\"project_id\":\"" + jsonEscape(wideToUtf8(project))
         + "\",\"subject\":\"" + jsonEscape(wideToUtf8(subject))
         + "\",\"due_date\":\"" + jsonEscape(dueIso)
         + "\",\"assigned_to_id\":" + std::to_string(assigneeId);
     if (priorityId > 0) body += ",\"priority_id\":" + std::to_string(priorityId);
+    const std::wstring desc = trimRegisterText(description);
+    if (!desc.empty()) body += ",\"description\":\"" + jsonEscape(wideToUtf8(desc)) + "\"";
     return body + "}}";
 }
 
@@ -5149,9 +5153,14 @@ static HWND g_regEdit     = nullptr; // 件名
 static HWND g_regPriority = nullptr; // 優先度（ComboBox、ドロップダウンリスト。g_priorities が空の間は非表示）
 static HWND g_regDate     = nullptr; // 期日（DateTimePicker）
 static HWND g_regButton   = nullptr; // 登録ボタン（id = IDOK。Enter と同じ WM_COMMAND 経路にする）
+static HWND g_regDescToggle = nullptr; // 説明欄の開閉トグル（BS_AUTOCHECKBOX | BS_PUSHLIKE。押下＝表示。表示状態の唯一の根拠）
+static HWND g_regDesc       = nullptr; // 説明（複数行 Edit。閉じている間は非表示だが入力内容は保持して送る）
 static constexpr int IDC_REG_EDIT     = 101;
 static constexpr int IDC_REG_DATE     = 102;
 static constexpr int IDC_REG_PRIORITY = 103;
+static constexpr int IDC_REG_DESC_TOGGLE = 104;
+static constexpr int IDC_REG_DESC        = 105;
+static constexpr UINT_PTR REG_DESC_SUBCLASS_ID = 1;  // 説明欄のサブクラス識別子（SetWindowSubclass）
 // 優先度コンボに入れた優先度 id（表示順。空 = 未投入で非表示）。g_priorities との差分検知と、
 // 選択項目から id を引くのに使う。（メインスレッド専用）
 static std::vector<int> g_regPriorityIds;
@@ -5223,14 +5232,23 @@ static int getRegisterPriorityId() {
     return g_regPriorityIds[static_cast<size_t>(sel)];
 }
 
+// 子コントロールの文字列全体を取得する（件名・説明の Edit で共用）
+static std::wstring getControlText(HWND h) {
+    const int len = GetWindowTextLengthW(h);
+    std::wstring s(static_cast<size_t>(len) + 1, L'\0');
+    const int got = GetWindowTextW(h, s.data(), len + 1);
+    s.resize(static_cast<size_t>((std::max)(got, 0)));
+    return s;
+}
+
 // 件名欄の入力を trim して返す
 static std::wstring getRegisterSubject() {
-    if (!g_regEdit) return {};
-    const int len = GetWindowTextLengthW(g_regEdit);
-    std::wstring s(static_cast<size_t>(len) + 1, L'\0');
-    const int got = GetWindowTextW(g_regEdit, s.data(), len + 1);
-    s.resize(static_cast<size_t>((std::max)(got, 0)));
-    return trimRegisterSubject(s);
+    return g_regEdit ? trimRegisterText(getControlText(g_regEdit)) : std::wstring{};
+}
+
+// 説明欄の入力をそのまま返す（trim と空の省略は buildIssueCreateBody が行う。未生成なら空）
+static std::wstring getRegisterDescription() {
+    return g_regDesc ? getControlText(g_regDesc) : std::wstring{};
 }
 
 // 登録欄の有効・無効を状態に合わせる
@@ -5328,7 +5346,8 @@ static void submitRegistration() {
     SYSTEMTIME st = {};
     if (DateTime_GetSystemtime(g_regDate, &st) != GDT_VALID) return;
     const std::string body = buildIssueCreateBody(currentRegisterProject(), subject,
-        ymdToIsoDate(st.wYear * 10000 + st.wMonth * 100 + st.wDay), me, getRegisterPriorityId());
+        ymdToIsoDate(st.wYear * 10000 + st.wMonth * 100 + st.wDay), me, getRegisterPriorityId(),
+        getRegisterDescription());
     // 前回分は完了通知の受信後（busy = false）なので、join は即座に戻る
     if (g_registerThread.joinable()) g_registerThread.join();
     try {
