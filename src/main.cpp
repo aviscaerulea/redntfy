@@ -3947,6 +3947,9 @@ static void initMenuFonts() {
 // 注意を促す文字色（期限切れ行で list_format の "!" を付けた要素と、バグマーカー。更新通知メニューの新バージョン表示と同じ赤）
 static constexpr COLORREF ALERT_TEXT_COLOR = RGB(220, 0, 0);
 
+// 新規マーカー（✨）の文字色（金色。既定の黒では絵文字として目に留まらないため）
+static constexpr COLORREF NEW_MARK_COLOR = RGB(0xD4, 0x9A, 0x00);
+
 // ラベル内で文字色、ウェイト、サイズを変える範囲（オフセットと長さは UTF-16 コードユニット単位）
 // bold と keepColor を組み合わせて「色は据え置き、ウェイトだけ変える」ような部分強調にも使える。
 struct ColorRange {
@@ -4146,7 +4149,7 @@ static constexpr wchar_t BUG_MARK[] = L"💥 ";
 
 // 新規マーカー（✨ + 半角スペース。起票から new_mark_hours 時間以内の行に付ける）
 // 扱いは GROUP_MARK と同じ。（ラベル埋め込みの GDI 単色描画）
-// 色は既定の文字色に据え置く。赤は期限切れと 💥 に予約済みで、緊急度ではない新規に使うと
+// 色は NEW_MARK_COLOR（金色）とする。赤は期限切れと 💥 に予約済みで、緊急度ではない新規に使うと
 // 意味が混ざるためだ。
 static constexpr wchar_t NEW_MARK[] = L"✨ ";
 
@@ -4166,7 +4169,7 @@ static constexpr wchar_t NEW_MARK[] = L"✨ ";
 //   装飾込みで展開し、
 //   空なら装飾ごと消える。
 //   期限切れ行の "!" 指定要素と、常に赤いバグマーカーは ALERT_TEXT_COLOR で描くため、
-//   位置を ranges に記録する。期日は "!" の有無によらず常に半太字の範囲を持つ。
+//   位置を ranges に記録する。新規マーカーも NEW_MARK_COLOR で描くため範囲を持つ。期日は "!" の有無によらず常に半太字の範囲を持つ。
 //   "@" で縮小した要素も、サイズを描画側へ渡すため範囲を持つ。
 //   （ranges はオフセット昇順で並べる契約。展開順の追記がそのまま昇順になる）
 // 引数に ListRow を丸ごと取るのは、同じ型の要素が増えて位置引数では取り違えを防げないため。
@@ -4251,6 +4254,12 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
             // マーカー自体を赤くする。（絵文字は GDI が現在の文字色で単色描画するため色が乗る）
             // 末尾の空白は色を変えても見えないので範囲に含めない
             range.len       = val.size() - (val.back() == L' ' ? 1 : 0);
+            range.keepColor = false;
+        }
+        else if (tk.element == FMT_NEW) {
+            // 💥 と同じ仕組みで金色にする。（末尾の空白を範囲に含めない理由も同じ）
+            range.len       = val.size() - (val.back() == L' ' ? 1 : 0);
+            range.color     = NEW_MARK_COLOR;
             range.keepColor = false;
         }
         // 色、ウェイト、サイズのいずれも既定のままなら範囲を持たない（範囲外と同じ描画で足りる）。

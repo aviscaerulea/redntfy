@@ -268,16 +268,20 @@ static void testBuildIssueLabel() {
         }
     }
 
-    // 新規：💥 の直前に ✨ が入り、後続の色範囲がその分だけ後ろへずれる
+    // 新規：💥 の直前に金色の ✨ が入り、後続の色範囲がその分だけ後ろへずれる
     {
         auto row = makeRow();
         row.isNew = true;
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
         CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 ✨ 💥 テスト件名（6 日遅れ）");
-        CHECK(lbl.ranges.size() == 4);
-        if (lbl.ranges.size() == 4) {
+        CHECK(lbl.ranges.size() == 5);
+        if (lbl.ranges.size() == 5) {
             CHECK(lbl.ranges[0].offset == 23);  // 期日は ✨ より前のため不変
-            CHECK(lbl.ranges[1].offset == 30);  // 💥。"✨ "（2 コードユニット）分ずれる
+            CHECK(lbl.ranges[1].offset == 28);  // ✨（BMP の 1 コードユニット、末尾空白を含まない）
+            CHECK(lbl.ranges[1].len == 1);
+            CHECK(lbl.ranges[1].color == NEW_MARK_COLOR);
+            CHECK(!lbl.ranges[1].keepColor);
+            CHECK(lbl.ranges[2].offset == 30);  // 💥。"✨ "（2 コードユニット）分ずれる
         }
     }
 
