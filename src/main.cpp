@@ -5392,6 +5392,15 @@ static std::string buildIssueUpdateBody(const char* key, const std::string& json
     return std::string("{\"issue\":{\"") + key + "\":" + jsonValue + "}}";
 }
 
+// チケット終了の要求本文（status_id と、コメントがあれば notes を 1 回の PUT で送る）
+// notes は trim して空なら送らない。（空コメントの journal を作らない。改行は jsonEscape が通す）
+static std::string buildIssueCloseBody(int statusId, const std::wstring& notes) {
+    std::string body = "{\"issue\":{\"status_id\":" + std::to_string(statusId);
+    const std::wstring trimmed = trimRegisterText(notes);
+    if (!trimmed.empty()) body += ",\"notes\":\"" + jsonEscape(wideToUtf8(trimmed)) + "\"";
+    return body + "}}";
+}
+
 // 更新失敗の Toast 本文（ステータス別の案内。422 は Redmine の検証エラー文言をそのまま示す）
 static std::wstring describeUpdateError(DWORD status, const std::string& resp) {
     switch (status) {
@@ -5418,7 +5427,9 @@ static bool g_issueUpdateBusy = false;  // 更新要求の送信中（メイン�
 // Redmine はワークフローで許可されない遷移・未完了の子チケット・ブロック関連などで選べない status_id を
 // エラーにせず黙って捨て、204 を返すため。（ステータスだけの更新では何も変わらないまま成功に見える）
 // 照合の取得に失敗したときは確かめようがないため、更新は成功として扱う。
-static void issueUpdateThreadFunc(int issueId, std::string body, int expectStatusId) {
+// notesSent は本文に notes を含めたかで、照合不一致の Toast にコメントが記録済みである旨を添える。
+// （Redmine は捨てた status_id と同じ PUT の notes を記録するため。再試行でコメントを二重に投稿させない）
+static void issueUpdateThreadFunc(int issueId, std::string body, int expectStatusId, bool notesSent) {
     WinRtApartment apartment;  // 応答の JSON 解析と Toast のため
     const Config& cfg = g_currentConfig;
     DWORD status = 0;
@@ -5444,6 +5455,7 @@ static void issueUpdateThreadFunc(int issueId, std::string body, int expectStatu
                 ok = false;
                 title  = L"チケットを終了できません";
                 reason = L"ステータスが変わりませんでした。（ワークフローや、未完了の子チケット・ブロック関連の状態によっては終了できません）";
+                if (notesSent) reason += L"コメントは記録されました。";
                 writeLog("issue update: #" + std::to_string(issueId) + " status not changed (expected "
                     + std::to_string(expectStatusId) + ", actual " + std::to_string(actual) + ")");
             }
@@ -5469,12 +5481,14 @@ static void issueUpdateThreadFunc(int issueId, std::string body, int expectStatu
 
 // チケット更新の送信を開始する（メインスレッド。送信中は何もしない）
 // expectStatusId はステータス更新のときだけ正の id を渡し、送信後の照合に使う。（issueUpdateThreadFunc を参照）
-static void startIssueUpdate(int issueId, const std::string& body, int expectStatusId = 0) {
+// notesSent は本文に notes を含めたときだけ true を渡す。（issueUpdateThreadFunc を参照）
+static void startIssueUpdate(int issueId, const std::string& body, int expectStatusId = 0,
+                             bool notesSent = false) {
     if (g_issueUpdateBusy) return;
     // 前回分は完了通知の受信後（busy = false）なので、join は即座に戻る
     if (g_issueUpdateThread.joinable()) g_issueUpdateThread.join();
     try {
-        g_issueUpdateThread = std::thread(issueUpdateThreadFunc, issueId, body, expectStatusId);
+        g_issueUpdateThread = std::thread(issueUpdateThreadFunc, issueId, body, expectStatusId, notesSent);
     }
     catch (const std::system_error& e) {
         writeLog(std::string("issue update: failed to start thread: ") + e.what());
@@ -5788,7 +5802,7 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-// 説明欄のキー処理（SetWindowSubclass）
+// 複数行 Edit のキー処理（SetWindowSubclass。登録欄の説明欄と終了ダイアログのコメント欄で共用）
 // 複数行 Edit は WM_GETDLGCODE で DLGC_WANTALLKEYS を返し、Tab・Esc も自分で処理して親へ渡さない。
 // Tab・Esc・Ctrl+Enter の 3 キーだけ DLGC_WANTALLKEYS を落とし、件名欄と同じく IsDialogMessageW に
 // Tab 移動・Esc（IDCANCEL）・Enter（IDOK）へ変換させる。Enter 単独は Edit に残して改行にする。（ES_WANTRETURN）
@@ -6364,6 +6378,66 @@ static void setClipboardText(HWND owner, const std::wstring& text, const std::st
     CloseClipboard();
 }
 
+// ==================== チケット終了ダイアログ ====================
+// 行メニュー「チケットを終了」の確認とコメント入力を 1 つのダイアログ（IDD_CLOSE_ISSUE）で行う。
+// コメントは任意で、空ならステータスだけ変える。（従来の確認 MessageBox と同じ結果）
+
+// ダイアログとの受け渡し（WM_INITDIALOG の lParam で渡し、[終了] でコメントを書き戻す）
+struct CloseIssueDialogData {
+    int          issueId;
+    std::wstring notes;  // [終了] 時のコメント欄の内容（未 trim）
+};
+
+// 終了ダイアログのプロシージャ
+// コメント欄は登録欄の説明欄と同じく regDescSubclassProc で Enter＝改行、Ctrl+Enter＝終了、Esc＝キャンセルにする。
+// 入力上限は説明欄と同じ REG_DESC_MAX_CHARS。（Redmine の notes は text 型で実質上限がないため UI 側で制限する）
+static INT_PTR CALLBACK closeIssueDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_INITDIALOG) {
+        auto* data = reinterpret_cast<CloseIssueDialogData*>(lParam);
+        SetWindowLongPtrW(hDlg, DWLP_USER, lParam);
+        SetWindowTextW(hDlg, (L"#" + std::to_wstring(data->issueId) + L" を終了").c_str());
+        HWND edit = GetDlgItem(hDlg, IDC_CLOSE_NOTES);
+        SendMessageW(edit, EM_LIMITTEXT, REG_DESC_MAX_CHARS, 0);
+        if (!SetWindowSubclass(edit, regDescSubclassProc, REG_DESC_SUBCLASS_ID, 0))
+            writeLog("close dialog: SetWindowSubclass failed");  // Ctrl+Enter・Esc が効かないだけでボタンは使える
+        SetFocus(edit);
+        return FALSE;  // フォーカスを自分で決めたため既定の設定をさせない
+    }
+    if (msg == WM_COMMAND) {
+        const UINT id = LOWORD(wParam);
+        if (id == IDOK) {
+            auto* data = reinterpret_cast<CloseIssueDialogData*>(GetWindowLongPtrW(hDlg, DWLP_USER));
+            HWND edit = GetDlgItem(hDlg, IDC_CLOSE_NOTES);
+            std::wstring text(static_cast<size_t>(GetWindowTextLengthW(edit)) + 1, L'\0');
+            text.resize(GetWindowTextW(edit, text.data(), static_cast<int>(text.size())));
+            data->notes = std::move(text);
+            EndDialog(hDlg, IDOK);
+            return TRUE;
+        }
+        if (id == IDCANCEL) {
+            EndDialog(hDlg, IDCANCEL);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+// 終了ダイアログを表示する（メインスレッド。モーダル）
+// [終了] なら true を返し、notes にコメント欄の内容を入れる。キャンセル・表示失敗は false。
+// 所有者は前面化済みのトレイウィンドウ。（呼び出し側が閉じた後のフォアグラウンドを元の窓へ戻す）
+static bool showCloseIssueDialog(int issueId, std::wstring& notes) {
+    CloseIssueDialogData data{ issueId, {} };
+    const INT_PTR r = DialogBoxParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_CLOSE_ISSUE),
+                                      g_hWnd, closeIssueDlgProc, reinterpret_cast<LPARAM>(&data));
+    if (r == -1) {
+        writeLog("close dialog: DialogBoxParamW failed: " + std::to_string(GetLastError()));
+        return false;
+    }
+    if (r != IDOK) return false;
+    notes = std::move(data.notes);
+    return true;
+}
+
 // 一覧の行の右クリックメニューのコマンド ID（TPM_RETURNCMD で受け、トレイの IDM_* とは混ぜない）
 // サブメニュー「コピー」（ID は追加順の採番で、値の連続には依存しない）
 static constexpr UINT IDM_ROW_COPY_ID  = 41001;  // 番号（#123）をコピー
@@ -6375,7 +6449,7 @@ static constexpr UINT IDM_ROW_COPY_MARKDOWN = 41009; // Markdown のリンク [#
 static constexpr UINT IDM_ROW_PIN      = 41003;
 static constexpr UINT IDM_ROW_HIDE     = 41004;
 static constexpr UINT IDM_ROW_NORMAL   = 41005;
-static constexpr UINT IDM_ROW_CLOSE    = 41006;  // close_status_id へ更新（確認ダイアログあり）
+static constexpr UINT IDM_ROW_CLOSE    = 41006;  // close_status_id へ更新（コメント入力を兼ねた確認ダイアログあり）
 // 期日のプリセット（サブメニュー「期日」）
 static constexpr UINT IDM_ROW_DUE_TODAY    = 41010;
 static constexpr UINT IDM_ROW_DUE_TOMORROW = 41011;
@@ -6390,13 +6464,13 @@ static constexpr UINT IDM_ROW_PRIORITY_BASE = 41100;
 // クリックで閉じない。一覧は WS_EX_NOACTIVATE のため所有者にしない）
 // TrackPopupMenu はモーダルループでメッセージを回し、その間にポーリングが一覧を組み直し得る。
 // そのため対象は id で持ち、行の添字は使わない。表示中は g_rowMenuOpen で離脱監視を止める。
-// （終了の確認ダイアログの表示中も、メニューと同じ理由で立てたままにする）
+// （終了ダイアログの表示中も、メニューと同じ理由で立てたままにする）
 // コピー系（番号・URL・テキスト・Markdown・リンク）はサブメニュー「コピー」にまとめる。
 // リンクのコピーだけは CF_HTML とプレーンテキストを同時に置く。（貼り付け先に応じてリンクかテキストになる）
 // 優先度・期日・終了は Redmine への更新で、startIssueUpdate へ渡す。送信中は灰色にして重ねて送らない。
 // 優先度は g_priorities が空（未取得・有効 0 件）なら項目ごと出さず、終了は close_status_id 未設定なら出さない。
 static void showRowContextMenu(int issueId, POINT screenPt) {
-    // 終了の確認ダイアログ表示中も一覧は右クリックを受けるため、入れ子で開かない
+    // 終了ダイアログの表示中も一覧は右クリックを受けるため、入れ子で開かない
     // （入れ子側の終了処理が g_rowMenuOpen を戻し、外側の表示中に離脱監視が再開してしまう）
     if (!g_hWnd || g_rowMenuOpen) return;
     // メニュー構築時点の状態（集合外の行はピン留め・非表示にできない。setIssueState を参照）
@@ -6521,13 +6595,12 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
     }
     else if (cmd == IDM_ROW_CLOSE) {
         // 取り消しにくい操作のため終了だけ確認する。（優先度・期日は選び直せるため確認しない）
-        // 所有者は前面化済みのトレイウィンドウとし、閉じた後のフォアグラウンドを自スレッドに残す。
-        // （下の返却処理が元の窓へ戻す。TOPMOST の一覧より前に出すため MB_TOPMOST を付ける）
-        const std::wstring text = idText + L" を終了しますか？";
-        if (MessageBoxW(g_hWnd, text.c_str(), L"redntfy",
-                        MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST) == IDOK) {
-            startIssueUpdate(issueId, buildIssueUpdateBody("status_id", std::to_string(closeStatusId)),
-                             closeStatusId);
+        // 確認はコメント入力を兼ねたダイアログで行い、コメントは notes として同じ PUT で送る。
+        // 閉じた後のフォアグラウンドは自スレッドに残り、下の返却処理が元の窓へ戻す。
+        std::wstring notes;
+        if (showCloseIssueDialog(issueId, notes)) {
+            startIssueUpdate(issueId, buildIssueCloseBody(closeStatusId, notes), closeStatusId,
+                             !trimRegisterText(notes).empty());
         }
     }
 

@@ -1079,6 +1079,15 @@ static void testBuildIssueUpdateBody() {
     CHECK(buildIssueUpdateBody("due_date", "null") == "{\"issue\":{\"due_date\":null}}");
 }
 
+static void testBuildIssueCloseBody() {
+    CHECK(buildIssueCloseBody(5, L"") == "{\"issue\":{\"status_id\":5}}");
+    // 空白だけのコメントは送らない
+    CHECK(buildIssueCloseBody(5, L" 　\r\n ") == "{\"issue\":{\"status_id\":5}}");
+    const std::string withNotes = reinterpret_cast<const char*>(
+        u8"{\"issue\":{\"status_id\":5,\"notes\":\"完了\\r\\n\\\"x\\\"\"}}");
+    CHECK(buildIssueCloseBody(5, L" 完了\r\n\"x\" ") == withNotes);
+}
+
 // CF_HTML のヘッダの値を取り出す（見つからなければ -1）
 static long long clipboardHtmlOffset(const std::string& html, const char* key) {
     const size_t pos = html.find(key);
@@ -1160,6 +1169,7 @@ int main() {
     testRegisterSubject();
     testBuildIssueCreateBody();
     testBuildIssueUpdateBody();
+    testBuildIssueCloseBody();
     testAddDaysYmd();
     testBuildClipboardHtml();
     testBuildMarkdownLink();

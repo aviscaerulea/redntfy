@@ -1,11 +1,26 @@
 // vi: ts=4 sw=4 ff=unix fenc=utf-8
 // リソーススクリプト：アイコンとバージョン情報を実行ファイルに埋め込む
 
-#include <winver.h>
+#include <windows.h>
 #include "resource.h"
 
 IDI_APP_ICON            ICON    "app.ico"
 IDI_APP_ICON_DISABLE    ICON    "app-disable.ico"
+
+// チケット終了ダイアログ（main.cpp の showCloseIssueDialog が表示する）
+// キャプションは表示時に「#123 を終了」へ差し替える。DS_CENTERMOUSE で右クリック位置付近に出し、
+// WS_EX_TOPMOST で TOPMOST の一覧より前に出す。
+IDD_CLOSE_ISSUE DIALOGEX 0, 0, 240, 122
+STYLE DS_MODALFRAME | DS_SETFONT | DS_CENTERMOUSE | DS_SETFOREGROUND | WS_POPUP | WS_CAPTION | WS_SYSMENU
+EXSTYLE WS_EX_TOPMOST
+CAPTION "チケットを終了"
+FONT 9, "Yu Gothic UI"
+BEGIN
+    LTEXT           "コメント（任意。Ctrl+Enter で終了）", -1, 7, 7, 226, 10
+    EDITTEXT        IDC_CLOSE_NOTES, 7, 19, 226, 74, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL
+    DEFPUSHBUTTON   "終了", IDOK, 129, 101, 50, 14
+    PUSHBUTTON      "キャンセル", IDCANCEL, 183, 101, 50, 14
+END
 
 // バージョン情報リソース
 // FileDescription と ProductName が空だと、Windows の各種アプリ一覧 UI（音量ミキサー、
