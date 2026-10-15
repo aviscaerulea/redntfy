@@ -10,16 +10,16 @@ IDI_APP_ICON_DISABLE    ICON    "app-disable.ico"
 // チケット終了ダイアログ（main.cpp の showCloseIssueDialog が表示する）
 // キャプションは表示時に「#123 を終了」へ差し替える。DS_CENTERMOUSE で右クリック位置付近に出し、
 // WS_EX_TOPMOST で TOPMOST の一覧より前に出す。
-IDD_CLOSE_ISSUE DIALOGEX 0, 0, 240, 122
+// コメント欄は約 4 行分の高さ。案内文は欄の中に表示する。（main.cpp の cueBannerSubclassProc）
+IDD_CLOSE_ISSUE DIALOGEX 0, 0, 320, 70
 STYLE DS_MODALFRAME | DS_SETFONT | DS_CENTERMOUSE | DS_SETFOREGROUND | WS_POPUP | WS_CAPTION | WS_SYSMENU
 EXSTYLE WS_EX_TOPMOST
 CAPTION "チケットを終了"
 FONT 9, "Yu Gothic UI"
 BEGIN
-    LTEXT           "コメント（任意。Ctrl+Enter で終了）", -1, 7, 7, 226, 10
-    EDITTEXT        IDC_CLOSE_NOTES, 7, 19, 226, 74, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL
-    DEFPUSHBUTTON   "終了", IDOK, 129, 101, 50, 14
-    PUSHBUTTON      "キャンセル", IDCANCEL, 183, 101, 50, 14
+    EDITTEXT        IDC_CLOSE_NOTES, 7, 7, 306, 37, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL
+    DEFPUSHBUTTON   "終了", IDOK, 209, 50, 50, 14
+    PUSHBUTTON      "キャンセル", IDCANCEL, 263, 50, 50, 14
 END
 
 // バージョン情報リソース

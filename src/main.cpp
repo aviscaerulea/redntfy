@@ -6388,8 +6388,43 @@ struct CloseIssueDialogData {
     std::wstring notes;  // [終了] 時のコメント欄の内容（未 trim）
 };
 
+// コメント欄の未入力時の案内文（件名欄のキューバナーと同じく、空の間だけ灰色で表示する）
+static constexpr wchar_t CLOSE_NOTES_CUE[] = L"チケット終了時のコメント（Ctrl+Enter）";
+static constexpr UINT_PTR CUE_BANNER_SUBCLASS_ID = 1;  // 複数行 Edit の案内文のサブクラス識別子（SetWindowSubclass）
+
+// 複数行 Edit の案内文表示（SetWindowSubclass。dwRefData は表示する文字列 const wchar_t*）
+// EM_SETCUEBANNER は ES_MULTILINE に効かないため、既定の描画の後に、空のときだけ書式矩形へ灰色で描く。
+// フォーカス中も表示する。（件名欄の EM_SETCUEBANNER の TRUE 指定と揃える）
+// 入力で空でなくなったときの消去は、既定の描画が変更箇所しか塗り直さないため、
+// 親が EN_CHANGE で全体を無効化して行う。（closeIssueDlgProc）
+// 描画中はキャレットを隠す。（XOR 描画のキャレットに重ね描きすると、点滅で欠けが残るため）
+static LRESULT CALLBACK cueBannerSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                              UINT_PTR, DWORD_PTR refData) {
+    if (msg == WM_PAINT) {
+        LRESULT r = DefSubclassProc(hWnd, msg, wParam, lParam);
+        if (GetWindowTextLengthW(hWnd) == 0) {
+            if (HDC dc = GetDC(hWnd)) {
+                RECT rc;
+                SendMessageW(hWnd, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&rc));
+                HFONT old = static_cast<HFONT>(SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(hWnd, WM_GETFONT, 0, 0))));
+                SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
+                SetBkMode(dc, TRANSPARENT);
+                HideCaret(hWnd);
+                DrawTextW(dc, reinterpret_cast<const wchar_t*>(refData), -1, &rc, DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK);
+                ShowCaret(hWnd);
+                SelectObject(dc, old);
+                ReleaseDC(hWnd, dc);
+            }
+        }
+        return r;
+    }
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(hWnd, cueBannerSubclassProc, CUE_BANNER_SUBCLASS_ID);
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+}
+
 // 終了ダイアログのプロシージャ
 // コメント欄は登録欄の説明欄と同じく regDescSubclassProc で Enter＝改行、Ctrl+Enter＝終了、Esc＝キャンセルにする。
+// 未入力時は cueBannerSubclassProc が案内文（CLOSE_NOTES_CUE）を表示する。
 // 入力上限は説明欄と同じ REG_DESC_MAX_CHARS。（Redmine の notes は text 型で実質上限がないため UI 側で制限する）
 static INT_PTR CALLBACK closeIssueDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_INITDIALOG) {
@@ -6400,11 +6435,19 @@ static INT_PTR CALLBACK closeIssueDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LP
         SendMessageW(edit, EM_LIMITTEXT, REG_DESC_MAX_CHARS, 0);
         if (!SetWindowSubclass(edit, regDescSubclassProc, REG_DESC_SUBCLASS_ID, 0))
             writeLog("close dialog: SetWindowSubclass failed");  // Ctrl+Enter・Esc が効かないだけでボタンは使える
+        if (!SetWindowSubclass(edit, cueBannerSubclassProc, CUE_BANNER_SUBCLASS_ID,
+                               reinterpret_cast<DWORD_PTR>(CLOSE_NOTES_CUE)))
+            writeLog("close dialog: SetWindowSubclass(cue) failed");  // 案内文が出ないだけで入力はできる
         SetFocus(edit);
         return FALSE;  // フォーカスを自分で決めたため既定の設定をさせない
     }
     if (msg == WM_COMMAND) {
         const UINT id = LOWORD(wParam);
+        if (id == IDC_CLOSE_NOTES && HIWORD(wParam) == EN_CHANGE) {
+            // 空⇔非空の切り替わりで案内文を出し入れするため全体を描き直す
+            InvalidateRect(reinterpret_cast<HWND>(lParam), nullptr, TRUE);
+            return TRUE;
+        }
         if (id == IDOK) {
             auto* data = reinterpret_cast<CloseIssueDialogData*>(GetWindowLongPtrW(hDlg, DWLP_USER));
             HWND edit = GetDlgItem(hDlg, IDC_CLOSE_NOTES);
@@ -6425,10 +6468,15 @@ static INT_PTR CALLBACK closeIssueDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LP
 // 終了ダイアログを表示する（メインスレッド。モーダル）
 // [終了] なら true を返し、notes にコメント欄の内容を入れる。キャンセル・表示失敗は false。
 // 所有者は前面化済みのトレイウィンドウ。（呼び出し側が閉じた後のフォアグラウンドを元の窓へ戻す）
+// 表示中は一覧を無効化して操作させない。DialogBoxParamW が無効化するのは所有者だけで、
+// TOPMOST の一覧は裏でクリックでき、行メニューの入れ子・登録欄の入力（モーダルループ中は
+// メインループの IsDialogMessageW を通らず Tab・Enter・Esc が効かない）を許してしまうため。
 static bool showCloseIssueDialog(int issueId, std::wstring& notes) {
     CloseIssueDialogData data{ issueId, {} };
+    if (g_listWnd) EnableWindow(g_listWnd, FALSE);
     const INT_PTR r = DialogBoxParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_CLOSE_ISSUE),
                                       g_hWnd, closeIssueDlgProc, reinterpret_cast<LPARAM>(&data));
+    if (g_listWnd) EnableWindow(g_listWnd, TRUE);
     if (r == -1) {
         writeLog("close dialog: DialogBoxParamW failed: " + std::to_string(GetLastError()));
         return false;
@@ -6470,8 +6518,8 @@ static constexpr UINT IDM_ROW_PRIORITY_BASE = 41100;
 // 優先度・期日・終了は Redmine への更新で、startIssueUpdate へ渡す。送信中は灰色にして重ねて送らない。
 // 優先度は g_priorities が空（未取得・有効 0 件）なら項目ごと出さず、終了は close_status_id 未設定なら出さない。
 static void showRowContextMenu(int issueId, POINT screenPt) {
-    // 終了ダイアログの表示中も一覧は右クリックを受けるため、入れ子で開かない
-    // （入れ子側の終了処理が g_rowMenuOpen を戻し、外側の表示中に離脱監視が再開してしまう）
+    // メニュー・終了ダイアログの表示中は入れ子で開かない。（入れ子側の終了処理が g_rowMenuOpen を戻し、
+    // 外側の表示中に離脱監視が再開してしまう。終了ダイアログ中は一覧を無効化して右クリック自体を止めるが、守りとして残す）
     if (!g_hWnd || g_rowMenuOpen) return;
     // メニュー構築時点の状態（集合外の行はピン留め・非表示にできない。setIssueState を参照）
     // 優先度・クローズ済みは取得集合を優先し、集合外ピンはピンのキャッシュから引く。

@@ -117,6 +117,8 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   閉じた後はフォアグラウンドを元の窓へ返す。（他アプリのクリックで閉じたときは何もしない）
   優先度・期日（今日・明日・1 週間後・期日なし）・終了は `PUT /issues/{id}.json` で 1 項目ずつ送り、成功時は `g_registerPoll` で即時ポーリングする。
   失敗時だけ Toast を出す。終了だけはコメント入力を兼ねた確認ダイアログ（`showCloseIssueDialog`、リソース `IDD_CLOSE_ISSUE`）を出す。（Enter は改行、Ctrl+Enter で終了、Esc でキャンセル）
+  コメント欄の案内文は `cueBannerSubclassProc` が描く。（`EM_SETCUEBANNER` は複数行 Edit に効かないため）
+  ダイアログの表示中は一覧を `EnableWindow` で無効化する。（`DialogBoxParamW` が無効化するのは所有者のトレイウィンドウだけで、TOPMOST の一覧を裏で操作できてしまうため）
   ダイアログのコメントは trim して空でなければ `notes` として `status_id` と同じ 1 回の PUT で送る。（1 項目ずつ送る規則の例外）
   終了は `[redmine] close_status_id` のステータスへ更新し、未設定なら項目を出さない。（ステータス id はサーバごとに異なるため推測しない）
   終了は成功応答の後にチケットを取得し直し、ステータスが `close_status_id` になっていなければ失敗として Toast を出す。取得し直しに失敗したときは成功として扱う。（Redmine はワークフロー・未完了の子チケット・ブロック関連で選べない `status_id` をエラーにせず無視し、204 を返すため）
