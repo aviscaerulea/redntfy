@@ -64,7 +64,7 @@ schedule = [ 6,  6,  6,  6,  6,  6,  6,  6, 10, 10, 10, 10, 10, 10, 10, 10, 10, 
 # 空の要素（期日なし等）の周りの余分な空白は自動で詰める。
 # 解釈できないプレースホルダはそのまま表示される。（誤記に気付けるように）
 # デフォルトは以下のとおり。
-# list_format = "#{id}  {author}/{commenter}  {group}[{project:5}] {due!}{left@90!} {new}{bug}{subject:40!}{ago@90}"
+# list_format = "#{id}  {author}/{commenter}  {group}[{project:5}] {due!} {new}{bug}{subject:40!}{left@90!}"
 
 # ✨ を付ける期間（単位：時間、範囲：0〜720、デフォルト 24）
 # 一覧の {new} の ✨ を、起票からこの時間が経つまで表示し、既読にしても外さない。

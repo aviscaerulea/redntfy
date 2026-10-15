@@ -59,8 +59,8 @@ static void testParseListFormat() {
     // 既定テンプレートの全トークン（並び・要素・最大文字数）
     {
         auto t = parseListFormat(LIST_FORMAT_DEFAULT);
-        CHECK(t.size() == 18);
-        if (t.size() == 18) {
+        CHECK(t.size() == 17);
+        if (t.size() == 17) {
             CHECK(t[0].element == FMT_LITERAL);   CHECK_WSTR(t[0].literal, L"#");
             CHECK(t[1].element == FMT_ID);        CHECK(t[1].maxChars == 0);  CHECK(!t[1].alert);
             CHECK(t[1].sizePct == 100);
@@ -74,13 +74,12 @@ static void testParseListFormat() {
             CHECK(t[9].element == FMT_PROJECT);   CHECK(t[9].maxChars == 5);
             CHECK(t[10].element == FMT_LITERAL);  CHECK_WSTR(t[10].literal, L"] ");
             CHECK(t[11].element == FMT_DUE);      CHECK(t[11].alert);
-            CHECK(t[12].element == FMT_LEFT);     CHECK(t[12].maxChars == 0);   CHECK(t[12].alert);
-            CHECK(t[12].sizePct == 90);
-            CHECK(t[13].element == FMT_LITERAL);  CHECK_WSTR(t[13].literal, L" ");
-            CHECK(t[14].element == FMT_NEW);
-            CHECK(t[15].element == FMT_BUG);
-            CHECK(t[16].element == FMT_SUBJECT);  CHECK(t[16].maxChars == 40);  CHECK(t[16].alert);
-            CHECK(t[17].element == FMT_AGO);      CHECK(!t[17].alert);          CHECK(t[17].sizePct == 90);
+            CHECK(t[12].element == FMT_LITERAL);  CHECK_WSTR(t[12].literal, L" ");
+            CHECK(t[13].element == FMT_NEW);
+            CHECK(t[14].element == FMT_BUG);
+            CHECK(t[15].element == FMT_SUBJECT);  CHECK(t[15].maxChars == 40);  CHECK(t[15].alert);
+            CHECK(t[16].element == FMT_LEFT);     CHECK(t[16].maxChars == 0);   CHECK(t[16].alert);
+            CHECK(t[16].sizePct == 90);
         }
     }
 
@@ -192,16 +191,24 @@ static void testBuildIssueLabel() {
         return row;
     };
 
-    // 既定テンプレート：起票者/最後のコメント投稿者、期日の直後に残り日数、末尾に経過日数
+    // 既定テンプレート：起票者/最後のコメント投稿者、末尾に残り日数（経過日数は含めない）
     g_currentConfig.listFormat = parseListFormat(LIST_FORMAT_DEFAULT);
     {
         auto row = makeRow();
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田/佐藤  👥 [ロケモニプ] 7/28（6 日遅れ） 💥 テスト件名（3 日前）");
+        CHECK_WSTR(lbl.text, L"#12345  山田/佐藤  👥 [ロケモニプ] 7/28 💥 テスト件名（6 日遅れ）");
         // コメントなし：区切りの "/" ごと消える
         row.commenter.clear();
         lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28（6 日遅れ） 💥 テスト件名（3 日前）");
+        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 💥 テスト件名（6 日遅れ）");
+    }
+
+    // 既定から外した経過日数 {ago} も、書式に書けば表示する
+    g_currentConfig.listFormat = parseListFormat(L"{subject}{ago@90}");
+    {
+        auto row = makeRow();
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"テスト件名（3 日前）");
     }
 
     // 以降は書式の仕組みの検査で、旧既定（最終更新者の姓・末尾に残り日数）の並びを使う
