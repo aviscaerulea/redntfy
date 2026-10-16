@@ -3916,7 +3916,7 @@ static void initMenuFonts() {
     LOGFONTW lfBold = ncm.lfMenuFont;
     lfBold.lfWeight = FW_BOLD;
     g_hMenuFontBold = CreateFontIndirectW(&lfBold);
-    // ラベル内の一部だけ強調する用（期日と、期限切れの件名、経過日数）。未読行の太字より控えめな
+    // ラベル内の一部だけ強調する用（期日と、期限切れ行で "!" を付けた要素）。未読行の太字より控えめな
     // ウェイトにして、行全体の太字（未読）と部分強調を見分けられるようにする。
     // 半太字は「<フェイス> Semibold」という別ファミリで、ウェイト値だけ FW_SEMIBOLD にしても
     // GDI は同一ファミリ内の近いウェイト＝太字へ丸める。（実測：Yu Gothic UI・Segoe UI とも 600 → 700）
