@@ -5430,6 +5430,7 @@ static bool g_issueUpdateBusy = false;  // 更新要求の送信中（メイン�
 // 照合の取得に失敗したときは確かめようがないため、更新は成功として扱う。
 // notesSent は本文に notes を含めたかで、照合不一致の Toast にコメントが記録済みである旨を添える。
 // （Redmine は捨てた status_id と同じ PUT の notes を記録するため。再試行でコメントを二重に投稿させない）
+// notesSent のときはログに本文を書かず、status_id とコメントの有無だけを書く。（コメントは利用者の自由記述のため）
 static void issueUpdateThreadFunc(int issueId, std::string body, int expectStatusId, bool notesSent) {
     WinRtApartment apartment;  // 応答の JSON 解析と Toast のため
     const Config& cfg = g_currentConfig;
@@ -5437,7 +5438,10 @@ static void issueUpdateThreadFunc(int issueId, std::string body, int expectStatu
     const std::string resp = redminePut(issueUrl(cfg, issueId) + L".json", cfg.apiKey, body, &status);
     // Redmine は 204 を返すが、版やプロキシによっては 200 になるため両方を成功とする
     bool ok = (status == 204 || status == 200);
-    writeLog("issue update: #" + std::to_string(issueId) + " " + body
+    // notes（利用者が書いたコメント）はログに残さず、有無だけを書く。（登録が説明文をログに出さないのと揃える）
+    const std::string logBody = notesSent
+        ? "status_id=" + std::to_string(expectStatusId) + " with notes" : body;
+    writeLog("issue update: #" + std::to_string(issueId) + " " + logBody
         + (ok ? " ok" : " failed, status=" + std::to_string(status)));
     std::wstring title = L"チケットを更新できません";
     std::wstring reason;
