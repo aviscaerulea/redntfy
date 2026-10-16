@@ -4165,7 +4165,8 @@ static constexpr wchar_t NEW_MARK[] = L"✨ ";
 //   出力末尾が空白または行頭なら取り除いて詰める。（従来の「詰めて省く」を再現）
 //   空に展開された要素を括弧対（[] ［］ () （） 【】 「」）が直接囲んでいれば、括弧ごと取り除く。
 //   （登録先プロジェクトや旧形式ピンで {project} が空のとき、既定書式の "[]" を残さないため）
-//   空に展開された要素の直前が "/"・"／" なら区切りごと取り除く。（コメントなしの {commenter}）
+//   空に展開された要素の直前がリテラル末尾の "/"・"／" なら区切りごと取り除く。（コメントなしの {commenter}。
+//   直前の要素の値が "/" で終わる場合は値の一部として残す）
 //   {group}＝"👥 "・{new}＝"✨ "・{bug}＝"💥 "・{ago}＝"（3 日前）"・{left}＝"（2 日遅れ）" は
 //   装飾込みで展開し、
 //   空なら装飾ごと消える。
@@ -4184,6 +4185,9 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
     IssueLabel r;
     bool prevEmpty = false;    // 直前のプレースホルダが空に展開されたか（空白整理の条件）
     wchar_t pendingClose = 0;  // 空要素の直前が開き括弧だったときの対の閉じ括弧（0 = なし）
+    // 直前にリテラルを足した時点の text の長さ（npos = 末尾はリテラルでない）。
+    // 空要素の前の区切り除去をリテラルの末尾に限るための判定に使う。
+    size_t literalEnd = std::wstring::npos;
     for (const auto& tk : g_currentConfig.listFormat) {
         if (tk.element == FMT_LITERAL) {
             std::wstring lit = tk.literal;
@@ -4199,6 +4203,7 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
             }
             if (!lit.empty()) {
                 r.text += lit;
+                literalEnd = r.text.size();
                 prevEmpty = false;
             }
             continue;
@@ -4222,9 +4227,12 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
         if (tk.maxChars > 0)
             val = truncateText(val, static_cast<size_t>(tk.maxChars), tk.element == FMT_SUBJECT);
         if (val.empty()) {
-            // 空要素の直前が区切りの "/" "／" なら消す。（"{author}/{commenter}" でコメントが無い行に
-            // "山田/" を残さないため）
-            if (!r.text.empty() && (r.text.back() == L'/' || r.text.back() == L'／')) r.text.pop_back();
+            // 空要素の直前がリテラル末尾の区切り "/" "／" なら消す。（"{author}/{commenter}" でコメントが
+            // 無い行に "山田/" を残さないため）
+            // 直前の要素の値が "/" で終わるとき（"docs/" で終わる件名など）は値の一部なので削らない。
+            // 括弧の除去（開き括弧の pop_back）を挟むと長さが一致しなくなり、区切りは残る。
+            if (r.text.size() == literalEnd && (r.text.back() == L'/' || r.text.back() == L'／'))
+                r.text.pop_back();
             // 連続する空要素では最初の要素の判定を保つ。（"[{a}{b}]" の両方が空なら括弧ごと消す）
             if (!prevEmpty) {
                 pendingClose = 0;
@@ -4236,6 +4244,7 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
             continue;
         }
         pendingClose = 0;
+        literalEnd   = std::wstring::npos;
         bool alertNow = tk.alert && due.overdue;  // "!" 指定かつ期限切れ行
         ColorRange range{.offset = r.text.size(), .len = val.size(), .color = ALERT_TEXT_COLOR,
                          .keepColor = true, .sizePct = tk.sizePct};

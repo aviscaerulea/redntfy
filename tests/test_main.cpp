@@ -203,6 +203,27 @@ static void testBuildIssueLabel() {
         CHECK_WSTR(lbl.text, L"#12345  山田  👥 [サンプルプ] 7/28 💥 テスト件名（6 日遅れ）");
     }
 
+    // 件名が "/" で終わり期日なし（末尾の {left} が空）：区切りの除去はリテラルにだけ効き、件名の末尾は残る
+    {
+        auto row = makeRow();
+        row.subject = "ドキュメント整備 docs/";
+        row.dueDate.clear();
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"#12345  山田/佐藤  👥 [サンプルプ] 💥 ドキュメント整備 docs/");
+    }
+
+    // "!" 付き件名の直後の要素が空：件名の末尾を削らないため、範囲長が実テキストと一致する
+    g_currentConfig.listFormat = parseListFormat(L"{subject!}{commenter}");
+    {
+        auto row = makeRow();
+        row.subject = "docs/";
+        row.commenter.clear();
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"docs/");
+        CHECK(lbl.ranges.size() == 1);
+        if (lbl.ranges.size() == 1) CHECK(lbl.ranges[0].len == lbl.text.size());
+    }
+
     // 既定から外した経過日数 {ago} も、書式に書けば表示する
     g_currentConfig.listFormat = parseListFormat(L"{subject}{ago@90}");
     {
