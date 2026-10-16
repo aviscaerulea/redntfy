@@ -6390,7 +6390,8 @@ static void setClipboardText(HWND owner, const std::wstring& text, const std::st
 // ダイアログとの受け渡し（WM_INITDIALOG の lParam で渡し、[終了] でコメントを書き戻す）
 struct CloseIssueDialogData {
     int          issueId;
-    std::wstring notes;  // [終了] 時のコメント欄の内容（未 trim）
+    std::wstring notes;              // [終了] 時のコメント欄の内容（未 trim）
+    bool         notesEmpty = true;  // 直前の EN_CHANGE 時点でコメント欄が空だったか（案内文の出し入れの判定用）
 };
 
 // コメント欄の未入力時の案内文（件名欄のキューバナーと同じく、空の間だけ灰色で表示する）
@@ -6400,17 +6401,29 @@ static constexpr UINT_PTR CUE_BANNER_SUBCLASS_ID = 1;  // 複数行 Edit の案�
 // 複数行 Edit の案内文表示（SetWindowSubclass。dwRefData は表示する文字列 const wchar_t*）
 // EM_SETCUEBANNER は ES_MULTILINE に効かないため、既定の描画の後に、空のときだけ書式矩形へ灰色で描く。
 // フォーカス中も表示する。（件名欄の EM_SETCUEBANNER の TRUE 指定と揃える）
-// 入力で空でなくなったときの消去は、既定の描画が変更箇所しか塗り直さないため、
+// 空⇔非空の切り替わりでの出し入れは、既定の描画が変更箇所しか塗り直さないため、
 // 親が EN_CHANGE で全体を無効化して行う。（closeIssueDlgProc）
+// 重ね描きは既定の描画が塗り直した範囲（更新領域）に限る。（塗り直していない範囲へ透過で重ねると、
+// 一部だけの再描画のたびに文字が濃く太って見えるため）
 // 描画中はキャレットを隠す。（XOR 描画のキャレットに重ね描きすると、点滅で欠けが残るため）
 static LRESULT CALLBACK cueBannerSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam,
                                               UINT_PTR, DWORD_PTR refData) {
     if (msg == WM_PAINT) {
-        LRESULT r = DefSubclassProc(hWnd, msg, wParam, lParam);
+        // 更新領域は既定の描画（BeginPaint）が空にするため、その前に写し取る
+        HRGN rgn = nullptr;
         if (GetWindowTextLengthW(hWnd) == 0) {
+            rgn = CreateRectRgn(0, 0, 0, 0);
+            if (rgn && GetUpdateRgn(hWnd, rgn, FALSE) <= NULLREGION) {
+                DeleteObject(rgn);
+                rgn = nullptr;
+            }
+        }
+        LRESULT r = DefSubclassProc(hWnd, msg, wParam, lParam);
+        if (rgn) {
             if (HDC dc = GetDC(hWnd)) {
                 RECT rc;
                 SendMessageW(hWnd, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&rc));
+                SelectClipRgn(dc, rgn);
                 HFONT old = static_cast<HFONT>(SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(hWnd, WM_GETFONT, 0, 0))));
                 SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
                 SetBkMode(dc, TRANSPARENT);
@@ -6420,6 +6433,7 @@ static LRESULT CALLBACK cueBannerSubclassProc(HWND hWnd, UINT msg, WPARAM wParam
                 SelectObject(dc, old);
                 ReleaseDC(hWnd, dc);
             }
+            DeleteObject(rgn);
         }
         return r;
     }
@@ -6449,8 +6463,15 @@ static INT_PTR CALLBACK closeIssueDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LP
     if (msg == WM_COMMAND) {
         const UINT id = LOWORD(wParam);
         if (id == IDC_CLOSE_NOTES && HIWORD(wParam) == EN_CHANGE) {
-            // 空⇔非空の切り替わりで案内文を出し入れするため全体を描き直す
-            InvalidateRect(reinterpret_cast<HWND>(lParam), nullptr, TRUE);
+            // 空⇔非空が切り替わったときだけ、案内文を出し入れするため全体を描き直す
+            // （毎回の全体消去は入力のたびにちらつくため）
+            auto* data = reinterpret_cast<CloseIssueDialogData*>(GetWindowLongPtrW(hDlg, DWLP_USER));
+            HWND edit = reinterpret_cast<HWND>(lParam);
+            const bool empty = (GetWindowTextLengthW(edit) == 0);
+            if (data && empty != data->notesEmpty) {
+                data->notesEmpty = empty;
+                InvalidateRect(edit, nullptr, TRUE);
+            }
             return TRUE;
         }
         if (id == IDOK) {
