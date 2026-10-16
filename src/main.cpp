@@ -4163,8 +4163,9 @@ static constexpr wchar_t NEW_MARK[] = L"✨ ";
 //   識別子的な要素（プロジェクト名・姓・名など）は横幅を優先して付けない。
 //   空に展開された要素（期限なし・更新者不明など）は、直後のリテラル先頭空白を
 //   出力末尾が空白または行頭なら取り除いて詰める。（従来の「詰めて省く」を再現）
-//   空に展開された要素を括弧対（[] ［］ () （） 【】 「」）が直接囲んでいれば、括弧ごと取り除く。
-//   （登録先プロジェクトや旧形式ピンで {project} が空のとき、既定書式の "[]" を残さないため）
+//   空に展開された要素をリテラルの括弧対（[] ［］ () （） 【】 「」）が直接囲んでいれば、括弧ごと取り除く。
+//   （登録先プロジェクトや旧形式ピンで {project} が空のとき、既定書式の "[]" を残さないため。
+//   直前の要素の値が開き括弧で終わる場合は値の一部として残し、後続リテラルの閉じ括弧も削らない）
 //   空に展開された要素の直前がリテラル末尾の "/"・"／" なら区切りごと取り除く。（コメントなしの {commenter}。
 //   直前の要素の値が "/" で終わる場合は値の一部として残す）
 //   {group}＝"👥 "・{new}＝"✨ "・{bug}＝"💥 "・{ago}＝"（3 日前）"・{left}＝"（2 日遅れ）" は
@@ -4188,6 +4189,11 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
     // 直前にリテラルを足した時点の text の長さ（npos = 末尾はリテラルでない）。
     // 空要素の前の区切り除去をリテラルの末尾に限るための判定に使う。
     size_t literalEnd = std::wstring::npos;
+    // 直前に要素の値を足した時点の text の長さ（これより後ろはすべてリテラル。0 = 値をまだ足していない）。
+    // 空要素の直前の開き括弧の判定をリテラルに限るための判定に使う。（値の末尾の括弧は値の一部）
+    // literalEnd の一致で判定しないのは、区切り "/" の除去で 1 文字短くなった後（"(/" → "("）も
+    // リテラルの開き括弧を対の候補にするため。
+    size_t literalBegin = 0;
     for (const auto& tk : g_currentConfig.listFormat) {
         if (tk.element == FMT_LITERAL) {
             std::wstring lit = tk.literal;
@@ -4234,10 +4240,12 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
             if (r.text.size() == literalEnd && (r.text.back() == L'/' || r.text.back() == L'／'))
                 r.text.pop_back();
             // 連続する空要素では最初の要素の判定を保つ。（"[{a}{b}]" の両方が空なら括弧ごと消す）
+            // 対の候補にする開き括弧はリテラルのものだけ。直前の要素の値が開き括弧で終わるとき
+            // （"Alpha[" に切り詰めたプロジェクト名など）に、値の末尾と後続の閉じ括弧を削らないため。
             if (!prevEmpty) {
                 pendingClose = 0;
                 for (const auto& [open, close] : BRACKETS) {
-                    if (!r.text.empty() && r.text.back() == open) pendingClose = close;
+                    if (r.text.size() > literalBegin && r.text.back() == open) pendingClose = close;
                 }
             }
             prevEmpty = true;
@@ -4276,6 +4284,7 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
         if (range.len > 0 && (range.bold || !range.keepColor || range.sizePct != 100))
             r.ranges.push_back(range);
         r.text += val;
+        literalBegin = r.text.size();
         prevEmpty = false;
     }
     while (!r.text.empty() && r.text.back() == L' ') r.text.pop_back();

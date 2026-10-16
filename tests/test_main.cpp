@@ -226,6 +226,26 @@ static void testBuildIssueLabel() {
         if (lbl.ranges.size() == 1) CHECK(lbl.ranges[0].len == lbl.text.size());
     }
 
+    // 要素の値が開き括弧で終わり直後の要素が空：括弧対の除去はリテラルの開き括弧にだけ効き、値の末尾と閉じ括弧は残る
+    g_currentConfig.listFormat = parseListFormat(L"[{project:6}{due}]");
+    {
+        auto row = makeRow();
+        row.projectName = "Alpha[旧]";  // :6 で "Alpha[" に切り詰める
+        row.dueDate.clear();
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"[Alpha[]");
+    }
+
+    // 区切り "/" の除去で短くなった後も、リテラルの開き括弧なら括弧対ごと消える
+    g_currentConfig.listFormat = parseListFormat(L"({author}/{commenter})");
+    {
+        auto row = makeRow();
+        row.author.clear();
+        row.commenter.clear();
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"");
+    }
+
     // 既定から外した経過日数 {ago} も、書式に書けば表示する
     g_currentConfig.listFormat = parseListFormat(L"{subject}{ago@90}");
     {
