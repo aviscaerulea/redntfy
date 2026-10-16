@@ -179,7 +179,7 @@ static void testBuildIssueLabel() {
         ListRow row;
         row.id              = 12345;
         row.subject         = "テスト件名";
-        row.projectName     = "ロケモニプロジェクト";
+        row.projectName     = "サンプルプロジェクト";
         row.updater         = "山田";
         row.updaterFirst    = "太郎";
         row.author          = "山田";
@@ -196,11 +196,11 @@ static void testBuildIssueLabel() {
     {
         auto row = makeRow();
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田/佐藤  👥 [ロケモニプ] 7/28 💥 テスト件名（6 日遅れ）");
+        CHECK_WSTR(lbl.text, L"#12345  山田/佐藤  👥 [サンプルプ] 7/28 💥 テスト件名（6 日遅れ）");
         // コメントなし：区切りの "/" ごと消える
         row.commenter.clear();
         lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 💥 テスト件名（6 日遅れ）");
+        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [サンプルプ] 7/28 💥 テスト件名（6 日遅れ）");
     }
 
     // 既定から外した経過日数 {ago} も、書式に書けば表示する
@@ -242,13 +242,13 @@ static void testBuildIssueLabel() {
     {
         auto row = makeRow();
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 💥 テスト件名（6 日遅れ）");
+        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [サンプルプ] 7/28 💥 テスト件名（6 日遅れ）");
         // ranges は期日（半太字・"!" で期限切れ赤）、💥（赤、末尾空白を含まない）、
         // 件名（"!" で期限切れは半太字の赤）、{left}（"!" で期限切れは半太字の赤、90% 縮小）の
         // 4 件で昇順
         CHECK(lbl.ranges.size() == 4);
         if (lbl.ranges.size() == 4) {
-            CHECK(lbl.ranges[0].offset == 23);  // "#12345  山田  👥 [ロケモニプ] " の直後
+            CHECK(lbl.ranges[0].offset == 23);  // "#12345  山田  👥 [サンプルプ] " の直後
             CHECK(lbl.ranges[0].len == 4);      // "7/28"
             CHECK(lbl.ranges[0].bold);
             CHECK(!lbl.ranges[0].keepColor);    // 期限切れ（7/28 ≦ 8/3）は赤
@@ -280,7 +280,7 @@ static void testBuildIssueLabel() {
         auto row = makeRow();
         row.isNew = true;
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 7/28 ✨ 💥 テスト件名（6 日遅れ）");
+        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [サンプルプ] 7/28 ✨ 💥 テスト件名（6 日遅れ）");
         CHECK(lbl.ranges.size() == 5);
         if (lbl.ranges.size() == 5) {
             CHECK(lbl.ranges[0].offset == 23);  // 期日は ✨ より前のため不変
@@ -297,7 +297,7 @@ static void testBuildIssueLabel() {
         auto row = makeRow();
         row.dueDate.clear();
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 💥 テスト件名");
+        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [サンプルプ] 💥 テスト件名");
         CHECK(lbl.ranges.size() == 1);  // 💥 のみ。期限切れでないため件名は赤にならない
     }
 
@@ -306,7 +306,7 @@ static void testBuildIssueLabel() {
         auto row = makeRow();
         row.updater.clear();
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  👥 [ロケモニプ] 7/28 💥 テスト件名（6 日遅れ）");
+        CHECK_WSTR(lbl.text, L"#12345  👥 [サンプルプ] 7/28 💥 テスト件名（6 日遅れ）");
     }
 
     // 期日が未来：半太字のまま色は据え置き（keepColor）
@@ -314,7 +314,7 @@ static void testBuildIssueLabel() {
         auto row = makeRow();
         row.dueDate = "2026-08-04";
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [ロケモニプ] 8/4 💥 テスト件名（1 日前）");
+        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [サンプルプ] 8/4 💥 テスト件名（1 日前）");
         // {left} は期限切れでないため色とウェイトを据え置き、縮小だけの範囲を持つ
         CHECK(lbl.ranges.size() == 3);
         if (lbl.ranges.size() == 3) {
