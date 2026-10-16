@@ -1245,7 +1245,7 @@ static PollState loadState(const std::wstring& dir) {
     using namespace winrt::Windows::Data::Json;
     PollState st;
     // state.json は追跡集合の件数に比例して育つため、書き込み側と非対称にならないよう
-    // 上限を 16MB（v2 は 1 件約 110 バイトで約 14 万件相当）まで広げる
+    // 上限を 16MB（v2 は 1 件約 160 バイトで約 10 万件相当）まで広げる
     auto buf = readJsonFile(dir + L"\\" + STATE_FILENAME, "state", 16u * 1024 * 1024);
     if (!buf) return st;
     try {
