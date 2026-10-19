@@ -249,6 +249,16 @@ static void testBuildIssueLabel() {
         CHECK_WSTR(lbl.text, L"");
     }
 
+    // 入れ子の括弧対：内側を取り除いて外側が空を囲む形になれば、外側も取り除く
+    for (const wchar_t* fmt : { L"[({author})]", L"[({author}){commenter}]" }) {
+        g_currentConfig.listFormat = parseListFormat(fmt);
+        auto row = makeRow();
+        row.author.clear();
+        row.commenter.clear();
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"");
+    }
+
     // 既定から外した経過日数 {ago} も、書式に書けば表示する
     g_currentConfig.listFormat = parseListFormat(L"{subject}{ago@90}");
     {

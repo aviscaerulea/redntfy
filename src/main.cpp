@@ -4166,6 +4166,8 @@ static constexpr wchar_t NEW_MARK[] = L"✨ ";
 //   空に展開された要素をリテラルの括弧対（[] ［］ () （） 【】 「」）が直接囲んでいれば、括弧ごと取り除く。
 //   （登録先プロジェクトや旧形式ピンで {project} が空のとき、既定書式の "[]" を残さないため。
 //   直前の要素の値が開き括弧で終わる場合は値の一部として残し、後続リテラルの閉じ括弧も削らない）
+//   入れ子の括弧対は内側から何重でも続けて取り除く。（外側のリテラルの括弧対が空要素だけを直接囲む形になれば
+//   同じ規則で取り除く。"[({a})]"・"[({a}){b}]"）
 //   空に展開された要素の直前がリテラル末尾の "/"・"／" なら区切りごと取り除く。（コメントなしの {commenter}。
 //   直前の要素の値が "/" で終わる場合は値の一部として残す）
 //   {group}＝"👥 "・{new}＝"✨ "・{bug}＝"💥 "・{ago}＝"（3 日前）"・{left}＝"（2 日遅れ）" は
@@ -4194,14 +4196,29 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
     // literalEnd の一致で判定しないのは、区切り "/" の除去で 1 文字短くなった後（"(/" → "("）も
     // リテラルの開き括弧を対の候補にするため。
     size_t literalBegin = 0;
+    // 末尾がリテラルの開き括弧なら対の閉じ括弧を返す（0 = 該当なし）
+    auto literalOpenClose = [&]() -> wchar_t {
+        if (r.text.size() <= literalBegin) return 0;
+        for (const auto& [open, close] : BRACKETS) {
+            if (r.text.back() == open) return close;
+        }
+        return 0;
+    };
     for (const auto& tk : g_currentConfig.listFormat) {
         if (tk.element == FMT_LITERAL) {
             std::wstring lit = tk.literal;
             if (prevEmpty && pendingClose && !lit.empty() && lit[0] == pendingClose) {
-                r.text.pop_back();  // 開き括弧
-                lit.erase(0, 1);    // 閉じ括弧
+                // 外側もリテラルの括弧対なら続けて取り除く。（"[({a})]" の a が空なら全体が消える）
+                do {
+                    r.text.pop_back();  // 開き括弧
+                    lit.erase(0, 1);    // 閉じ括弧
+                } while (!lit.empty() && literalOpenClose() == lit[0]);
+                // リテラルを使い切ったら、外側の開き括弧が次の空要素を囲む候補になる。（"[({a}){b}]"）
+                pendingClose = lit.empty() ? literalOpenClose() : 0;
             }
-            pendingClose = 0;
+            else {
+                pendingClose = 0;
+            }
             if (prevEmpty && (r.text.empty() || r.text.back() == L' ')) {
                 size_t i = 0;
                 while (i < lit.size() && lit[i] == L' ') ++i;
@@ -4242,12 +4259,7 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
             // 連続する空要素では最初の要素の判定を保つ。（"[{a}{b}]" の両方が空なら括弧ごと消す）
             // 対の候補にする開き括弧はリテラルのものだけ。直前の要素の値が開き括弧で終わるとき
             // （"Alpha[" に切り詰めたプロジェクト名など）に、値の末尾と後続の閉じ括弧を削らないため。
-            if (!prevEmpty) {
-                pendingClose = 0;
-                for (const auto& [open, close] : BRACKETS) {
-                    if (r.text.size() > literalBegin && r.text.back() == open) pendingClose = close;
-                }
-            }
+            if (!prevEmpty) pendingClose = literalOpenClose();
             prevEmpty = true;
             continue;
         }
