@@ -227,13 +227,16 @@ static void testBuildIssueLabel() {
     }
 
     // 要素の値が開き括弧で終わり直後の要素が空：括弧対の除去はリテラルの開き括弧にだけ効き、値の末尾と閉じ括弧は残る
-    g_currentConfig.listFormat = parseListFormat(L"[{project:6}{due}]");
+    // "@90" の範囲は値と同じ長さを保つ
+    g_currentConfig.listFormat = parseListFormat(L"[{project:6@90}{due}]");
     {
         auto row = makeRow();
         row.projectName = "Alpha[旧]";  // :6 で "Alpha[" に切り詰める
         row.dueDate.clear();
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
         CHECK_WSTR(lbl.text, L"[Alpha[]");
+        CHECK(lbl.ranges.size() == 1);
+        if (lbl.ranges.size() == 1) CHECK(lbl.ranges[0].offset == 1 && lbl.ranges[0].len == 6);
     }
 
     // 区切り "/" の除去で短くなった後も、リテラルの開き括弧なら括弧対ごと消える
