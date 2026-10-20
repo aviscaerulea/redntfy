@@ -4725,6 +4725,8 @@ static std::wstring getCurrentLogTarget() {
 // 行クリック時点では一覧ポップアップがまだ可視で、g_popupShowing 中の直接呼びは
 // updateTrayTooltip に捨てられる。PostMessage でキューに積んでおけば、
 // この後の hideListPopup（フラグ解除）を経てから必ず反映される。
+// Ctrl+クリックで一覧を開いたままにした場合は積んだ分も updateTrayTooltip が捨てるため、
+// 一覧を閉じたときの hideListPopup がバッジへ反映する。
 // ✨ は起票日時だけで決まるため、既読化では外れない。
 static void markIssueRead(int issueId) {
     bool wasUnread;
@@ -5544,7 +5546,7 @@ static void startIssueUpdate(int issueId, const std::string& body, int expectSta
 // 開く：ホバー（OS の NIN_POPUPOPEN 通知から hover_delay_ms 後）または
 // アイコン左クリック（NIN_SELECT、即時）。
 // 閉じる：アイコンとポップアップ両方からの離脱（IDT_LIST_WATCH が監視。入力モード中は除く）・
-// アイコン左クリックのトグル・行クリックでチケットを開いたとき・入力モード中の Esc と Alt+F4。
+// アイコン左クリックのトグル・行クリックでチケットを開いたとき（Ctrl 押下中を除く）・入力モード中の Esc と Alt+F4。
 // 起点によらず同一ルール。
 // 唯一の例外として、ホバー自動表示から hover_click_guard_ms 以内のアイコン左クリックは
 // 無視する。（詳細は handleTrayLeftClick を参照）
@@ -5646,6 +5648,22 @@ static RECT listRowRect(HWND hWnd, const ListRowLayout& row) {
     return rc;
 }
 
+// 一覧の 1 行の再描画
+// g_issueItems の添字 itemIndex に対応する行だけを再描画する。（一覧に無ければ何もしない）
+// erase は FALSE：行描画が背景ごと塗るため消去は不要で、TRUE だと全面消去→再描画の
+// 白フラッシュ（チラつき）が見える。
+static void redrawIssueRow(size_t itemIndex) {
+    if (!g_listWnd) return;
+    for (const auto& row : g_listLayout) {
+        if (row.kind == ListRowKind::Issue && row.index == itemIndex) {
+            RECT rc = listRowRect(g_listWnd, row);
+            InvalidateRect(g_listWnd, &rc, FALSE);
+            UpdateWindow(g_listWnd);
+            return;
+        }
+    }
+}
+
 // フッタ・0 件行の描画（単色テキスト行。クリック可能なためホット時はハイライトする）
 static void drawTextRow(HDC hdc, const RECT& rc, const wchar_t* text, bool hot) {
     FillRect(hdc, &rc, reinterpret_cast<HBRUSH>(
@@ -5715,6 +5733,7 @@ static void paintListWindow(HWND hWnd) {
 // 説明欄では Enter は改行で、Ctrl+Enter が IDOK になる。（regDescSubclassProc）
 // WM_CLOSE（入力モード中の Alt+F4）は破棄ではなく非表示で閉じる。（g_listWnd は使い回すため）
 // 行の左クリック＝チケットを開いて既読化して閉じる。フッタ・0 件行＝クエリ画面を開いて閉じる。
+// Ctrl+左クリックはどちらも閉じずに開く。（既読化した行はその場で再描画する）
 // 行の右クリック＝行メニュー（showRowContextMenu）を開き、一覧は開いたまま。
 // 離脱による自動クローズはトレイ側の IDT_LIST_WATCH が担い、ここでは扱わない。
 static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -5803,6 +5822,8 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     if (msg == WM_LBUTTONUP) {
         int hit = listRowHitTest(static_cast<short>(HIWORD(lParam)));
         if (hit < 0) return 0;
+        // Ctrl 押下中のクリックは一覧を閉じない。（複数のチケットを続けて開くため。フッタ・0 件行も同じ）
+        const bool keepOpen = (wParam & MK_CONTROL) != 0;
         const auto& row = g_listLayout[hit];
         if (row.kind == ListRowKind::Issue && row.index < g_issueItems.size()) {
             // 参照はメッセージポンプ越しに持ち越さない。ShellExecuteW と markIssueRead は
@@ -5815,14 +5836,24 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                 ShellExecuteW(nullptr, L"open", url.c_str(),
                               nullptr, nullptr, SW_SHOWNORMAL);
                 markIssueRead(id);
+                // 開いたままの一覧では当該行の未読表示をその場で外す。（ポンプ越しに
+                // g_issueItems が差し替わり得るため、添字でなく id で探し直す）
+                if (keepOpen) {
+                    for (size_t i = 0; i < g_issueItems.size(); ++i) {
+                        if (g_issueItems[i].id != id) continue;
+                        g_issueItems[i].unread = false;
+                        redrawIssueRow(i);
+                        break;
+                    }
+                }
             }
         }
         else {
             // フッタ・0 件行はクエリ画面を開く（既存の IDM_OPEN_QUERY 処理を共用）
             handleTrayCommand(IDM_OPEN_QUERY);
         }
-        // チケットを開いたら一覧は役目を終える
-        if (g_hWnd) hideListPopup(g_hWnd);
+        // チケットを開いたら一覧を閉じる。（Ctrl 押下中は続けて開けるよう残す）
+        if (!keepOpen && g_hWnd) hideListPopup(g_hWnd);
         return 0;
     }
     if (msg == WM_RBUTTONUP) {
@@ -6325,18 +6356,7 @@ static void setIssueState(int issueId, IssueRowState target) {
     item.hidden = nowHidden;
     item.unread = nowUnread;
 
-    // 当該行だけを再描画する。（erase は FALSE：行描画が背景ごと塗るため消去は不要で、
-    // TRUE だと全面消去→再描画の白フラッシュ（チラつき）が見える）
-    if (g_listWnd) {
-        for (const auto& row : g_listLayout) {
-            if (row.kind == ListRowKind::Issue && row.index == itemIndex) {
-                RECT rc = listRowRect(g_listWnd, row);
-                InvalidateRect(g_listWnd, &rc, FALSE);
-                UpdateWindow(g_listWnd);
-                break;
-            }
-        }
-    }
+    redrawIssueRow(itemIndex);
     // 遷移で必ずどちらかの集合が変わるが、片側だけの変化を追う分岐より両方の保存の方が単純で、
     // 書き出しはどちらも小さい。（tmp 経由の atomicWriteJson で破損もしない）
     savePins(g_dataDir);
