@@ -2297,6 +2297,22 @@ static bool isRecentlyCreated(const std::string& createdOn, long long nowEpoch, 
     return nowEpoch - created < static_cast<long long>(hours) * 3600;
 }
 
+// 一覧の行背景で強調する優先度の段階
+enum class PriorityHighlight { None, Second, Top };
+
+// 優先度 id の強調段階を返す
+// priorities は有効な優先度の順位昇順（g_priorities と同じ並び）で、末尾が Top（標準構成の「今すぐ」）、
+// 末尾から 2 番目が Second（標準構成の「急いで」）。名前で探さないのは表記の違うサーバでも効かせるためだ。
+// （優先度順（期日考慮）の繰り上げ先と同じ位置規則）
+// 有効な優先度が 1 つだけなら Top のみ、空（未取得）なら常に None。id 0（不明）と無効化済みの優先度も None。
+static PriorityHighlight priorityHighlightOf(int priorityId, const std::vector<PriorityEntry>& priorities) {
+    if (priorityId == 0 || priorities.empty()) return PriorityHighlight::None;
+    if (priorityId == priorities.back().id) return PriorityHighlight::Top;
+    if (priorities.size() >= 2 && priorityId == priorities[priorities.size() - 2].id)
+        return PriorityHighlight::Second;
+    return PriorityHighlight::None;
+}
+
 // 最終 journal がチケットの updated_on を作った更新かを判定する
 // Redmine は issue を保存してから journal を保存するため同じ操作でも数秒ずれ得る。
 // 差が JOURNAL_MATCH_TOLERANCE_SEC を超える場合は、journal を作らない更新（子チケットの
@@ -3631,6 +3647,7 @@ struct ListRow {
     std::string updatedOn;
     std::string createdOn;            // created_on（作成日順の並べ替え用。未取得は空で末尾側へ。✨ は isNew で判定済み）
     int         priorityRank = 0;     // 優先度の順位（大きいほど高優先。順位表に無ければ priority id）
+    PriorityHighlight priorityHighlight = PriorityHighlight::None;  // 行背景の強調段階（実際の優先度で決め、期日の繰り上げは反映しない）
     bool        assignedToGroup = false;
     bool        isBugTracker    = false;
     bool        pinned          = false;
@@ -3667,12 +3684,14 @@ struct ListRow {
 // tooltip の未読件数も本関数の結果から数える。表示と同じ選定を通すことで「未読 N 件」と
 // 画面上の未読行数を一致させる。（一覧に出ない未読は数に出さず、バッジも点けない）
 // 非表示チケットの unread・isNew は常に false にする。（太字にも未読件数にも ✨ にも出さない）
+// 行背景の強調段階（priorityHighlight）は実際の優先度だけで決め、優先度順（期日考慮）の繰り上げは反映しない。
 static std::vector<ListRow> buildListRows(int& visible) {
     std::vector<Issue>      issues;
     std::vector<PinEntry>   pins;
     std::unordered_set<int> unread;
     std::unordered_set<int> hiddenIds;
     std::unordered_map<int, int> priorityPositions;
+    std::vector<PriorityEntry> priorities;
     std::string personalProject;
     int urgentRank = 0;  // 優先度順（期日考慮）の繰り上げ先の順位（0 = 未取得で繰り上げない）
     {
@@ -3682,6 +3701,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
         unread    = g_unreadIds;
         hiddenIds = g_hiddenIds;
         priorityPositions = g_priorityPositions;
+        priorities        = g_priorities;
         personalProject   = g_personalProjectName;
         // g_priorities は順位昇順のため、末尾の 1 つ手前が「最上位の 1 つ下」
         if (!g_priorities.empty())
@@ -3734,6 +3754,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
                         .dueDate = is.dueDate,
                         .updatedOn = is.updatedOn, .createdOn = is.createdOn,
                         .priorityRank = rankOf(is.priorityId),
+                        .priorityHighlight = priorityHighlightOf(is.priorityId, priorities),
                         .assignedToGroup = is.assignedToGroup,
                         .isBugTracker = is.isBugTracker,
                         .pinned = pinned, .hidden = hidden, .closed = is.closed,
@@ -3749,6 +3770,7 @@ static std::vector<ListRow> buildListRows(int& visible) {
                         .dueDate = p.dueDate,
                         .updatedOn = p.updatedOn, .createdOn = p.createdOn,
                         .priorityRank = rankOf(p.priorityId),
+                        .priorityHighlight = priorityHighlightOf(p.priorityId, priorities),
                         .assignedToGroup = p.assignedToGroup,
                         .isBugTracker = p.isBugTracker,
                         .pinned = true, .closed = p.closed,
@@ -3951,6 +3973,12 @@ static constexpr COLORREF ALERT_TEXT_COLOR = RGB(220, 0, 0);
 // 新規マーカー（✨）の文字色（金色。既定の黒では絵文字として目に留まらないため）
 static constexpr COLORREF NEW_MARK_COLOR = RGB(0xD4, 0x9A, 0x00);
 
+// 高優先度行の背景に混ぜる色と混色率（%）。COLOR_MENU に混ぜて作り、テーマの背景明度に追随させる。
+// 「今すぐ」（Top）を濃く、「急いで」（Second）を淡くして 2 段階を見分けられるようにする
+static constexpr COLORREF PRIORITY_ROW_TINT        = RGB(255, 0, 0);
+static constexpr int      PRIORITY_ROW_TINT_TOP    = 25;
+static constexpr int      PRIORITY_ROW_TINT_SECOND = 12;
+
 // ラベル内で文字色、ウェイト、サイズを変える範囲（オフセットと長さは UTF-16 コードユニット単位）
 // bold と keepColor を組み合わせて「色は据え置き、ウェイトだけ変える」ような部分強調にも使える。
 struct ColorRange {
@@ -3974,6 +4002,7 @@ struct IssueItem {
     bool         pinned = false; // ピン留め中（マーカー列の描画条件。行メニューでの遷移時にもその場で更新する）
     bool         hidden = false; // 非表示（グレー＋取消線描画の条件。行メニューでの遷移時にもその場で更新する）
     bool         closed = false; // クローズ済（打ち消し線の描画条件）
+    PriorityHighlight priorityHighlight = PriorityHighlight::None;  // 行背景の強調段階（非表示・クローズ済み・hot の行では描画側が無視する）
 };
 static std::vector<IssueItem> g_issueItems;
 
@@ -4948,6 +4977,24 @@ static bool issueRowBold(const IssueItem& item) {
     return item.unread || (item.hasDue && !item.hidden);
 }
 
+// 一覧行の背景色
+// hot はハイライト色を優先する。非表示行とクローズ済み行は対応不要の行のため強調しない。
+static COLORREF issueRowBackground(const IssueItem& item, bool hot) {
+    if (hot) return GetSysColor(COLOR_HIGHLIGHT);
+    const COLORREF menu = GetSysColor(COLOR_MENU);
+    if (item.hidden || item.closed) return menu;
+    int pct = 0;
+    switch (item.priorityHighlight) {
+        case PriorityHighlight::Top:    pct = PRIORITY_ROW_TINT_TOP;    break;
+        case PriorityHighlight::Second: pct = PRIORITY_ROW_TINT_SECOND; break;
+        case PriorityHighlight::None:   return menu;
+    }
+    auto mix = [pct](int base, int tint) { return (base * (100 - pct) + tint * pct) / 100; };
+    return RGB(mix(GetRValue(menu), GetRValue(PRIORITY_ROW_TINT)),
+               mix(GetGValue(menu), GetGValue(PRIORITY_ROW_TINT)),
+               mix(GetBValue(menu), GetBValue(PRIORITY_ROW_TINT)));
+}
+
 // 一覧行のラベルに使うフォントの組を返す
 // 太字行は行全体が太字のため、部分強調にはそれ以上のウェイトが無い。太字のまま据え置く。
 static void issueLabelFonts(bool bold, HFONT& baseFont, HFONT& emphFont) {
@@ -4990,7 +5037,7 @@ static SIZE measureIssueRow(HDC hdc, const IssueItem& item) {
 }
 
 // 一覧行の描画
-// hot（カーソルが乗っている行）に応じた背景色・テキスト色を切り替え、closed または hidden
+// 背景色は issueRowBackground（hot・高優先度の強調）で決め、テキスト色は hot に応じて切り替える。closed または hidden
 // フラグが立つ項目には DrawTextW 後に 2 px の取消線を手動で重ね描画する。
 // （非表示はグレー一色だけでは通常行との差が分かりにくいため、取消線で「除外済」を示す）
 // IssueLabel::ranges に色付け範囲がある行は、範囲ごとに文字色を変えて分割描画する。
@@ -4998,9 +5045,10 @@ static SIZE measureIssueRow(HDC hdc, const IssueItem& item) {
 // （期日超過などの範囲色より優先する）ホット時はハイライト背景に GRAYTEXT が沈んで
 // 読めないため、GRAYTEXT と HIGHLIGHTTEXT の中間色へ明度を上げる。（非活性感は保つ）
 static void drawIssueRow(HDC hdc, const RECT& rcItem, const IssueItem& item, bool hot) {
-    FillRect(hdc, &rcItem,
-        reinterpret_cast<HBRUSH>(
-            static_cast<INT_PTR>(hot ? COLOR_HIGHLIGHT + 1 : COLOR_MENU + 1)));
+    const COLORREF bgColor = issueRowBackground(item, hot);
+    HBRUSH hBgBrush = CreateSolidBrush(bgColor);
+    FillRect(hdc, &rcItem, hBgBrush);
+    DeleteObject(hBgBrush);
 
     RECT textRect  = rcItem;
     textRect.left += 4;  // 左パディング（measureIssueRow の確保幅と揃える）
@@ -5030,7 +5078,6 @@ static void drawIssueRow(HDC hdc, const RECT& rcItem, const IssueItem& item, boo
         // 行幅・インデント・取消線の座標計算（measureIssueRow と共有）を変えない。
         RECT markRect  = textRect;
         markRect.right = markRect.left + markSz.cx;
-        COLORREF bgColor = GetSysColor(hot ? COLOR_HIGHLIGHT : COLOR_MENU);
         if (!drawPinMarkColor(hdc, markRect, bgColor, textColor)) {
             // D2D が使えない環境では従来どおり GDI で単色の 📌 を描く
             DrawTextW(hdc, PIN_MARK, -1, &textRect,
@@ -6008,6 +6055,7 @@ static void showListPopup(HWND trayWnd, bool refresh) {
         it.pinned = row.pinned;
         it.hidden = row.hidden;
         it.closed = row.closed;
+        it.priorityHighlight = row.priorityHighlight;
         return it;
     };
 

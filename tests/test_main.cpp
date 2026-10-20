@@ -1076,6 +1076,19 @@ static void testIsRecentlyCreated() {
     CHECK(!isRecentlyCreated("", now, 24));
 }
 
+static void testPriorityHighlightOf() {
+    std::vector<PriorityEntry> ps;
+    for (int i = 1; i <= 5; ++i) ps.push_back({.id = i, .name = "p" + std::to_string(i), .position = i});
+    CHECK(priorityHighlightOf(5, ps) == PriorityHighlight::Top);
+    CHECK(priorityHighlightOf(4, ps) == PriorityHighlight::Second);
+    CHECK(priorityHighlightOf(3, ps) == PriorityHighlight::None);
+    CHECK(priorityHighlightOf(0, ps) == PriorityHighlight::None);
+    CHECK(priorityHighlightOf(99, ps) == PriorityHighlight::None);
+    CHECK(priorityHighlightOf(5, {}) == PriorityHighlight::None);
+    std::vector<PriorityEntry> one = {{.id = 7, .name = "only", .position = 1}};
+    CHECK(priorityHighlightOf(7, one) == PriorityHighlight::Top);
+}
+
 // schedule の回数を 60 の約数へ丸める
 static void testRoundToDivisorOf60() {
     CHECK(roundToDivisorOf60(0) == 0);    // 休止はそのまま
@@ -1228,6 +1241,7 @@ int main() {
     testRoundToDivisorOf60();
     testJournalMatchesUpdate();
     testIsRecentlyCreated();
+    testPriorityHighlightOf();
     testAlignTowardCenter();
     testRegisterSubject();
     testBuildIssueCreateBody();
