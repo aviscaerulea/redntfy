@@ -61,12 +61,12 @@ static void testParseListFormat() {
     // 既定テンプレートの全トークン（並び・要素・最大文字数）
     {
         auto t = parseListFormat(LIST_FORMAT_DEFAULT);
-        CHECK(t.size() == 17);
-        if (t.size() == 17) {
+        CHECK(t.size() == 16);
+        if (t.size() == 16) {
             CHECK(t[0].element == FMT_LITERAL);   CHECK_WSTR(t[0].literal, L"#");
             CHECK(t[1].element == FMT_ID);        CHECK(t[1].maxChars == 0);  CHECK(!t[1].alert);
             CHECK(t[1].sizePct == 100);
-            CHECK(t[2].element == FMT_LITERAL);   CHECK_WSTR(t[2].literal, L"  ");
+            CHECK(t[2].element == FMT_NEW);
             CHECK(t[3].element == FMT_AUTHOR);
             CHECK(t[4].element == FMT_LITERAL);   CHECK_WSTR(t[4].literal, L"/");
             CHECK(t[5].element == FMT_COMMENTER);
@@ -77,11 +77,10 @@ static void testParseListFormat() {
             CHECK(t[10].element == FMT_LITERAL);  CHECK_WSTR(t[10].literal, L"] ");
             CHECK(t[11].element == FMT_DUE);      CHECK(t[11].alert);
             CHECK(t[12].element == FMT_LITERAL);  CHECK_WSTR(t[12].literal, L" ");
-            CHECK(t[13].element == FMT_NEW);
-            CHECK(t[14].element == FMT_BUG);
-            CHECK(t[15].element == FMT_SUBJECT);  CHECK(t[15].maxChars == 40);  CHECK(t[15].alert);
-            CHECK(t[16].element == FMT_LEFT);     CHECK(t[16].maxChars == 0);   CHECK(t[16].alert);
-            CHECK(t[16].sizePct == 90);
+            CHECK(t[13].element == FMT_BUG);
+            CHECK(t[14].element == FMT_SUBJECT);  CHECK(t[14].maxChars == 40);  CHECK(t[14].alert);
+            CHECK(t[15].element == FMT_LEFT);     CHECK(t[15].maxChars == 0);   CHECK(t[15].alert);
+            CHECK(t[15].sizePct == 90);
         }
     }
 
@@ -198,11 +197,11 @@ static void testBuildIssueLabel() {
     {
         auto row = makeRow();
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田/佐藤  👥 [サンプルプ] 7/28 💥 テスト件名（6 日遅れ）");
+        CHECK_WSTR(lbl.text, L"#12345🆙山田/佐藤  👥 [サンプルプ] 7/28 💥 テスト件名（6 日遅れ）");
         // コメントなし：区切りの "/" ごと消える
         row.commenter.clear();
         lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [サンプルプ] 7/28 💥 テスト件名（6 日遅れ）");
+        CHECK_WSTR(lbl.text, L"#12345🆙山田  👥 [サンプルプ] 7/28 💥 テスト件名（6 日遅れ）");
     }
 
     // 件名が "/" で終わり期日なし（末尾の {left} が空）：区切りの除去はリテラルにだけ効き、件名の末尾は残る
@@ -211,7 +210,7 @@ static void testBuildIssueLabel() {
         row.subject = "ドキュメント整備 docs/";
         row.dueDate.clear();
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田/佐藤  👥 [サンプルプ] 💥 ドキュメント整備 docs/");
+        CHECK_WSTR(lbl.text, L"#12345🆙山田/佐藤  👥 [サンプルプ] 💥 ドキュメント整備 docs/");
     }
 
     // "!" 付き件名の直後の要素が空：件名の末尾を削らないため、範囲長が実テキストと一致する
@@ -267,9 +266,9 @@ static void testBuildIssueLabel() {
         CHECK_WSTR(lbl.text, L"テスト件名（3 日前）");
     }
 
-    // 以降は書式の仕組みの検査で、旧既定（最終更新者の姓・末尾に残り日数）の並びを使う
+    // 以降は書式の仕組みの検査で、旧既定（最終更新者の姓・末尾に残り日数）の並びを使う（{new} は常に幅を持つため除く）
     static constexpr wchar_t LEGACY_FORMAT[] =
-        L"#{id}  {lastname}  {group}[{project:5}] {due!} {new}{bug}{subject:40!}{left@90!}";
+        L"#{id}  {lastname}  {group}[{project:5}] {due!} {bug}{subject:40!}{left@90!}";
 
     // 空要素を囲む括弧対は括弧ごと消える（登録先プロジェクト・旧形式ピンの {project} が空の行）
     g_currentConfig.listFormat = parseListFormat(LEGACY_FORMAT);
@@ -331,22 +330,49 @@ static void testBuildIssueLabel() {
         }
     }
 
-    // 新規：💥 の直前に金色の ✨ が入り、後続の色範囲がその分だけ後ろへずれる
+    // {new}：既定テンプレートで番号の直後に空白なしで入る。✨ は金色、🆙 は青、マーカーなしは透明の 🆙
+    g_currentConfig.listFormat = parseListFormat(LIST_FORMAT_DEFAULT);
     {
         auto row = makeRow();
-        row.isNew = true;
+        row.newMark = NewMark::Created;
         auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
-        CHECK_WSTR(lbl.text, L"#12345  山田  👥 [サンプルプ] 7/28 ✨ 💥 テスト件名（6 日遅れ）");
+        CHECK_WSTR(lbl.text, L"#12345✨山田/佐藤  👥 [サンプルプ] 7/28 💥 テスト件名（6 日遅れ）");
         CHECK(lbl.ranges.size() == 5);
         if (lbl.ranges.size() == 5) {
-            CHECK(lbl.ranges[0].offset == 23);  // 期日は ✨ より前のため不変
-            CHECK(lbl.ranges[1].offset == 28);  // ✨（BMP の 1 コードユニット、末尾空白を含まない）
-            CHECK(lbl.ranges[1].len == 1);
-            CHECK(lbl.ranges[1].color == NEW_MARK_COLOR);
-            CHECK(!lbl.ranges[1].keepColor);
-            CHECK(lbl.ranges[2].offset == 30);  // 💥。"✨ "（2 コードユニット）分ずれる
+            CHECK(lbl.ranges[0].offset == 6);   // ✨（BMP の 1 コードユニット）
+            CHECK(lbl.ranges[0].len == 1);
+            CHECK(lbl.ranges[0].color == NEW_MARK_COLOR);
+            CHECK(!lbl.ranges[0].keepColor);
+            CHECK(!lbl.ranges[0].invisible);
+            CHECK(lbl.ranges[1].offset == 25);  // 期日
         }
     }
+    {
+        auto row = makeRow();
+        row.newMark = NewMark::Updated;
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK_WSTR(lbl.text, L"#12345🆙山田/佐藤  👥 [サンプルプ] 7/28 💥 テスト件名（6 日遅れ）");
+        CHECK(lbl.ranges.size() == 5);
+        if (lbl.ranges.size() == 5) {
+            CHECK(lbl.ranges[0].offset == 6);   // 🆙（サロゲートペア）
+            CHECK(lbl.ranges[0].len == 2);
+            CHECK(lbl.ranges[0].color == UPDATED_MARK_COLOR);
+            CHECK(!lbl.ranges[0].keepColor);
+            CHECK(!lbl.ranges[0].invisible);
+            CHECK(lbl.ranges[1].offset == 26);  // 期日。🆙 は ✨ より 1 コードユニット長い
+        }
+    }
+    {
+        auto row = makeRow();  // newMark は None
+        auto lbl = buildIssueLabel(row, makeDueDateView(row.dueDate, todayYmd), today);
+        CHECK(lbl.ranges.size() == 5);
+        if (lbl.ranges.size() == 5) {
+            CHECK(lbl.ranges[0].offset == 6);   // 透明の 🆙
+            CHECK(lbl.ranges[0].len == 2);
+            CHECK(lbl.ranges[0].invisible);
+        }
+    }
+    g_currentConfig.listFormat = parseListFormat(LEGACY_FORMAT);
 
     // 期日なし：前後のリテラル空白が詰まる
     {
@@ -1063,17 +1089,37 @@ static void testJournalMatchesUpdate() {
     CHECK(journalMatchesUpdate("2026-08-01T10:00:00Z", ""));
 }
 
-// 起票から指定時間以内か（一覧の ✨ マーカー）
-static void testIsRecentlyCreated() {
+// 指定時刻から指定時間以内か（一覧の ✨・🆙 マーカー）
+static void testIsWithinHours() {
     const long long now = isoUtcToEpoch("2026-08-02T10:00:00Z");
     // 24 時間の境界：ちょうど 24 時間前は対象外、1 秒手前は対象
-    CHECK(isRecentlyCreated("2026-08-01T10:00:01Z", now, 24));
-    CHECK(!isRecentlyCreated("2026-08-01T10:00:00Z", now, 24));
-    // 未来の created_on（時計のずれ）は新規とみなす
-    CHECK(isRecentlyCreated("2026-08-02T10:05:00Z", now, 24));
+    CHECK(isWithinHours("2026-08-01T10:00:01Z", now, 24));
+    CHECK(!isWithinHours("2026-08-01T10:00:00Z", now, 24));
+    // 未来の時刻（時計のずれ）は時間内とみなす
+    CHECK(isWithinHours("2026-08-02T10:05:00Z", now, 24));
     // 0 時間は無効、解釈不能（未取得）は対象外
-    CHECK(!isRecentlyCreated("2026-08-02T10:00:00Z", now, 0));
-    CHECK(!isRecentlyCreated("", now, 24));
+    CHECK(!isWithinHours("2026-08-02T10:00:00Z", now, 0));
+    CHECK(!isWithinHours("", now, 24));
+}
+
+// {new} のマーカー種別（🆙 優先、自分の主要変更は除外）
+static void testNewMarkOf() {
+    const long long now = isoUtcToEpoch("2026-08-02T10:00:00Z");
+    const std::string recent = "2026-08-02T09:00:00Z";  // 1 時間前
+    const std::string old    = "2026-07-30T10:00:00Z";  // 3 日前
+    // 起票も主要変更も時間内：🆙 を優先
+    CHECK(newMarkOf(recent, recent, 7, 1, now, 24) == NewMark::Updated);
+    // 主要変更が自分：起票が時間内なら ✨、古ければなし
+    CHECK(newMarkOf(recent, recent, 1, 1, now, 24) == NewMark::Created);
+    CHECK(newMarkOf(old, recent, 1, 1, now, 24) == NewMark::None);
+    // 自分の id が未取得（0）・投稿者不明（0）は他人扱い
+    CHECK(newMarkOf(old, recent, 1, 0, now, 24) == NewMark::Updated);
+    CHECK(newMarkOf(old, recent, 0, 1, now, 24) == NewMark::Updated);
+    // 主要変更なし（空）・古い主要変更は起票だけで判定
+    CHECK(newMarkOf(recent, "", 0, 1, now, 24) == NewMark::Created);
+    CHECK(newMarkOf(old, old, 7, 1, now, 24) == NewMark::None);
+    // 0 時間は無効
+    CHECK(newMarkOf(recent, recent, 7, 1, now, 0) == NewMark::None);
 }
 
 static void testPriorityHighlightOf() {
@@ -1240,7 +1286,8 @@ int main() {
     testBuildListRowsSortPriorityDue();
     testRoundToDivisorOf60();
     testJournalMatchesUpdate();
-    testIsRecentlyCreated();
+    testIsWithinHours();
+    testNewMarkOf();
     testPriorityHighlightOf();
     testAlignTowardCenter();
     testRegisterSubject();

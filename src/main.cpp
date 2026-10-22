@@ -424,6 +424,9 @@ struct Issue {
     std::string updaterFirstName;  // 一覧の {firstname} 用（姓と違いフォールバックせず、未取得は空）
     std::string authorDisplay;     // 一覧の {author} 用（起票者の姓。取得できない場合はフルネーム）
     std::string commenterDisplay;  // 一覧の {commenter} 用（最後のコメント投稿者の姓。コメントなしは空）
+    // 最後の主要変更（説明・担当者・ステータスの変更かコメントの journal。一覧の 🆙 用。resolveUpdaters が確定）
+    std::string changeOn;          // その journal の created_on（UTC ISO 8601。主要変更なし・未取得は空）
+    int         changerId = 0;     // その journal の投稿者 id（0 = 主要変更なし・未取得）
 };
 
 // ピン留め 1 件分
@@ -467,14 +470,16 @@ struct FormatToken {
 };
 
 // list_format の既定値
-// 番号、起票者/最後のコメント投稿者、グループ担当マーカー、[プロジェクト名]、期日、
-// 新規マーカー、バグマーカー、件名、残り日数の並び。名前を最終更新者でなく起票者と
+// 番号、新規・更新マーカー、起票者/最後のコメント投稿者、グループ担当マーカー、[プロジェクト名]、期日、
+// バグマーカー、件名、残り日数の並び。名前を最終更新者でなく起票者と
 // コメント投稿者にするのは、優先度・期日の変更だけで名前が操作者に変わらないようにするため。
+// マーカーを番号の直後に空白なしで置くのは、マーカーのない行も同じ幅を確保する {new} と組み合わせて
+// 起票者名の位置を全行で揃えるため。
 // 期限切れ行で赤にするのは期日、件名、残り日数とする。
 // 残り日数は件名より目立たせないため 90% に縮めて末尾に置く。
 // 経過日数 {ago} は既定に含めない。（トークン自体は有効）
 static constexpr wchar_t LIST_FORMAT_DEFAULT[] =
-    L"#{id}  {author}/{commenter}  {group}[{project:5}] {due!} {new}{bug}{subject:40!}{left@90!}";
+    L"#{id}{new}{author}/{commenter}  {group}[{project:5}] {due!} {bug}{subject:40!}{left@90!}";
 
 // フォールバックモード（query_ids 省略）の擬似クエリ id
 // Redmine のクエリ id は正の整数のため 0 は衝突しない。state.json の queries／
@@ -1223,6 +1228,11 @@ struct StateEntry {
     // キャッシュミスして journals を取り直す）
     std::string      authorDisplay;
     std::string      commenterDisplay;
+    // 最後の主要変更（🆙 用）。hasChange は change_on キーがあったか。（旧形式はキー不在で false となり、
+    // キャッシュミスして journals を取り直す。主要変更なしは空文字で保存されるため、空かどうかでは判別できない）
+    std::string      changeOn;
+    int              changerId = 0;
+    bool             hasChange = false;
 };
 
 // state.json の読み込み結果
@@ -1273,6 +1283,9 @@ static PollState loadState(const std::wstring& dir) {
                 e.updaterFirst   = winrt::to_string(o.GetNamedString(L"updater_first", L""));
                 e.authorDisplay    = winrt::to_string(o.GetNamedString(L"author", L""));
                 e.commenterDisplay = winrt::to_string(o.GetNamedString(L"commenter", L""));
+                e.hasChange = o.HasKey(L"change_on");
+                e.changeOn  = winrt::to_string(o.GetNamedString(L"change_on", L""));
+                e.changerId = static_cast<int>(o.GetNamedNumber(L"changer_id", 0));
                 if (o.HasKey(L"queries")) {
                     e.hasQueries = true;
                     for (auto q : o.GetNamedArray(L"queries")) {
@@ -1332,6 +1345,8 @@ static bool saveState(const std::wstring& dir, const Config& cfg, const std::vec
             o.Insert(L"updater_first", JsonValue::CreateStringValue(winrt::to_hstring(is.updaterFirstName)));
             o.Insert(L"author",     JsonValue::CreateStringValue(winrt::to_hstring(is.authorDisplay)));
             o.Insert(L"commenter",  JsonValue::CreateStringValue(winrt::to_hstring(is.commenterDisplay)));
+            o.Insert(L"change_on",  JsonValue::CreateStringValue(winrt::to_hstring(is.changeOn)));
+            o.Insert(L"changer_id", JsonValue::CreateNumberValue(is.changerId));
             JsonArray iq;
             for (int q : is.queryIds) iq.Append(JsonValue::CreateNumberValue(q));
             o.Insert(L"queries", iq);
@@ -2287,14 +2302,31 @@ static long long isoUtcToEpoch(const std::string& iso) {
     return e < 0 ? -1 : e;
 }
 
-// 起票から hours 時間以内か（一覧の ✨ マーカーの判定）
-// hours が 0 以下（new_mark_hours = 0 で無効）、または createdOn が解釈不能（未取得の旧形式ピン）なら false。
-// 未来の created_on（サーバとローカルの時計のずれ）は差が負になり、新規とみなす。
-static bool isRecentlyCreated(const std::string& createdOn, long long nowEpoch, int hours) {
+// UTC ISO 8601 の時刻 isoUtc から hours 時間以内か（一覧の ✨・🆙 マーカーの判定）
+// hours が 0 以下（new_mark_hours = 0 で無効）、または isoUtc が解釈不能（空・未取得）なら false。
+// 未来の時刻（サーバとローカルの時計のずれ）は差が負になり、時間内とみなす。
+static bool isWithinHours(const std::string& isoUtc, long long nowEpoch, int hours) {
     if (hours <= 0) return false;
-    long long created = isoUtcToEpoch(createdOn);
-    if (created < 0) return false;
-    return nowEpoch - created < static_cast<long long>(hours) * 3600;
+    long long t = isoUtcToEpoch(isoUtc);
+    if (t < 0) return false;
+    return nowEpoch - t < static_cast<long long>(hours) * 3600;
+}
+
+// 一覧の {new} に出すマーカーの種別（Created = ✨、Updated = 🆙）
+enum class NewMark { None, Created, Updated };
+
+// {new} のマーカー種別を返す
+// changeOn・changerId は最後の主要変更（説明・担当者・ステータスの変更かコメントの journal）の
+// created_on と投稿者 id。（主要変更なし・未取得は空と 0）
+// 主要変更から hours 時間以内で、投稿者が自分（myUserId。0 = 未取得は自分とみなさない）でなければ Updated。
+// それ以外で起票から hours 時間以内なら Created。両方に当たる行は Updated を優先する。
+// （既存チケットへの他人の更新を見落とさないことを、起票直後の目印より重く見るため）
+static NewMark newMarkOf(const std::string& createdOn, const std::string& changeOn, int changerId,
+                         int myUserId, long long nowEpoch, int hours) {
+    const bool ownChange = myUserId != 0 && changerId == myUserId;
+    if (!ownChange && isWithinHours(changeOn, nowEpoch, hours)) return NewMark::Updated;
+    if (isWithinHours(createdOn, nowEpoch, hours)) return NewMark::Created;
+    return NewMark::None;
 }
 
 // 一覧の行背景で強調する優先度の段階
@@ -2339,7 +2371,35 @@ struct LastUpdater {
     // updated_on との突き合わせはしない。（一覧の表示専用で、抑止判定に使わないため）
     int         commenterId = 0;
     std::string commenterName;
+    // 最後の主要変更の journal（一覧の 🆙 用。updated_on との突き合わせはしない。0・空 = 主要変更なし）
+    int         changerId = 0;
+    std::string changeOn;
 };
+
+// journal が空白以外を含むコメント（notes）を持つか
+// null・欠落はコメントなし。（GetNamedString は null で例外を投げるため型を見る）
+static bool journalHasNote(const winrt::Windows::Data::Json::JsonObject& j) {
+    auto nv = j.GetNamedValue(L"notes", nullptr);
+    if (!nv || nv.ValueType() != winrt::Windows::Data::Json::JsonValueType::String) return false;
+    std::wstring notes(nv.GetString());
+    return notes.find_first_not_of(L" \t\r\n　") != std::wstring::npos;
+}
+
+// journal が説明・担当者・ステータスのいずれかを変えたか（🆙 の対象。優先度・期日などだけの変更は対象外）
+// details の property "attr" が標準フィールドの変更で、name は API のフィールド名。
+static bool journalChangesKeyAttr(const winrt::Windows::Data::Json::JsonObject& j) {
+    using namespace winrt::Windows::Data::Json;
+    auto dv = j.GetNamedValue(L"details", nullptr);
+    if (!dv || dv.ValueType() != JsonValueType::Array) return false;
+    for (auto d : dv.GetArray()) {
+        if (d.ValueType() != JsonValueType::Object) continue;
+        auto o = d.GetObject();
+        if (o.GetNamedString(L"property", L"") != L"attr") continue;
+        auto name = o.GetNamedString(L"name", L"");
+        if (name == L"description" || name == L"assigned_to_id" || name == L"status_id") return true;
+    }
+    return false;
+}
 
 // 指定チケットの最終 journal の更新者を取得する
 // journals は作成順（昇順）で返るため末尾要素が最新の更新。
@@ -2347,7 +2407,7 @@ struct LastUpdater {
 // 取得失敗時は userId 0 のまま返し、呼び出し側の抑止判定は通知する側に倒れる。
 // 最終 journal の created_on が updated_on と一致しない（journalMatchesUpdate が false）場合も
 // userId 0 で返す。自分の古い journal を根拠に他人の更新を自分の操作として抑止しないため。
-// 一覧の {commenter} 用に、最後のコメント投稿者も同じ取得で返す。
+// 一覧の {commenter} 用の最後のコメント投稿者と、🆙 用の最後の主要変更（説明・担当者・ステータスの変更かコメント）も同じ取得で返す。
 static LastUpdater fetchLastUpdater(const Config& cfg, int id) {
     LastUpdater lu;
     auto obj = redmineGetJson(cfg, issueUrl(cfg, id) + L".json?include=journals",
@@ -2359,20 +2419,25 @@ static LastUpdater fetchLastUpdater(const Config& cfg, int id) {
         auto journals = issue.GetNamedArray(L"journals");
         lu.ok = true;  // journals を取得できた（空でも成功。呼び出し側が失敗時の再解決を判断する）
         if (journals.Size() == 0) return lu;
-        // 一覧の {commenter} 用に、末尾から遡って最後のコメントの投稿者を探す
+        // 末尾から遡り、一覧の {commenter} 用の最後のコメント投稿者と、🆙 用の最後の主要変更を探す
         // （最終 journal の突き合わせ失敗でも確定させるため、早期 return より前に置く）
+        // コメントは主要変更に含まれるため、主要変更は最後のコメントと同じか、それより新しい journal になる。
+        bool changeFound = false;
         for (uint32_t i = journals.Size(); i-- > 0;) {
-            auto j  = journals.GetObjectAt(i);
-            auto nv = j.GetNamedValue(L"notes", nullptr);
-            // null・欠落はコメントなし（GetNamedString は null で例外を投げるため型を見る）
-            if (!nv || nv.ValueType() != winrt::Windows::Data::Json::JsonValueType::String) continue;
-            std::wstring notes(nv.GetString());
-            if (notes.find_first_not_of(L" \t\r\n　") == std::wstring::npos) continue;
-            auto cu = j.GetNamedObject(L"user", nullptr);
-            if (!cu) continue;
-            lu.commenterId   = static_cast<int>(cu.GetNamedNumber(L"id", 0));
-            lu.commenterName = winrt::to_string(cu.GetNamedString(L"name", L""));
-            break;
+            auto j = journals.GetObjectAt(i);
+            const bool hasNote = journalHasNote(j);
+            if (!hasNote && !journalChangesKeyAttr(j)) continue;
+            auto ju = j.GetNamedObject(L"user", nullptr);
+            if (!changeFound) {
+                changeFound  = true;
+                lu.changeOn  = winrt::to_string(j.GetNamedString(L"created_on", L""));
+                lu.changerId = ju ? static_cast<int>(ju.GetNamedNumber(L"id", 0)) : 0;
+            }
+            if (hasNote && ju) {
+                lu.commenterId   = static_cast<int>(ju.GetNamedNumber(L"id", 0));
+                lu.commenterName = winrt::to_string(ju.GetNamedString(L"name", L""));
+                break;
+            }
         }
         auto last = journals.GetObjectAt(journals.Size() - 1);
         auto createdOn = winrt::to_string(last.GetNamedString(L"created_on", L""));
@@ -2436,7 +2501,7 @@ static UserNames resolveUserNames(const Config& cfg, int userId,
 // 更新）は起票者を表示名にし、updaterId は 0 のまま抑止しない。取得失敗は表示名を空のまま残して
 // 次回ポーリングで再解決する。通知抑止（deliverPollResults）もここで確定した updaterId を
 // 使うため、journals の取得は本関数だけで行う。
-// 一覧の {author}（起票者の姓）と {commenter}（最後のコメント投稿者の姓）も同じ取得で確定する。
+// 一覧の {author}（起票者の姓）と {commenter}（最後のコメント投稿者の姓）、🆙 用の最後の主要変更も同じ取得で確定する。
 static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
                             const PollState& prev,
                             std::unordered_map<int, UserNames>& nameCache)
@@ -2445,12 +2510,15 @@ static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
         if (g_shutdownRequested) return;
         auto it = prev.issues.find(is.id);
         if (it != prev.issues.end() && it->second.updatedOn == is.updatedOn
-            && !it->second.updaterDisplay.empty() && !it->second.authorDisplay.empty()) {
+            && !it->second.updaterDisplay.empty() && !it->second.authorDisplay.empty()
+            && it->second.hasChange) {
             is.updaterId        = it->second.updaterId;
             is.updaterDisplay   = it->second.updaterDisplay;
             is.updaterFirstName = it->second.updaterFirst;
             is.authorDisplay    = it->second.authorDisplay;
             is.commenterDisplay = it->second.commenterDisplay;
+            is.changeOn         = it->second.changeOn;
+            is.changerId        = it->second.changerId;
             continue;
         }
         LastUpdater lu = fetchLastUpdater(cfg, is.id);
@@ -2459,6 +2527,8 @@ static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
         // 取得失敗は表示名を空のまま残し、次回ポーリングのキャッシュミスで再解決する。
         // （誤った名前を state.json に焼き付けない。抑止判定は userId 0 で通知側に倒れる）
         if (!lu.ok) continue;
+        is.changeOn  = lu.changeOn;
+        is.changerId = lu.changerId;
         // journal の無いチケットと journal を伴わない更新は起票者を表示名にする。
         // （表示名を空にすると次回もキャッシュミスして毎回 journals を引き直すため）
         int         dispId   = lu.userId != 0 ? lu.userId : is.authorId;
@@ -3645,7 +3715,7 @@ struct ListRow {
     std::string commenter;            // 最後のコメント投稿者の姓（{commenter}。コメントなしは空）
     std::string dueDate;              // "YYYY-MM-DD"（期日なしは空）
     std::string updatedOn;
-    std::string createdOn;            // created_on（作成日順の並べ替え用。未取得は空で末尾側へ。✨ は isNew で判定済み）
+    std::string createdOn;            // created_on（作成日順の並べ替え用。未取得は空で末尾側へ。✨・🆙 は newMark で判定済み）
     int         priorityRank = 0;     // 優先度の順位（大きいほど高優先。順位表に無ければ priority id）
     PriorityHighlight priorityHighlight = PriorityHighlight::None;  // 行背景の強調段階（実際の優先度で決め、期日の繰り上げは反映しない）
     bool        assignedToGroup = false;
@@ -3654,7 +3724,7 @@ struct ListRow {
     bool        hidden          = false;  // 非表示チケット（グレー＋取消線描画。件数・未読に数えない）
     bool        closed          = false;
     bool        unread          = false;
-    bool        isNew           = false;  // 起票から new_mark_hours 時間以内（{new} の ✨ マーカー。非表示行は常に false）
+    NewMark     newMark         = NewMark::None;  // {new} のマーカー（✨ / 🆙。非表示行は常に None）
 };
 
 // 一覧に出す行を選定し、並べ替えて list_limit 件へ絞る
@@ -3683,7 +3753,7 @@ struct ListRow {
 // 非表示チケットもトグルにかかわらず数えない。（「見なくて良い」の意思表示のため）
 // tooltip の未読件数も本関数の結果から数える。表示と同じ選定を通すことで「未読 N 件」と
 // 画面上の未読行数を一致させる。（一覧に出ない未読は数に出さず、バッジも点けない）
-// 非表示チケットの unread・isNew は常に false にする。（太字にも未読件数にも ✨ にも出さない）
+// 非表示チケットの unread は常に false、newMark は常に None にする。（太字にも未読件数にも ✨・🆙 にも出さない）
 // 行背景の強調段階（priorityHighlight）は実際の優先度だけで決め、優先度順（期日考慮）の繰り上げは反映しない。
 static std::vector<ListRow> buildListRows(int& visible) {
     std::vector<Issue>      issues;
@@ -3717,11 +3787,10 @@ static std::vector<ListRow> buildListRows(int& visible) {
         return it != priorityPositions.end() ? it->second : priorityId;
     };
 
-    // ✨ は起票から new_mark_hours 時間以内の行に付ける。（通知の有無・既読によらない）
+    // {new} のマーカー。✨ は起票から、🆙 は他人の最後の主要変更から new_mark_hours 時間以内の行に付ける。
+    // （通知の有無・既読によらない）
     const long long nowEpoch = static_cast<long long>(_time64(nullptr));
-    auto isNewRow = [nowEpoch](const std::string& createdOn) {
-        return isRecentlyCreated(createdOn, nowEpoch, g_currentConfig.newMarkHours);
-    };
+    const int myUserId = g_myUserId.load();
 
     auto isPinned = [&pins](int id) {
         for (const auto& p : pins) {
@@ -3759,11 +3828,14 @@ static std::vector<ListRow> buildListRows(int& visible) {
                         .isBugTracker = is.isBugTracker,
                         .pinned = pinned, .hidden = hidden, .closed = is.closed,
                         .unread = !hidden && unread.count(is.id) != 0,
-                        .isNew = !hidden && isNewRow(is.createdOn)});
+                        .newMark = hidden ? NewMark::None
+                                 : newMarkOf(is.createdOn, is.changeOn, is.changerId, myUserId,
+                                             nowEpoch, g_currentConfig.newMarkHours)});
         shown.insert(is.id);
     }
     for (const auto& p : pins) {
         if (shown.count(p.id)) continue;
+        // 集合外ピンは個別取得が journals を含まず主要変更が分からないため、✨ だけを判定する
         rows.push_back({.id = p.id, .subject = p.subject, .projectName = projectLabel(p.projectName),
                         .updater = p.updaterDisplay, .updaterFirst = p.updaterFirst,
                         .author = p.authorDisplay, .commenter = p.commenterDisplay,
@@ -3775,7 +3847,8 @@ static std::vector<ListRow> buildListRows(int& visible) {
                         .isBugTracker = p.isBugTracker,
                         .pinned = true, .closed = p.closed,
                         .unread = unread.count(p.id) != 0,
-                        .isNew = isNewRow(p.createdOn)});
+                        .newMark = isWithinHours(p.createdOn, nowEpoch, g_currentConfig.newMarkHours)
+                                   ? NewMark::Created : NewMark::None});
     }
 
     // 期日順の比較規則。期日は ISO 形式のため文字列辞書順で昇順に比較でき、期日なしは末尾、
@@ -3973,13 +4046,16 @@ static constexpr COLORREF ALERT_TEXT_COLOR = RGB(220, 0, 0);
 // 新規マーカー（✨）の文字色（金色。既定の黒では絵文字として目に留まらないため）
 static constexpr COLORREF NEW_MARK_COLOR = RGB(0xD4, 0x9A, 0x00);
 
+// 更新マーカー（🆙）の文字色（青と水色の中間。✨ の金色、期限切れ・💥 の赤と区別する）
+static constexpr COLORREF UPDATED_MARK_COLOR = RGB(0x1E, 0x90, 0xFF);
+
 // 高優先度行の背景に混ぜる色と混色率（%）。COLOR_MENU に混ぜて作り、テーマの背景明度に追随させる。
 // 「今すぐ」（Top）を濃く、「急いで」（Second）を淡くして 2 段階を見分けられるようにする
 static constexpr COLORREF PRIORITY_ROW_TINT        = RGB(255, 0, 0);
 static constexpr int      PRIORITY_ROW_TINT_TOP    = 25;
 static constexpr int      PRIORITY_ROW_TINT_SECOND = 12;
 
-// ラベル内で文字色、ウェイト、サイズを変える範囲（オフセットと長さは UTF-16 コードユニット単位）
+// ラベル内で文字色、ウェイト、サイズを変える範囲、または描かない範囲（オフセットと長さは UTF-16 コードユニット単位）
 // bold と keepColor を組み合わせて「色は据え置き、ウェイトだけ変える」ような部分強調にも使える。
 struct ColorRange {
     size_t   offset    = 0;
@@ -3988,6 +4064,7 @@ struct ColorRange {
     bool     bold      = false;  // 半太字で描く（範囲外との幅の差は走査側が吸収する）
     bool     keepColor = false;  // true なら color を無視して範囲外と同じ色で描く
     int      sizePct   = 100;    // 文字サイズの百分率（100 未満は縮小フォントで描く）
+    bool     invisible = false;  // true なら幅だけ進めて描かない（{new} のマーカーなし行でマーカーと同じ幅を確保する）
 };
 
 // 一覧ポップアップのチケット項目（行レイアウトの index に対応、トレイ WndProc スレッドのみ使用）
@@ -4177,17 +4254,23 @@ static constexpr wchar_t GROUP_MARK[] = L"👥 ";
 // 扱いは GROUP_MARK と同じ。（ラベル埋め込みの GDI 単色描画）
 static constexpr wchar_t BUG_MARK[] = L"💥 ";
 
-// 新規マーカー（✨ + 半角スペース。起票から new_mark_hours 時間以内の行に付ける）
+// 新規マーカー（✨。起票から new_mark_hours 時間以内の行に付ける）
 // 扱いは GROUP_MARK と同じ。（ラベル埋め込みの GDI 単色描画）
 // 色は NEW_MARK_COLOR（金色）とする。赤は期限切れと 💥 に予約済みで、緊急度ではない新規に使うと
 // 意味が混ざるためだ。
-static constexpr wchar_t NEW_MARK[] = L"✨ ";
+// 前後に空白を付けない。既定書式で番号の直後に置き、マーカーのない行と幅を揃えるため。
+static constexpr wchar_t NEW_MARK[] = L"✨";
+
+// 更新マーカー（🆙。他人の最後の主要変更から new_mark_hours 時間以内の行に付け、✨ より優先する）
+// 扱いは NEW_MARK と同じで、{new} の枠に ✨ と排他で出す。色は UPDATED_MARK_COLOR。
+// マーカーのない行では、この文字を透明（ColorRange::invisible）で置いて同じ幅を確保する。
+static constexpr wchar_t UPDATED_MARK[] = L"🆙";
 
 // 一覧行のラベルを組み立てる
 //   並びは list_format（g_currentConfig.listFormat）のトークン列に従う。
-//   既定は「番号、起票者/最後のコメント投稿者、グループ担当マーカー、[プロジェクト名]、期日、
-//   新規マーカー、バグマーカー、件名、期日の残り日数」
-//   （例："#12345  山田/佐藤  👥 [サンプル] 7/28 ✨ 💥 件名…（6 日遅れ）"）。
+//   既定は「番号、新規・更新マーカー、起票者/最後のコメント投稿者、グループ担当マーカー、[プロジェクト名]、期日、
+//   バグマーカー、件名、期日の残り日数」
+//   （例："#12345✨山田/佐藤  👥 [サンプル] 7/28 💥 件名…（6 日遅れ）"）。
 //   {要素:N} の最大文字数で切り詰める。「…」は自由文の {subject} のみ付け、
 //   識別子的な要素（プロジェクト名・姓・名など）は横幅を優先して付けない。
 //   空に展開された要素（期限なし・更新者不明など）は、直後のリテラル先頭空白を
@@ -4199,11 +4282,14 @@ static constexpr wchar_t NEW_MARK[] = L"✨ ";
 //   同じ規則で取り除く。"[({a})]"・"[({a}){b}]"）
 //   空に展開された要素の直前がリテラル末尾の "/"・"／" なら区切りごと取り除く。（コメントなしの {commenter}。
 //   直前の要素の値が "/" で終わる場合は値の一部として残す）
-//   {group}＝"👥 "・{new}＝"✨ "・{bug}＝"💥 "・{ago}＝"（3 日前）"・{left}＝"（2 日遅れ）" は
+//   {group}＝"👥 "・{bug}＝"💥 "・{ago}＝"（3 日前）"・{left}＝"（2 日遅れ）" は
 //   装飾込みで展開し、
 //   空なら装飾ごと消える。
+//   {new} は ✨・🆙 を空白なしで展開し、マーカーのない行も 🆙 を透明（invisible の範囲）で置くため空にならない。
+//   （行ごとにマーカーの有無が違っても、後続の要素の位置を揃えるため）
 //   期限切れ行の "!" 指定要素と、常に赤いバグマーカーは ALERT_TEXT_COLOR で描くため、
-//   位置を ranges に記録する。新規マーカーも NEW_MARK_COLOR で描くため範囲を持つ。期日は "!" の有無によらず常に半太字の範囲を持つ。
+//   位置を ranges に記録する。新規・更新マーカーも NEW_MARK_COLOR・UPDATED_MARK_COLOR で描くため、
+//   マーカーのない行の透明の 🆙 も描かないため範囲を持つ。期日は "!" の有無によらず常に半太字の範囲を持つ。
 //   "@" で縮小した要素も、サイズを描画側へ渡すため範囲を持つ。
 //   （ranges はオフセット昇順で並べる契約。展開順の追記がそのまま昇順になる）
 // 引数に ListRow を丸ごと取るのは、同じ型の要素が増えて位置引数では取り違えを防げないため。
@@ -4270,7 +4356,7 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
         case FMT_GROUP:     if (row.assignedToGroup) val = GROUP_MARK; break;
         case FMT_PROJECT:   val = toWide(row.projectName); break;
         case FMT_DUE:       val = due.text; break;
-        case FMT_NEW:       if (row.isNew) val = NEW_MARK; break;
+        case FMT_NEW:       val = row.newMark == NewMark::Created ? NEW_MARK : UPDATED_MARK; break;
         case FMT_BUG:       if (row.isBugTracker) val = BUG_MARK; break;
         case FMT_SUBJECT:   val = toWide(row.subject); break;
         case FMT_AGO:       val = makeUpdatedAgoText(row.updatedOn, todayDays); break;
@@ -4316,13 +4402,14 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
             range.keepColor = false;
         }
         else if (tk.element == FMT_NEW) {
-            // 💥 と同じ仕組みで金色にする。（末尾の空白を範囲に含めない理由も同じ）
-            range.len       = val.size() - (val.back() == L' ' ? 1 : 0);
-            range.color     = NEW_MARK_COLOR;
+            // 💥 と同じ仕組みで ✨ を金色、🆙 を青にする。（マーカーは空白を含まないため全体が範囲）
+            range.color     = row.newMark == NewMark::Created ? NEW_MARK_COLOR : UPDATED_MARK_COLOR;
             range.keepColor = false;
         }
-        // 色、ウェイト、サイズのいずれも既定のままなら範囲を持たない（範囲外と同じ描画で足りる）。
-        if (range.len > 0 && (range.bold || !range.keepColor || range.sizePct != 100))
+        // マーカーのない行は幅だけ確保して描かない。（"!" の期限切れ指定でも描かない）
+        if (tk.element == FMT_NEW && row.newMark == NewMark::None) range.invisible = true;
+        // 色、ウェイト、サイズ、透明のいずれも既定のままなら範囲を持たない（範囲外と同じ描画で足りる）。
+        if (range.len > 0 && (range.bold || !range.keepColor || range.sizePct != 100 || range.invisible))
             r.ranges.push_back(range);
         r.text += val;
         literalBegin = r.text.size();
@@ -4916,6 +5003,7 @@ static HFONT scaledFont(HFONT src, int pct) {
 // 範囲の sizePct が 100 未満なら縮小フォントで描き、ベースラインを基準フォントに揃える。
 // サイズ 100 のセグメントは従来どおり DT_VCENTER の中央配置のまま。
 // textRect が nullptr なら描画せず幅だけを返す。（measureIssueRow 用）
+// 範囲の invisible が true なら、その範囲は描かずに幅だけ進める。（計測と描画で幅が一致する）
 // uniformColor=true は範囲の色を無視して textColor 一色で描く。要求元はホット行と非表示行の
 // 両方だ。（ハイライト背景上の赤は読みにくい。ウェイトは幅が変わるためホット行でも維持する）
 // 非表示行は「見なくて良い」ことを示すグレー一色を範囲色より優先する。
@@ -4931,7 +5019,7 @@ static int walkIssueLabel(HDC hdc, const IssueItem& item, const RECT* textRect,
     TEXTMETRICW baseTm = {};
     SelectObject(hdc, baseFont);
     GetTextMetricsW(hdc, &baseTm);
-    auto segment = [&](size_t from, size_t to, COLORREF color, HFONT font, int sizePct) {
+    auto segment = [&](size_t from, size_t to, COLORREF color, HFONT font, int sizePct, bool visible) {
         // 範囲の指定を信用せずラベル長で丸める。（境界外読み取りと位置の巻き戻りを防ぐ）
         to = (std::min)(to, item.label.size());
         if (from >= to) return;
@@ -4940,7 +5028,7 @@ static int walkIssueLabel(HDC hdc, const IssueItem& item, const RECT* textRect,
         int len = static_cast<int>(to - from);
         SIZE sz = {};
         GetTextExtentPoint32W(hdc, base + from, len, &sz);
-        if (textRect) {
+        if (textRect && visible) {
             RECT seg = *textRect;
             seg.left += x;
             if (sizePct != 100) {
@@ -4959,12 +5047,12 @@ static int walkIssueLabel(HDC hdc, const IssueItem& item, const RECT* textRect,
     };
     size_t done = 0;
     for (const auto& r : item.ranges) {
-        segment(done, r.offset, textColor, baseFont, 100);
+        segment(done, r.offset, textColor, baseFont, 100, true);
         segment(r.offset, r.offset + r.len,
-                r.keepColor ? textColor : r.color, r.bold ? emphFont : baseFont, r.sizePct);
+                r.keepColor ? textColor : r.color, r.bold ? emphFont : baseFont, r.sizePct, !r.invisible);
         done = r.offset + r.len;
     }
-    segment(done, item.label.size(), textColor, baseFont, 100);
+    segment(done, item.label.size(), textColor, baseFont, 100, true);
     return x;
 }
 
@@ -6326,12 +6414,12 @@ enum class IssueRowState { Normal, Pinned, Hidden };
 // 非表示は一覧に出るチケットにしか意味がない。（メニュー側も両項目を灰色にする）
 // 非表示への遷移で g_unreadIds には触らない。非表示は「見なくて良い」の意思表示で
 // あって既読（開いた）ではないため、非表示を解除すれば未読の太字は戻る。
-// ✨ も、解除時点で起票から new_mark_hours 時間以内なら戻る。
-// 非表示中に太字・✨・未読件数へ出ないのは buildListRows の hidden 判定が担う。
+// ✨・🆙 も、解除時点で new_mark_hours 時間以内なら戻る。
+// 非表示中に太字・✨・🆙・未読件数へ出ないのは buildListRows の hidden 判定が担う。
 // 開いたままの一覧でも同じ見え方にするため、非表示への遷移で item.unread を落とし、
 // 解除では g_unreadIds の現況から復元する。
 // 遷移直後の再描画では、太字は item.unread と hidden（issueRowBold）で即座に切り替わるが、
-// 組み立て済みラベルが保持する ✨ は非表示中も残る。（IssueItem にマーカー用のフラグを持たせていないため。
+// 組み立て済みラベルが保持する ✨・🆙 は非表示中も残る。（IssueItem にマーカー用のフラグを持たせていないため。
 // グレー＋取消線の行なので誤読はなく、次に一覧を開くかポーリングで組み直せば消えるため許容する）
 static void setIssueState(int issueId, IssueRowState target) {
     size_t itemIndex = 0;
