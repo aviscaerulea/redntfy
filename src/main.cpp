@@ -2487,17 +2487,22 @@ struct UserNames {
 
 // ユーザ id から姓・名を取得する（セッション内キャッシュ）
 // Redmine のユーザ名文字列は姓名が無区切りで分割できない。一覧の {lastname} と {firstname} に
-// 使うため /users/{id}.json を引く。取得失敗は両方空をキャッシュして毎回の再試行を抑える。
-// （呼び出し側が姓をフルネームへフォールバックし、再起動で再試行される）
-static UserNames resolveUserNames(const Config& cfg, int userId,
-                                  std::unordered_map<int, UserNames>& cache)
+// 使うため /users/{id}.json を引く。
+// 403・404（参照権限なし・ロック済みなど）と想定外の JSON 構造は確定的な失敗として両方空を
+// キャッシュし、毎回の再試行を抑える。（呼び出し側が姓をフルネームへフォールバックする）
+// 接続失敗・5xx などの一時的な失敗はキャッシュせず nullopt を返す。呼び出し側は表示名を
+// 確定せず、次回ポーリングで再解決する。（フルネームへの縮退を state.json に焼き付けないため）
+static std::optional<UserNames> resolveUserNames(const Config& cfg, int userId,
+                                                 std::unordered_map<int, UserNames>& cache)
 {
-    if (userId <= 0) return {};
+    if (userId <= 0) return UserNames{};
     auto it = cache.find(userId);
     if (it != cache.end()) return it->second;
     UserNames names;
+    DWORD status = 0;
     auto obj = redmineGetJson(cfg, cfg.redmineUrl + L"/users/" + std::to_wstring(userId) + L".json",
-                              "resolveUserNames(user=" + std::to_string(userId) + ")");
+                              "resolveUserNames(user=" + std::to_string(userId) + ")", &status);
+    if (!obj && status != 403 && status != 404) return std::nullopt;
     if (obj) {
         try {
             auto user = obj.GetNamedObject(L"user", nullptr);
@@ -2519,8 +2524,8 @@ static UserNames resolveUserNames(const Config& cfg, int userId,
 // updated_on が前回ポーリングから変わっていないチケットは state.json のキャッシュを使う。
 // 変わったチケットと新規のチケットだけ journals を取得する。（定常時の追加 HTTP は変化分のみ）
 // journal の無いチケットと、最終 journal が updated_on と一致しないチケット（journal を伴わない
-// 更新）は起票者を表示名にし、updaterId は 0 のまま抑止しない。取得失敗は表示名を空のまま残して
-// 次回ポーリングで再解決する。通知抑止（deliverPollResults）もここで確定した updaterId を
+// 更新）は起票者を表示名にし、updaterId は 0 のまま抑止しない。取得失敗（journals と、姓・名の
+// 一時的な失敗）は表示名を空のまま残して次回ポーリングで再解決する。通知抑止（deliverPollResults）もここで確定した updaterId を
 // 使うため、journals の取得は本関数だけで行う。
 // 一覧の {author}（起票者の姓）と {commenter}（最後のコメント投稿者の姓）、🆙 用の最後の主要変更も同じ取得で確定する。
 static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
@@ -2554,17 +2559,21 @@ static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
         // （表示名を空にすると次回もキャッシュミスして毎回 journals を引き直すため）
         int         dispId   = lu.userId != 0 ? lu.userId : is.authorId;
         std::string dispName = lu.userId != 0 ? lu.userName : is.authorName;
-        auto names = resolveUserNames(cfg, dispId, nameCache);
-        is.updaterDisplay   = names.lastName;
-        is.updaterFirstName = names.firstName;
+        auto names       = resolveUserNames(cfg, dispId, nameCache);
+        auto authorNames = resolveUserNames(cfg, is.authorId, nameCache);
+        std::optional<UserNames> commenterNames = UserNames{};
+        if (lu.commenterId != 0) commenterNames = resolveUserNames(cfg, lu.commenterId, nameCache);
+        // 姓・名の一時的な取得失敗は journals の取得失敗と同じく表示名を空のまま残し、次回ポーリングで
+        // 再解決する。（フルネームへの縮退が state.json のキャッシュに残り、更新まで戻らなくなるため）
+        if (!names || !authorNames || !commenterNames) continue;
+        is.updaterDisplay   = names->lastName;
+        is.updaterFirstName = names->firstName;
         if (is.updaterDisplay.empty()) is.updaterDisplay = dispName;
         // 起票者と最後のコメント投稿者の姓（{author}・{commenter}）。姓が取れなければフルネーム
-        auto authorNames = resolveUserNames(cfg, is.authorId, nameCache);
-        is.authorDisplay = authorNames.lastName.empty() ? is.authorName : authorNames.lastName;
+        is.authorDisplay = authorNames->lastName.empty() ? is.authorName : authorNames->lastName;
         is.commenterDisplay.clear();
         if (lu.commenterId != 0) {
-            auto cn = resolveUserNames(cfg, lu.commenterId, nameCache);
-            is.commenterDisplay = cn.lastName.empty() ? lu.commenterName : cn.lastName;
+            is.commenterDisplay = commenterNames->lastName.empty() ? lu.commenterName : commenterNames->lastName;
         }
     }
 }
