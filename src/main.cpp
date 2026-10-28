@@ -5695,7 +5695,7 @@ static void startIssueUpdate(int issueId, const std::string& body, int expectSta
 // アイコン左クリック（NIN_SELECT、即時）。
 // 閉じる：アイコンとポップアップ両方からの離脱（IDT_LIST_WATCH が監視。入力モード中は除く）・
 // アイコン左クリックのトグル・行クリックかホット行の Enter でチケットを開いたとき（Ctrl 押下中を除く）・
-// 入力モード中の Alt+F4。（Esc は処理しない）
+// 入力モード中の Alt+F4。（Esc は一覧を閉じない。検索モード中だけ検索を解除する）
 // 起点によらず同一ルール。
 // 唯一の例外として、ホバー自動表示から hover_click_guard_ms 以内のアイコン左クリックは
 // 無視する。（詳細は handleTrayLeftClick を参照）
@@ -5743,8 +5743,8 @@ static constexpr int IDC_SEARCH_EDIT  = 106;
 // 検索欄の最小幅（px。0 件表示など一覧が狭いときに入力欄が潰れないようにする）
 static constexpr int SEARCH_EDIT_MIN_WIDTH = 240;
 static HWND g_searchEdit   = nullptr;  // 検索欄（初回の Ctrl+F で生成し、以降は使い回す。未生成なら nullptr）
-static bool g_searchActive = false;    // 検索欄を表示中（Ctrl+F のトグルで切り替え、一覧のクローズで false）
-// 検索の解除（Ctrl+F）でフォアグラウンドを返す先（検索を開いた Ctrl+F の時点の前面窓）
+static bool g_searchActive = false;    // 検索欄を表示中＝検索モード（Ctrl+F のトグルで切り替え、Esc と一覧のクローズで false）
+// 検索の解除（Ctrl+F・Esc）でフォアグラウンドを返す先（検索を開いた Ctrl+F の時点の前面窓）
 // nullptr は開いた時点で入力モードだったことを示し、解除後も入力モードに留まる。
 static HWND g_searchReturnFg = nullptr;
 
@@ -5752,14 +5752,18 @@ static HWND g_searchReturnFg = nullptr;
 // 入力モードでない表示中は一覧にキーが届かないため、上下キー・Enter・Ctrl+Enter をトレイウィンドウの
 // ホットキーとして登録する。（表示中は前面アプリのこれらのキーより優先する。ユーザ判断）
 // 入力モード中は登録しない。（登録欄の Enter＝登録、優先度・期日の上下キーと衝突するため。検索欄では
-// searchEditSubclassProc と IDOK の経路が同じ操作を受ける）
+// searchEditSubclassProc が同じ操作を受ける）
 // 行メニュー・終了の確認ダイアログの表示中も登録しない。（メニューのキー操作とコメント欄の改行を妨げるため）
 // 登録の要否は updateListNavHotkeys が状態から決める。
 static constexpr int HOTKEY_ID_NAV_UP         = 2;
 static constexpr int HOTKEY_ID_NAV_DOWN       = 3;
 static constexpr int HOTKEY_ID_NAV_ENTER      = 4;
 static constexpr int HOTKEY_ID_NAV_CTRL_ENTER = 5;
+// 検索の解除の Esc（検索欄の表示中で、上記のホットキーを登録している間だけ登録する。Ctrl+F の解除と同じ動作）
+// 入力モード中の Esc は IsDialogMessageW が IDCANCEL へ変換し、listWndProc が受ける。
+static constexpr int HOTKEY_ID_SEARCH_ESC     = 6;
 static bool  g_navHotkeysRegistered = false;
+static bool  g_searchEscRegistered  = false;
 // ホット行をキーで選んだか（組み直しで選択をチケット id で引き継ぎ、マウスの離脱で選択を消さない判定。
 // マウスを実際に動かすと false に戻す）
 static bool  g_listKeySelected = false;
@@ -5773,11 +5777,26 @@ static bool isListPopupVisible() {
 
 // 一覧のキー操作のホットキーを、現在の状態に合わせて登録・解除する
 // 登録するのは「一覧の表示中・入力モードでない・行メニュー等の表示中でない」をすべて満たす間だけ。
-// 表示・非表示、入力モードの出入り、行メニューの開閉のたびに呼ぶ。
-// 上下キーは押し続けで連続移動させるため MOD_NOREPEAT を付けず、Enter は 1 回の押下で 1 回だけ開くよう付ける。
+// 検索の解除の Esc は、さらに検索欄の表示中に限る。（検索モードでない Esc は前面アプリへ素通しする）
+// 表示・非表示、入力モードの出入り、行メニューの開閉、検索の開始・解除のたびに呼ぶ。
+// 上下キーは押し続けで連続移動させるため MOD_NOREPEAT を付けず、Enter・Esc は 1 回の押下で 1 回だけ働くよう付ける。
 // 他アプリが登録済みのキーは失敗し、そのキーが効かないだけで一覧は使える。（失敗のログは起動後の初回だけ）
 static void updateListNavHotkeys() {
     const bool want = g_hWnd && isListPopupVisible() && !g_listInputMode && !g_rowMenuOpen;
+    const bool wantEsc = want && g_searchActive;
+    if (wantEsc != g_searchEscRegistered) {
+        if (wantEsc) {
+            static bool loggedEsc = false;
+            if (!RegisterHotKey(g_hWnd, HOTKEY_ID_SEARCH_ESC, MOD_NOREPEAT, VK_ESCAPE) && !loggedEsc) {
+                writeLog("list: RegisterHotKey(Esc) failed: " + std::to_string(GetLastError()));
+                loggedEsc = true;
+            }
+        }
+        else {
+            UnregisterHotKey(g_hWnd, HOTKEY_ID_SEARCH_ESC);
+        }
+        g_searchEscRegistered = wantEsc;
+    }
     if (want == g_navHotkeysRegistered) return;
     if (want) {
         bool ok = RegisterHotKey(g_hWnd, HOTKEY_ID_NAV_UP, 0, VK_UP) != FALSE;
@@ -5857,6 +5876,7 @@ static void exitListInputMode() {
 static void markIssueRead(int issueId);
 static void handleTrayCommand(UINT id);
 static void showRowContextMenu(int issueId, POINT screenPt);
+static void closeListSearch(HWND trayWnd);
 
 // クライアント座標 y の行ヒットテスト（セパレータ・登録欄・検索欄は対象外）。ヒットなしは -1
 // 登録欄・検索欄の行背景のクリックでホット表示やクエリ画面遷移を起こさないため、入力欄の行も除く。
@@ -6068,14 +6088,15 @@ static void paintListWindow(HWND hWnd) {
 // キー入力を受けるのは登録欄のクリックか Ctrl+F で入った入力モードの間だけで、Tab・Enter・Esc は
 // メッセージループの IsDialogMessageW が WM_COMMAND（IDOK・IDCANCEL）へ変換する。
 // 説明欄では Enter は改行で、Ctrl+Enter が IDOK になる。（regDescSubclassProc）
-// 検索欄では Enter はホット行を開き、登録はしない。（検索の解除は Ctrl+F のトグル）
-// Esc（IDCANCEL）はどの入力欄でも何もしない。（Esc を処理しない方針。入力モードでないときは届かず、
-// 効く場面と効かない場面が混ざるため。閉じるのは離脱・Alt+F4・アイコンのトグル・行クリック）
+// 検索欄では Enter はホット行を開き、登録はしない。（searchEditSubclassProc）
+// Esc（IDCANCEL）は検索モード中だけ検索を解除し（Ctrl+F の解除と同じ closeListSearch）、それ以外は何もしない。
+// （一覧を閉じる用途には使わない。入力モードでないときは届かず、効く場面と効かない場面が混ざるため。
+// 閉じるのは離脱・Alt+F4・アイコンのトグル・行クリック。入力モードでない検索モード中の Esc はホットキーで受ける）
 // WM_CLOSE（入力モード中の Alt+F4）は破棄ではなく非表示で閉じる。（g_listWnd は使い回すため）
 // 行の左クリック＝チケットを開いて既読化して閉じる。フッタ・0 件行＝クエリ画面を開いて閉じる。
 // Ctrl+左クリックはどちらも閉じずに開く。（既読化した行はその場で再描画する。openListRow）
 // ホット行はマウスとキー操作（上下キー）で共用し、Enter はホット行をクリックと同じく開く。
-// 検索欄での上下キーは searchEditSubclassProc、Enter は IDOK で受ける。それ以外の表示中はトレイ側の WM_HOTKEY で受ける。
+// 検索欄での上下キーと Enter は searchEditSubclassProc で受ける。それ以外の表示中はトレイ側の WM_HOTKEY で受ける。
 // 行の右クリック＝行メニュー（showRowContextMenu）を開き、一覧は開いたまま。
 // 離脱による自動クローズはトレイ側の IDT_LIST_WATCH が担い、ここでは扱わない。
 static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -6119,14 +6140,14 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     }
     if (msg == WM_COMMAND) {
         const UINT id = LOWORD(wParam);
-        if (id == IDOK) {  // 登録ボタン・Enter
-            // 検索欄の Enter も IsDialogMessageW が IDOK へ変換するため、フォーカスで振り分ける。
-            // 検索欄ではホット行を開き（Ctrl+Enter は一覧を残す）、登録はしない。
-            if (g_searchEdit && GetFocus() == g_searchEdit) openListRow(g_listHotRow, GetKeyState(VK_CONTROL) < 0);
-            else submitRegistration();
+        if (id == IDOK) {  // 登録ボタン・Enter（検索欄の Enter は searchEditSubclassProc が受け、ここへは来ない）
+            submitRegistration();
             return 0;
         }
-        if (id == IDCANCEL) return 0;  // Esc は処理しない（ウィンドウプロシージャのコメントを参照）
+        if (id == IDCANCEL) {  // Esc（検索モード中だけ検索を解除する。ウィンドウプロシージャのコメントを参照）
+            if (g_searchActive && g_hWnd) closeListSearch(g_hWnd);
+            return 0;
+        }
         if (id == IDC_SEARCH_EDIT && HIWORD(wParam) == EN_CHANGE) {
             // 入力のたびに一致を判定し直して全面を描き直す。（行数は変わらないため組み直さない）
             // 先頭の一致行（語が無ければ先頭のチケット行）を選び、すぐ Enter で開けるようにする。
@@ -6255,16 +6276,31 @@ static void createRegisterControls(HWND parent, HINSTANCE hInst) {
 }
 
 // 検索欄のキー処理（SetWindowSubclass）
-// 上下キーでホット行を移す。（入力モード中はキー操作のホットキーを外しているため、検索欄で受ける。
-// 1 行 Edit は上下キーを使わないため、横取りしても入力の操作は失われない）
-// Enter は IsDialogMessageW が IDOK へ変換し、listWndProc がホット行を開く。
+// 上下キーでホット行を移し、Enter でホット行を開く。（Ctrl+Enter は一覧を残す。openListRow）
+// 入力モード中はキー操作のホットキーを外しているため、検索欄で受ける。
+// 1 行 Edit は上下キーと Enter を使わないため、横取りしても入力の操作は失われない。
+// Enter は WM_GETDLGCODE で DLGC_WANTALLKEYS を返して IsDialogMessageW に変換させない。
+// （変換先の既定ボタンは登録欄の登録ボタン（IDOK）で、件名が空の間は無効のため、
+// IsDialogMessageW が警告音だけ鳴らして IDOK を送らず、Enter が効かなかった）
+// Enter が生む WM_CHAR（Enter は '\r'、Ctrl+Enter は '\n'）も捨てる。（1 行 Edit が警告音を鳴らすため）
 static constexpr UINT_PTR SEARCH_EDIT_SUBCLASS_ID = 1;
 static LRESULT CALLBACK searchEditSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam,
                                                UINT_PTR, DWORD_PTR) {
+    if (msg == WM_GETDLGCODE) {
+        const MSG* m = reinterpret_cast<const MSG*>(lParam);
+        LRESULT code = DefSubclassProc(hWnd, msg, wParam, lParam);
+        if (m && m->message == WM_KEYDOWN && m->wParam == VK_RETURN) code |= DLGC_WANTALLKEYS;
+        return code;
+    }
     if (msg == WM_KEYDOWN && (wParam == VK_UP || wParam == VK_DOWN)) {
         moveListSelection(wParam == VK_UP ? -1 : 1);
         return 0;
     }
+    if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
+        openListRow(g_listHotRow, GetKeyState(VK_CONTROL) < 0);
+        return 0;
+    }
+    if (msg == WM_CHAR && (wParam == L'\r' || wParam == L'\n')) return 0;
     if (msg == WM_NCDESTROY) RemoveWindowSubclass(hWnd, searchEditSubclassProc, SEARCH_EDIT_SUBCLASS_ID);
     return DefSubclassProc(hWnd, msg, wParam, lParam);
 }
@@ -6281,7 +6317,7 @@ static bool createSearchEdit(HWND parent) {
     }
     SendMessageW(g_searchEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_hMenuFont), FALSE);
     SendMessageW(g_searchEdit, EM_SETCUEBANNER, TRUE,
-                 reinterpret_cast<LPARAM>(L"一覧に表示中の文字を検索（Ctrl+F で解除）"));
+                 reinterpret_cast<LPARAM>(L"一覧に表示中の文字を検索（Ctrl+F・Esc で解除）"));
     if (!SetWindowSubclass(g_searchEdit, searchEditSubclassProc, SEARCH_EDIT_SUBCLASS_ID, 0))
         writeLog("list: SetWindowSubclass(search) failed");  // 検索欄での上下キー移動が効かないだけで検索はできる
     return true;
@@ -6691,7 +6727,7 @@ static void openListSearch(HWND trayWnd) {
     SetFocus(g_searchEdit);
 }
 
-// 一覧の検索を解除する（検索欄の表示中の Ctrl+F）
+// 一覧の検索を解除する（検索欄の表示中の Ctrl+F と Esc。どちらもこの関数で同じ動作にする）
 // 検索欄と着色を消して一覧は残す。入力モード中なら、Ctrl+F の時点の前面窓が他スレッドの窓のときは
 // 入力モードを抜けてそこへフォアグラウンドを返す。（ホバー表示中の Ctrl+F で奪ったフォーカスを戻し、
 // 離脱監視に閉じる判断を任せる）それ以外は入力モードに留め、件名欄（無ければ一覧自体）へフォーカスを渡す。
@@ -6710,11 +6746,12 @@ static void closeListSearch(HWND trayWnd) {
             SetFocus(g_regEdit ? g_regEdit : g_listWnd);
         }
     }
+    updateListNavHotkeys();  // 検索モードを抜けたため、解除用の Esc のホットキーを外す
     showListPopup(trayWnd, true);  // 検索欄の行を除いて組み直す
 }
 
 // 一覧の検索を切り替える（表示中の Ctrl+F。トレイウィンドウの WM_HOTKEY から呼ぶ）
-// 検索欄が出ていれば解除し、出ていなければ開始する。（検索の解除はこのトグルだけで、Esc は使わない）
+// 検索欄が出ていれば解除し、出ていなければ開始する。（検索モード中の Esc も closeListSearch で同じく解除する）
 static void toggleListSearch(HWND trayWnd) {
     if (g_searchActive) closeListSearch(trayWnd);
     else openListSearch(trayWnd);
@@ -7344,6 +7381,12 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         // 一覧の表示中だけ登録している Ctrl+F。行メニュー・終了の確認ダイアログの表示中は、
         // モーダルループ越しに一覧を前面化するとメニューやダイアログを覆うため無視する。
         if (isListPopupVisible() && !g_rowMenuOpen) toggleListSearch(hWnd);
+        return 0;
+    }
+    if (msg == WM_HOTKEY && wParam == HOTKEY_ID_SEARCH_ESC) {
+        // 入力モードでない検索モード中だけ登録している Esc。検索モード中の Ctrl+F と同じく検索を解除する。
+        // （登録を外す直前にキューへ入った分が後から届き得るため、登録中かつ検索モード中だけ処理する）
+        if (g_searchEscRegistered && g_searchActive) closeListSearch(hWnd);
         return 0;
     }
     if (msg == WM_HOTKEY && (wParam == HOTKEY_ID_NAV_UP || wParam == HOTKEY_ID_NAV_DOWN
@@ -8487,7 +8530,7 @@ int wmain() {
         // WM_QUIT は IDM_EXIT 等の終了経路で PostQuitMessage(0) により投函される。
         MSG msg;
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-            // 一覧の登録欄の Tab（移動）・Enter（IDOK）・Esc（IDCANCEL。一覧は何もしない）をダイアログ同様に処理する。
+            // 一覧の登録欄の Tab（移動）・Enter（IDOK）・Esc（IDCANCEL。検索モード中だけ検索を解除する）をダイアログ同様に処理する。
             // 説明欄は regDescSubclassProc が Tab・Esc・Ctrl+Enter だけを同じ経路へ流す
             if (g_listWnd && IsDialogMessageW(g_listWnd, &msg)) continue;
             TranslateMessage(&msg);
