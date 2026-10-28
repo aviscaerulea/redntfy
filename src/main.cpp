@@ -5684,7 +5684,8 @@ static void startIssueUpdate(int issueId, const std::string& body, int expectSta
 // TrackPopupMenu のモーダルメニューをやめ、フォーカスを奪わない非アクティブの
 // 自前ポップアップ（WS_EX_NOACTIVATE）で一覧を表示する。
 // 非モーダルのため、フォーカス復元・EndMenu・クローズ直後のクリック猶予といった
-// モーダルメニュー時代の補正処理は存在しない。チケット行はマウス専用の UI。
+// モーダルメニュー時代の補正処理は存在しない。
+// チケット行はマウスと、上下キー・Enter で操作する。（キーは表示中だけのホットキーで受ける。updateListNavHotkeys）
 // 行の右クリックメニューだけは TrackPopupMenu を使い、表示中は離脱監視を止める。（showRowContextMenu）
 // 例外は末尾の登録欄（登録先の確定時のみ）で、登録欄のクリックでだけ
 // WS_EX_NOACTIVATE を外して一覧をアクティブ化し、キー入力を受ける。（入力モード）
@@ -5693,7 +5694,7 @@ static void startIssueUpdate(int issueId, const std::string& body, int expectSta
 // 開く：ホバー（OS の NIN_POPUPOPEN 通知から hover_delay_ms 後）または
 // アイコン左クリック（NIN_SELECT、即時）。
 // 閉じる：アイコンとポップアップ両方からの離脱（IDT_LIST_WATCH が監視。入力モード中は除く）・
-// アイコン左クリックのトグル・行クリックでチケットを開いたとき（Ctrl 押下中を除く）・
+// アイコン左クリックのトグル・行クリックかホット行の Enter でチケットを開いたとき（Ctrl 押下中を除く）・
 // 入力モード中の Alt+F4。（Esc は処理しない）
 // 起点によらず同一ルール。
 // 唯一の例外として、ホバー自動表示から hover_click_guard_ms 以内のアイコン左クリックは
@@ -5747,9 +5748,53 @@ static bool g_searchActive = false;    // 検索欄を表示中（Ctrl+F のト�
 // nullptr は開いた時点で入力モードだったことを示し、解除後も入力モードに留まる。
 static HWND g_searchReturnFg = nullptr;
 
+// 一覧のキー操作（上下キーで行を選び、Enter で開く）
+// 入力モードでない表示中は一覧にキーが届かないため、上下キー・Enter・Ctrl+Enter をトレイウィンドウの
+// ホットキーとして登録する。（表示中は前面アプリのこれらのキーより優先する。ユーザ判断）
+// 入力モード中は登録しない。（登録欄の Enter＝登録、優先度・期日の上下キーと衝突するため。検索欄では
+// searchEditSubclassProc と IDOK の経路が同じ操作を受ける）
+// 行メニュー・終了の確認ダイアログの表示中も登録しない。（メニューのキー操作とコメント欄の改行を妨げるため）
+// 登録の要否は updateListNavHotkeys が状態から決める。
+static constexpr int HOTKEY_ID_NAV_UP         = 2;
+static constexpr int HOTKEY_ID_NAV_DOWN       = 3;
+static constexpr int HOTKEY_ID_NAV_ENTER      = 4;
+static constexpr int HOTKEY_ID_NAV_CTRL_ENTER = 5;
+static bool  g_navHotkeysRegistered = false;
+// ホット行をキーで選んだか（組み直しで選択をチケット id で引き継ぎ、マウスの離脱で選択を消さない判定。
+// マウスを実際に動かすと false に戻す）
+static bool  g_listKeySelected = false;
+// 一覧上で最後に観測したカーソルのスクリーン座標（再配置で届く移動なしの WM_MOUSEMOVE を無視するため）
+static POINT g_listLastMouse = { LONG_MIN, LONG_MIN };
+
 // 一覧ポップアップが画面に出ているか（ウィンドウ未生成は非表示扱い）
 static bool isListPopupVisible() {
     return g_listWnd && IsWindowVisible(g_listWnd);
+}
+
+// 一覧のキー操作のホットキーを、現在の状態に合わせて登録・解除する
+// 登録するのは「一覧の表示中・入力モードでない・行メニュー等の表示中でない」をすべて満たす間だけ。
+// 表示・非表示、入力モードの出入り、行メニューの開閉のたびに呼ぶ。
+// 上下キーは押し続けで連続移動させるため MOD_NOREPEAT を付けず、Enter は 1 回の押下で 1 回だけ開くよう付ける。
+// 他アプリが登録済みのキーは失敗し、そのキーが効かないだけで一覧は使える。（失敗のログは起動後の初回だけ）
+static void updateListNavHotkeys() {
+    const bool want = g_hWnd && isListPopupVisible() && !g_listInputMode && !g_rowMenuOpen;
+    if (want == g_navHotkeysRegistered) return;
+    if (want) {
+        bool ok = RegisterHotKey(g_hWnd, HOTKEY_ID_NAV_UP, 0, VK_UP) != FALSE;
+        ok = (RegisterHotKey(g_hWnd, HOTKEY_ID_NAV_DOWN, 0, VK_DOWN) != FALSE) && ok;
+        ok = (RegisterHotKey(g_hWnd, HOTKEY_ID_NAV_ENTER, MOD_NOREPEAT, VK_RETURN) != FALSE) && ok;
+        ok = (RegisterHotKey(g_hWnd, HOTKEY_ID_NAV_CTRL_ENTER, MOD_CONTROL | MOD_NOREPEAT, VK_RETURN) != FALSE) && ok;
+        static bool logged = false;
+        if (!ok && !logged) {
+            writeLog("list: RegisterHotKey(navigation) failed: " + std::to_string(GetLastError()));
+            logged = true;
+        }
+    }
+    else {
+        for (int id : { HOTKEY_ID_NAV_UP, HOTKEY_ID_NAV_DOWN, HOTKEY_ID_NAV_ENTER, HOTKEY_ID_NAV_CTRL_ENTER })
+            UnregisterHotKey(g_hWnd, id);
+    }
+    g_navHotkeysRegistered = want;
 }
 
 // 一覧行の表示文字列が検索語を含むか（部分一致の AND 検索）
@@ -5792,6 +5837,7 @@ static void applySearchHits() {
 static void enterListInputMode(HWND hWnd) {
     SetWindowLongPtrW(hWnd, GWL_EXSTYLE, GetWindowLongPtrW(hWnd, GWL_EXSTYLE) & ~WS_EX_NOACTIVATE);
     g_listInputMode = true;
+    updateListNavHotkeys();  // 入力欄のキー（Enter・上下）を奪わないよう、キー操作のホットキーを外す
     forceForeground(hWnd);
 }
 
@@ -5804,6 +5850,7 @@ static void exitListInputMode() {
     }
     g_listInputMode   = false;
     g_listOutsideTicks = 0;
+    updateListNavHotkeys();  // 表示中なら非アクティブでもキー操作できるよう、ホットキーを戻す
 }
 
 // 後方定義の関数を一覧ウィンドウの WndProc から呼ぶための前方宣言
@@ -5859,6 +5906,98 @@ static void redrawIssueRow(size_t itemIndex) {
             return;
         }
     }
+}
+
+// ホット行（マウスとキー操作で共用する選択行）を変える
+// 変化した行だけ再描画してチラつきを抑える。（erase FALSE：行描画が背景ごと塗る）
+static void setListHotRow(int hit) {
+    if (hit == g_listHotRow) return;
+    const int prev = g_listHotRow;
+    g_listHotRow = hit;
+    if (!g_listWnd) return;
+    for (int i : { prev, hit }) {
+        if (i < 0 || i >= static_cast<int>(g_listLayout.size())) continue;
+        RECT rc = listRowRect(g_listWnd, g_listLayout[i]);
+        InvalidateRect(g_listWnd, &rc, FALSE);
+    }
+}
+
+// 検索語でキー操作の移動先を絞るか（検索欄の表示中で、語が 1 つ以上あるとき）
+static bool listSearchHasTerms() {
+    return g_searchActive && g_searchEdit && !trimRegisterText(getControlText(g_searchEdit)).empty();
+}
+
+// キー操作の移動先になる行か（チケット行だけ。filter のときは検索に一致した行だけ）
+static bool isListNavTarget(int layoutIndex, bool filter) {
+    const auto& row = g_listLayout[static_cast<size_t>(layoutIndex)];
+    if (row.kind != ListRowKind::Issue || row.index >= g_issueItems.size()) return false;
+    return !filter || g_issueItems[row.index].searchHit;
+}
+
+// ホット行を上下へ 1 つ移す（dir：-1 で上、+1 で下）
+// 現在のホット行から dir 方向で最初の移動先へ移る。ホット行が無ければ、下は先頭から、上は末尾から探す。
+// 端では止まり、反対側へは回らない。移動先が無ければ何もしない。
+static void moveListSelection(int dir) {
+    const bool filter = listSearchHasTerms();
+    const int n = static_cast<int>(g_listLayout.size());
+    int i = (g_listHotRow >= 0) ? g_listHotRow : (dir > 0 ? -1 : n);
+    for (i += dir; i >= 0 && i < n; i += dir) {
+        if (!isListNavTarget(i, filter)) continue;
+        setListHotRow(i);
+        g_listKeySelected = true;
+        return;
+    }
+}
+
+// 先頭の移動先を選ぶ（検索語を入力するたび。すぐ Enter で開けるようにする。移動先が無ければ選択を外す）
+static void selectFirstListTarget() {
+    const bool filter = listSearchHasTerms();
+    for (int i = 0; i < static_cast<int>(g_listLayout.size()); ++i) {
+        if (!isListNavTarget(i, filter)) continue;
+        setListHotRow(i);
+        g_listKeySelected = true;
+        return;
+    }
+    setListHotRow(-1);
+}
+
+// 一覧の行を開く（行の左クリックと、ホット行での Enter の共通経路）
+// チケット行はブラウザで開いて既読化し、フッタ・0 件行はクエリ画面を開く。
+// keepOpen（Ctrl 押下中）でなければ一覧を閉じる。（複数のチケットを続けて開くため Ctrl 押下中は残す。フッタ・0 件行も同じ）
+static void openListRow(int layoutIndex, bool keepOpen) {
+    if (layoutIndex < 0 || layoutIndex >= static_cast<int>(g_listLayout.size())) return;
+    const auto& row = g_listLayout[static_cast<size_t>(layoutIndex)];
+    if (row.kind == ListRowKind::Issue && row.index < g_issueItems.size()) {
+        // 参照はメッセージポンプ越しに持ち越さない。ShellExecuteW と markIssueRead は
+        // 内部でポンプを回し得るため、実行中に g_issueItems が差し替わると
+        // 参照が dangling になる。id と URL を値でコピーしてから呼ぶ。
+        const int          id  = g_issueItems[row.index].id;
+        const std::wstring url = g_issueItems[row.index].url;
+        // URL 検証を通った行だけ開いて既読化する（誤既読の防止。旧メニュー実装と同じ契約）
+        if (isHttpUrl(url)) {
+            ShellExecuteW(nullptr, L"open", url.c_str(),
+                          nullptr, nullptr, SW_SHOWNORMAL);
+            markIssueRead(id);
+            // 開いたままの一覧では当該行の未読表示をその場で外す。（ポンプ越しに
+            // g_issueItems が差し替わり得るため、添字でなく id で探し直す）
+            if (keepOpen) {
+                for (size_t i = 0; i < g_issueItems.size(); ++i) {
+                    if (g_issueItems[i].id != id) continue;
+                    g_issueItems[i].unread = false;
+                    redrawIssueRow(i);
+                    break;
+                }
+            }
+        }
+    }
+    else if (row.kind == ListRowKind::Footer || row.kind == ListRowKind::Empty) {
+        // フッタ・0 件行はクエリ画面を開く（既存の IDM_OPEN_QUERY 処理を共用）
+        handleTrayCommand(IDM_OPEN_QUERY);
+    }
+    else {
+        return;  // セパレータ・入力欄の行は開く対象ではない
+    }
+    if (!keepOpen && g_hWnd) hideListPopup(g_hWnd);
 }
 
 // フッタ・0 件行の描画（単色テキスト行。クリック可能なためホット時はハイライトする）
@@ -5929,12 +6068,14 @@ static void paintListWindow(HWND hWnd) {
 // キー入力を受けるのは登録欄のクリックか Ctrl+F で入った入力モードの間だけで、Tab・Enter・Esc は
 // メッセージループの IsDialogMessageW が WM_COMMAND（IDOK・IDCANCEL）へ変換する。
 // 説明欄では Enter は改行で、Ctrl+Enter が IDOK になる。（regDescSubclassProc）
-// 検索欄では Enter は何もしない。（検索の解除は Ctrl+F のトグル）
+// 検索欄では Enter はホット行を開き、登録はしない。（検索の解除は Ctrl+F のトグル）
 // Esc（IDCANCEL）はどの入力欄でも何もしない。（Esc を処理しない方針。入力モードでないときは届かず、
 // 効く場面と効かない場面が混ざるため。閉じるのは離脱・Alt+F4・アイコンのトグル・行クリック）
 // WM_CLOSE（入力モード中の Alt+F4）は破棄ではなく非表示で閉じる。（g_listWnd は使い回すため）
 // 行の左クリック＝チケットを開いて既読化して閉じる。フッタ・0 件行＝クエリ画面を開いて閉じる。
-// Ctrl+左クリックはどちらも閉じずに開く。（既読化した行はその場で再描画する）
+// Ctrl+左クリックはどちらも閉じずに開く。（既読化した行はその場で再描画する。openListRow）
+// ホット行はマウスとキー操作（上下キー）で共用し、Enter はホット行をクリックと同じく開く。
+// 検索欄での上下キーは searchEditSubclassProc、Enter は IDOK で受ける。それ以外の表示中はトレイ側の WM_HOTKEY で受ける。
 // 行の右クリック＝行メニュー（showRowContextMenu）を開き、一覧は開いたまま。
 // 離脱による自動クローズはトレイ側の IDT_LIST_WATCH が担い、ここでは扱わない。
 static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -5979,14 +6120,19 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     if (msg == WM_COMMAND) {
         const UINT id = LOWORD(wParam);
         if (id == IDOK) {  // 登録ボタン・Enter
-            // 検索欄の Enter も IsDialogMessageW が IDOK へ変換するため、フォーカスで除外する（検索欄の Enter で登録しない）
-            if (!(g_searchEdit && GetFocus() == g_searchEdit)) submitRegistration();
+            // 検索欄の Enter も IsDialogMessageW が IDOK へ変換するため、フォーカスで振り分ける。
+            // 検索欄ではホット行を開き（Ctrl+Enter は一覧を残す）、登録はしない。
+            if (g_searchEdit && GetFocus() == g_searchEdit) openListRow(g_listHotRow, GetKeyState(VK_CONTROL) < 0);
+            else submitRegistration();
             return 0;
         }
         if (id == IDCANCEL) return 0;  // Esc は処理しない（ウィンドウプロシージャのコメントを参照）
         if (id == IDC_SEARCH_EDIT && HIWORD(wParam) == EN_CHANGE) {
             // 入力のたびに一致を判定し直して全面を描き直す。（行数は変わらないため組み直さない）
+            // 先頭の一致行（語が無ければ先頭のチケット行）を選び、すぐ Enter で開けるようにする。
+            // 検索の解除と一覧のクローズで文字列を消したときは選ばない。（どちらも先に g_searchActive を落とす）
             applySearchHits();
+            if (g_searchActive) selectFirstListTarget();
             InvalidateRect(hWnd, nullptr, FALSE);
             return 0;
         }
@@ -6002,19 +6148,14 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         }
     }
     if (msg == WM_MOUSEMOVE) {
-        int hit = listRowHitTest(static_cast<short>(HIWORD(lParam)));
-        if (hit != g_listHotRow) {
-            // 変化した行だけ再描画してチラつきを抑える（erase FALSE：行描画が背景ごと塗る）
-            int prev = g_listHotRow;
-            g_listHotRow = hit;
-            if (prev >= 0 && prev < static_cast<int>(g_listLayout.size())) {
-                RECT rc = listRowRect(hWnd, g_listLayout[prev]);
-                InvalidateRect(hWnd, &rc, FALSE);
-            }
-            if (hit >= 0) {
-                RECT rc = listRowRect(hWnd, g_listLayout[hit]);
-                InvalidateRect(hWnd, &rc, FALSE);
-            }
+        // カーソルが実際に動いたときだけホット行を追従させる。（一覧の再配置でも移動なしの WM_MOUSEMOVE が
+        // 届き、カーソル下の行がキーで選んだ行を上書きしてしまうため）
+        POINT screen;
+        GetCursorPos(&screen);
+        if (screen.x != g_listLastMouse.x || screen.y != g_listLastMouse.y) {
+            g_listLastMouse = screen;
+            setListHotRow(listRowHitTest(static_cast<short>(HIWORD(lParam))));
+            g_listKeySelected = false;
         }
         // ウィンドウ外へ出たときのホット解除用（毎回の再登録は無害）
         TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hWnd, 0 };
@@ -6022,48 +6163,13 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
     }
     if (msg == WM_MOUSELEAVE) {
-        if (g_listHotRow >= 0 && g_listHotRow < static_cast<int>(g_listLayout.size())) {
-            RECT rc = listRowRect(hWnd, g_listLayout[g_listHotRow]);
-            g_listHotRow = -1;
-            InvalidateRect(hWnd, &rc, FALSE);
-        }
+        // キーで選んだ行はマウスが離れても残す（キー操作中にカーソルが一覧の外にあっても選択を保つ）
+        if (!g_listKeySelected) setListHotRow(-1);
         return 0;
     }
     if (msg == WM_LBUTTONUP) {
-        int hit = listRowHitTest(static_cast<short>(HIWORD(lParam)));
-        if (hit < 0) return 0;
-        // Ctrl 押下中のクリックは一覧を閉じない。（複数のチケットを続けて開くため。フッタ・0 件行も同じ）
-        const bool keepOpen = (wParam & MK_CONTROL) != 0;
-        const auto& row = g_listLayout[hit];
-        if (row.kind == ListRowKind::Issue && row.index < g_issueItems.size()) {
-            // 参照はメッセージポンプ越しに持ち越さない。ShellExecuteW と markIssueRead は
-            // 内部でポンプを回し得るため、実行中に g_issueItems が差し替わると
-            // 参照が dangling になる。id と URL を値でコピーしてから呼ぶ。
-            const int          id  = g_issueItems[row.index].id;
-            const std::wstring url = g_issueItems[row.index].url;
-            // URL 検証を通った行だけ開いて既読化する（誤既読の防止。旧メニュー実装と同じ契約）
-            if (isHttpUrl(url)) {
-                ShellExecuteW(nullptr, L"open", url.c_str(),
-                              nullptr, nullptr, SW_SHOWNORMAL);
-                markIssueRead(id);
-                // 開いたままの一覧では当該行の未読表示をその場で外す。（ポンプ越しに
-                // g_issueItems が差し替わり得るため、添字でなく id で探し直す）
-                if (keepOpen) {
-                    for (size_t i = 0; i < g_issueItems.size(); ++i) {
-                        if (g_issueItems[i].id != id) continue;
-                        g_issueItems[i].unread = false;
-                        redrawIssueRow(i);
-                        break;
-                    }
-                }
-            }
-        }
-        else {
-            // フッタ・0 件行はクエリ画面を開く（既存の IDM_OPEN_QUERY 処理を共用）
-            handleTrayCommand(IDM_OPEN_QUERY);
-        }
-        // チケットを開いたら一覧を閉じる。（Ctrl 押下中は続けて開けるよう残す）
-        if (!keepOpen && g_hWnd) hideListPopup(g_hWnd);
+        // Ctrl 押下中のクリックは一覧を閉じない。（openListRow を参照）
+        openListRow(listRowHitTest(static_cast<short>(HIWORD(lParam))), (wParam & MK_CONTROL) != 0);
         return 0;
     }
     if (msg == WM_RBUTTONUP) {
@@ -6148,6 +6254,21 @@ static void createRegisterControls(HWND parent, HINSTANCE hInst) {
     updateRegisterControls();
 }
 
+// 検索欄のキー処理（SetWindowSubclass）
+// 上下キーでホット行を移す。（入力モード中はキー操作のホットキーを外しているため、検索欄で受ける。
+// 1 行 Edit は上下キーを使わないため、横取りしても入力の操作は失われない）
+// Enter は IsDialogMessageW が IDOK へ変換し、listWndProc がホット行を開く。
+static constexpr UINT_PTR SEARCH_EDIT_SUBCLASS_ID = 1;
+static LRESULT CALLBACK searchEditSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                               UINT_PTR, DWORD_PTR) {
+    if (msg == WM_KEYDOWN && (wParam == VK_UP || wParam == VK_DOWN)) {
+        moveListSelection(wParam == VK_UP ? -1 : 1);
+        return 0;
+    }
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(hWnd, searchEditSubclassProc, SEARCH_EDIT_SUBCLASS_ID);
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+}
+
 // 検索欄（1 行 Edit）を生成する（初回の Ctrl+F で 1 回。失敗時は次の Ctrl+F で再試行する）
 // 表示・位置・大きさは showListPopup が g_searchActive に合わせて決める。
 static bool createSearchEdit(HWND parent) {
@@ -6161,6 +6282,8 @@ static bool createSearchEdit(HWND parent) {
     SendMessageW(g_searchEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_hMenuFont), FALSE);
     SendMessageW(g_searchEdit, EM_SETCUEBANNER, TRUE,
                  reinterpret_cast<LPARAM>(L"一覧に表示中の文字を検索（Ctrl+F で解除）"));
+    if (!SetWindowSubclass(g_searchEdit, searchEditSubclassProc, SEARCH_EDIT_SUBCLASS_ID, 0))
+        writeLog("list: SetWindowSubclass(search) failed");  // 検索欄での上下キー移動が効かないだけで検索はできる
     return true;
 }
 
@@ -6202,7 +6325,8 @@ static HWND ensureListWindow() {
 // 表示中は IDT_LIST_WATCH（トレイ側タイマー）が離脱を監視して閉じる。
 // refresh は表示中の一覧を最新の状態で組み直す指定だ。
 // 位置は新規表示時のカーソル座標を基準に同じ規則で求め直す。
-// 離脱監視の状態（猶予・タイマー）は引き継ぐ。ホット行は現在のカーソル位置から求め直す。
+// 離脱監視の状態（猶予・タイマー）は引き継ぐ。ホット行は、キーで選んだ行なら同じチケットの行へ移し
+// （一覧から消えたら選択を外す）、それ以外は現在のカーソル位置から求め直す。
 // 登録欄（登録先の確定時）は常に末尾の行で、作業領域による打ち切りでも必ず残す。
 // 検索欄（Ctrl+F で表示中のみ）は常に先頭の行に置き、一致した行の着色は組み直しのたびに判定し直す。
 // 子コントロールは組み直しのたびに置き直し、入力中の内容とフォーカスはそのまま保つ。
@@ -6239,6 +6363,13 @@ static void showListPopup(HWND trayWnd, bool refresh) {
         it.priorityHighlight = row.priorityHighlight;
         return it;
     };
+
+    // 組み直しでキーで選んだ行を引き継ぐため、そのチケット id を控える（0 = 引き継がない）
+    int keepSelectedId = 0;
+    if (refresh && g_listKeySelected && g_listHotRow >= 0 && g_listHotRow < static_cast<int>(g_listLayout.size())) {
+        const auto& hot = g_listLayout[static_cast<size_t>(g_listHotRow)];
+        if (hot.kind == ListRowKind::Issue && hot.index < g_issueItems.size()) keepSelectedId = g_issueItems[hot.index].id;
+    }
 
     g_issueItems.clear();
     g_listLayout.clear();
@@ -6470,9 +6601,23 @@ static void showListPopup(HWND trayWnd, bool refresh) {
                  SWP_NOACTIVATE | SWP_SHOWWINDOW | (refresh ? SWP_NOZORDER : 0));
     InvalidateRect(hWnd, nullptr, FALSE);
 
-    // 組み直しではホット行をカーソル位置から復元し、離脱監視は引き継ぐ。
+    // 組み直しではホット行を復元し、離脱監視は引き継ぐ。
     // （-1 のままだと次のマウス移動までハイライトが消え、猶予を戻すと離脱判定が遅れる）
+    // キーで選んだ行は同じチケットの行へ移す。（並びが変わっても選択を保つ。一覧から消えたら選択を外す）
+    // それ以外はカーソル位置の行にする。
     if (refresh) {
+        if (keepSelectedId != 0) {
+            for (size_t i = 0; i < g_listLayout.size(); ++i) {
+                const auto& row = g_listLayout[i];
+                if (row.kind == ListRowKind::Issue && row.index < g_issueItems.size()
+                    && g_issueItems[row.index].id == keepSelectedId) {
+                    g_listHotRow = static_cast<int>(i);
+                    break;
+                }
+            }
+            g_listKeySelected = (g_listHotRow >= 0);
+            return;
+        }
         POINT pt;
         GetCursorPos(&pt);
         ScreenToClient(hWnd, &pt);
@@ -6502,9 +6647,10 @@ static void showListPopup(HWND trayWnd, bool refresh) {
             logged = true;
         }
     }
+    updateListNavHotkeys();  // 上下キー・Enter のキー操作（updateListNavHotkeys を参照）
 }
 
-// 一覧ポップアップを閉じる（離脱・トグル・行クリックの共通経路）
+// 一覧ポップアップを閉じる（離脱・トグル・行クリック・Enter の共通経路）
 // カーソルがまだアイコン上にある閉じ操作では、ホバー再表示を抑止する
 // （g_hoverSuppressed。NIN_POPUPCLOSE で解除）。閉じた直後の微動で NIN_POPUPOPEN が
 // 再送されても開き直さないための備えだ。（再送条件は文書化されていない）
@@ -6514,6 +6660,8 @@ static void hideListPopup(HWND trayWnd) {
     if (g_listInputMode) exitListInputMode();
     if (g_listWnd) ShowWindow(g_listWnd, SW_HIDE);
     UnregisterHotKey(trayWnd, HOTKEY_ID_SEARCH);
+    updateListNavHotkeys();  // 非表示になったため、キー操作のホットキーも外れる
+    g_listKeySelected = false;
     g_searchActive = false;
     if (g_searchEdit) {
         ShowWindow(g_searchEdit, SW_HIDE);
@@ -6989,6 +7137,7 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
     // 前面化で奪うフォアグラウンドを閉じた後に返すため、元の窓を控える
     const HWND prevFg = GetForegroundWindow();
     g_rowMenuOpen = true;
+    updateListNavHotkeys();  // メニューの上下キー・Enter とコメント欄の Enter を奪わないよう外す
     forceForeground(g_hWnd);
     const UINT cmd = static_cast<UINT>(TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
                                                       screenPt.x, screenPt.y, 0, g_hWnd, nullptr));
@@ -7037,6 +7186,7 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
     }
 
     g_rowMenuOpen = false;
+    updateListNavHotkeys();
     g_listOutsideTicks = 0;
     // フォアグラウンドを返す。（一覧はフォーカスを奪わない設計のため、前面化はメニューの間だけに留める）
     // メニュー外で他アプリをクリックして閉じた場合は、利用者の切り替えを尊重して何もしない。
@@ -7194,6 +7344,16 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         // 一覧の表示中だけ登録している Ctrl+F。行メニュー・終了の確認ダイアログの表示中は、
         // モーダルループ越しに一覧を前面化するとメニューやダイアログを覆うため無視する。
         if (isListPopupVisible() && !g_rowMenuOpen) toggleListSearch(hWnd);
+        return 0;
+    }
+    if (msg == WM_HOTKEY && (wParam == HOTKEY_ID_NAV_UP || wParam == HOTKEY_ID_NAV_DOWN
+                             || wParam == HOTKEY_ID_NAV_ENTER || wParam == HOTKEY_ID_NAV_CTRL_ENTER)) {
+        // 一覧の表示中（入力モード以外）だけ登録している上下キー・Enter。（updateListNavHotkeys）
+        // 登録を外す直前にキューへ入った分が後から届き得るため、登録条件を満たすときだけ処理する。
+        if (!g_navHotkeysRegistered) return 0;
+        if (wParam == HOTKEY_ID_NAV_UP)        moveListSelection(-1);
+        else if (wParam == HOTKEY_ID_NAV_DOWN) moveListSelection(1);
+        else openListRow(g_listHotRow, wParam == HOTKEY_ID_NAV_CTRL_ENTER);
         return 0;
     }
     if (msg == WM_TIMER && wParam == IDT_HOVER_TRIGGER) {

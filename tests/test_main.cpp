@@ -1279,6 +1279,55 @@ static void testIssueLabelMatches() {
     CHECK(!issueLabelMatches(L"#1234 abc", L"'"));
 }
 
+// ==================== moveListSelection / isListNavTarget ====================
+
+static void testListNavigation() {
+    // チケット行 3 つ（2 番目だけ検索一致）とセパレータ・フッタの一覧（窓が無いため setListHotRow は再描画しない）
+    g_issueItems.assign(3, IssueItem{});
+    g_issueItems[1].searchHit = true;
+    g_listLayout = {
+        { ListRowKind::Issue, 0, 10, 0 },
+        { ListRowKind::Issue, 10, 10, 1 },
+        { ListRowKind::Issue, 20, 10, 2 },
+        { ListRowKind::Separator, 30, 9, 0 },
+        { ListRowKind::Footer, 39, 10, 0 },
+    };
+
+    // 移動先はチケット行だけで、filter のときは一致行だけ
+    CHECK(isListNavTarget(0, false));
+    CHECK(!isListNavTarget(0, true));
+    CHECK(isListNavTarget(1, true));
+    CHECK(!isListNavTarget(4, false));  // フッタは対象外
+
+    // 選択なしからの下は先頭、端では止まる（フッタへは進まない）
+    g_listHotRow = -1;
+    moveListSelection(1);
+    CHECK(g_listHotRow == 0);
+    CHECK(g_listKeySelected);
+    moveListSelection(1);
+    moveListSelection(1);
+    moveListSelection(1);
+    CHECK(g_listHotRow == 2);
+    // 上は端の先頭で止まる
+    moveListSelection(-1);
+    moveListSelection(-1);
+    moveListSelection(-1);
+    CHECK(g_listHotRow == 0);
+    // 選択なしからの上は末尾のチケット行
+    g_listHotRow = -1;
+    moveListSelection(-1);
+    CHECK(g_listHotRow == 2);
+    // マウスでフッタがホット行のときの上は、その直前のチケット行
+    g_listHotRow = 4;
+    moveListSelection(-1);
+    CHECK(g_listHotRow == 2);
+
+    g_issueItems.clear();
+    g_listLayout.clear();
+    g_listHotRow = -1;
+    g_listKeySelected = false;
+}
+
 // テストの列挙実行と集計出力（失敗ありなら終了コード 1）
 int main() {
     // 失敗診断は日本語（UTF-8）を含むため、コンソールの出力コードページを合わせる
@@ -1321,6 +1370,7 @@ int main() {
     testBuildMarkdownLink();
     testRegisterProjectFromLogin();
     testIssueLabelMatches();
+    testListNavigation();
     printf("checks: %d, failed: %d\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }
