@@ -518,7 +518,7 @@ struct Config {
     // バージョン欄判定情報（トラッカー定義・プロジェクトのバージョン定義）の再取得間隔（時間）
     // 超過していたら次のポーリングで直ちに再取得する。デフォルト 24。（1〜168）
     int versionMetaRefreshHours;
-    // 一覧の ✨ を付ける期間（起票からの時間。0〜720、0 で付けない、デフォルト 24）
+    // 一覧の ✨ と 🆙 を付ける期間（✨ は起票から、🆙 は他人の最後の主要変更からの時間。0〜720、0 でどちらも付けない、デフォルト 24）
     int newMarkHours;
     // ホバーで一覧を表示するまでの遅延（ms、0〜5000、0 で即時、デフォルト 100）
     long long hoverDelayMs;
@@ -1803,7 +1803,7 @@ static Config loadConfig(const std::wstring& exeDir) {
     // バージョン欄判定情報の再取得間隔（時間）
     cfg.versionMetaRefreshHours = readAppInt("version_meta_refresh_hours", 24, 1, 168);
 
-    // 一覧の ✨ を付ける期間（起票からの時間）
+    // 一覧の ✨ と 🆙 を付ける期間（✨ は起票から、🆙 は他人の最後の主要変更からの時間）
     cfg.newMarkHours = readAppInt("new_mark_hours", 24, 0, 720);
 
     // hover_delay_ms（OS のホバー検出から一覧を表示するまでの追加遅延、ms 単位。
