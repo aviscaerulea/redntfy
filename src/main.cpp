@@ -4055,6 +4055,11 @@ static constexpr COLORREF PRIORITY_ROW_TINT        = RGB(255, 0, 0);
 static constexpr int      PRIORITY_ROW_TINT_TOP    = 25;
 static constexpr int      PRIORITY_ROW_TINT_SECOND = 12;
 
+// 検索に一致した行の背景に混ぜる色と混色率（%）。優先度の薄赤と見分けるため黄色にする。
+// 作り方は高優先度行と同じく COLOR_MENU への混色。（テーマの背景明度に追随させる）
+static constexpr COLORREF SEARCH_ROW_TINT     = RGB(255, 215, 0);
+static constexpr int      SEARCH_ROW_TINT_PCT = 40;
+
 // ラベル内で文字色、ウェイト、サイズを変える範囲、または描かない範囲（オフセットと長さは UTF-16 コードユニット単位）
 // bold と keepColor を組み合わせて「色は据え置き、ウェイトだけ変える」ような部分強調にも使える。
 struct ColorRange {
@@ -4080,6 +4085,7 @@ struct IssueItem {
     bool         hidden = false; // 非表示（グレー＋取消線描画の条件。行メニューでの遷移時にもその場で更新する）
     bool         closed = false; // クローズ済（打ち消し線の描画条件）
     PriorityHighlight priorityHighlight = PriorityHighlight::None;  // 行背景の強調段階（非表示・クローズ済み・hot の行では描画側が無視する）
+    bool         searchHit = false;  // 検索欄の文字列を label に含む（行背景の検索色の条件。applySearchHits が更新する）
 };
 static std::vector<IssueItem> g_issueItems;
 
@@ -5066,21 +5072,26 @@ static bool issueRowBold(const IssueItem& item) {
 }
 
 // 一覧行の背景色
-// hot はハイライト色を優先する。非表示行とクローズ済み行は対応不要の行のため強調しない。
+// 優先順は hot（ハイライト色）→ 検索一致 → 高優先度の強調。
+// 検索一致は探している行を示すため、非表示行・クローズ済み行でも着色する。
+// 高優先度の強調は、非表示行とクローズ済み行が対応不要の行のため付けない。
 static COLORREF issueRowBackground(const IssueItem& item, bool hot) {
     if (hot) return GetSysColor(COLOR_HIGHLIGHT);
     const COLORREF menu = GetSysColor(COLOR_MENU);
+    auto tint = [menu](COLORREF color, int pct) {
+        auto mix = [pct](int base, int c) { return (base * (100 - pct) + c * pct) / 100; };
+        return RGB(mix(GetRValue(menu), GetRValue(color)),
+                   mix(GetGValue(menu), GetGValue(color)),
+                   mix(GetBValue(menu), GetBValue(color)));
+    };
+    if (item.searchHit) return tint(SEARCH_ROW_TINT, SEARCH_ROW_TINT_PCT);
     if (item.hidden || item.closed) return menu;
-    int pct = 0;
     switch (item.priorityHighlight) {
-        case PriorityHighlight::Top:    pct = PRIORITY_ROW_TINT_TOP;    break;
-        case PriorityHighlight::Second: pct = PRIORITY_ROW_TINT_SECOND; break;
-        case PriorityHighlight::None:   return menu;
+        case PriorityHighlight::Top:    return tint(PRIORITY_ROW_TINT, PRIORITY_ROW_TINT_TOP);
+        case PriorityHighlight::Second: return tint(PRIORITY_ROW_TINT, PRIORITY_ROW_TINT_SECOND);
+        case PriorityHighlight::None:   break;
     }
-    auto mix = [pct](int base, int tint) { return (base * (100 - pct) + tint * pct) / 100; };
-    return RGB(mix(GetRValue(menu), GetRValue(PRIORITY_ROW_TINT)),
-               mix(GetGValue(menu), GetGValue(PRIORITY_ROW_TINT)),
-               mix(GetBValue(menu), GetBValue(PRIORITY_ROW_TINT)));
+    return menu;
 }
 
 // 一覧行のラベルに使うフォントの組を返す
@@ -5677,11 +5688,13 @@ static void startIssueUpdate(int issueId, const std::string& body, int expectSta
 // 行の右クリックメニューだけは TrackPopupMenu を使い、表示中は離脱監視を止める。（showRowContextMenu）
 // 例外は末尾の登録欄（登録先の確定時のみ）で、登録欄のクリックでだけ
 // WS_EX_NOACTIVATE を外して一覧をアクティブ化し、キー入力を受ける。（入力モード）
+// もう 1 つの例外は表示中の Ctrl+F で、先頭に検索欄を出して同じく入力モードへ入る。（toggleListSearch）
 // 入力モード中は離脱で閉じず、他アプリへの切り替えで入力モードだけ抜ける。
 // 開く：ホバー（OS の NIN_POPUPOPEN 通知から hover_delay_ms 後）または
 // アイコン左クリック（NIN_SELECT、即時）。
 // 閉じる：アイコンとポップアップ両方からの離脱（IDT_LIST_WATCH が監視。入力モード中は除く）・
-// アイコン左クリックのトグル・行クリックでチケットを開いたとき（Ctrl 押下中を除く）・入力モード中の Esc と Alt+F4。
+// アイコン左クリックのトグル・行クリックでチケットを開いたとき（Ctrl 押下中を除く）・
+// 入力モード中の Alt+F4。（Esc は処理しない）
 // 起点によらず同一ルール。
 // 唯一の例外として、ホバー自動表示から hover_click_guard_ms 以内のアイコン左クリックは
 // 無視する。（詳細は handleTrayLeftClick を参照）
@@ -5700,8 +5713,8 @@ static constexpr DWORD LIST_WND_STYLE   = WS_POPUP | WS_BORDER | WS_CLIPCHILDREN
 static constexpr DWORD LIST_WND_EXSTYLE = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
 
 // 一覧の行種別と配置（クライアント座標）。表示のたびに構築する
-// Register は末尾の登録欄。（描画とクリックは子コントロールが担い、行としてはヒットしない）
-enum class ListRowKind { Issue, Separator, Footer, Empty, Register };
+// Register は末尾の登録欄、Search は先頭の検索欄。（どちらも描画とクリックは子コントロールが担い、行としてはヒットしない）
+enum class ListRowKind { Issue, Separator, Footer, Empty, Register, Search };
 struct ListRowLayout {
     ListRowKind kind;
     int         top;
@@ -5715,18 +5728,65 @@ static int g_listHotRow = -1;                    // ホット行（g_listLayout 
 static POINT g_listAnchor = {};                  // 表示位置の基準（新規表示時のカーソル座標。組み直しで再利用）
 static bool  g_listInOverflow = false;           // 新規表示時にアイコンがフライアウト内にあったか（組み直しで再利用）
 static RECT  g_listOverflowRect = {};            // そのときのフライアウト矩形
-static bool  g_listInputMode = false;            // 入力モード（登録欄のクリックで一覧をアクティブ化している間）
+static bool  g_listInputMode = false;            // 入力モード（登録欄・検索欄のクリックか Ctrl+F で一覧をアクティブ化している間）
 // 行の右クリックメニュー（と終了の確認ダイアログ）の表示中
 // モーダルループ中も IDT_LIST_WATCH は配送され、カーソルがメニュー上（一覧の矩形外）にあると
 // 離脱と数えて一覧を閉じてしまうため、この間は離脱監視を止める。
 static bool  g_rowMenuOpen = false;
+
+// 一覧の検索（Ctrl+F）
+// 一覧は非アクティブでキーが届かないため、Ctrl+F は表示中だけトレイウィンドウのホットキーとして登録する。
+// （表示中は前面アプリの Ctrl+F より優先する。登録は showListPopup の新規表示時、解除は hideListPopup）
+static constexpr int HOTKEY_ID_SEARCH = 1;
+static constexpr int IDC_SEARCH_EDIT  = 106;
+// 検索欄の最小幅（px。0 件表示など一覧が狭いときに入力欄が潰れないようにする）
+static constexpr int SEARCH_EDIT_MIN_WIDTH = 240;
+static HWND g_searchEdit   = nullptr;  // 検索欄（初回の Ctrl+F で生成し、以降は使い回す。未生成なら nullptr）
+static bool g_searchActive = false;    // 検索欄を表示中（Ctrl+F のトグルで切り替え、一覧のクローズで false）
+// 検索の解除（Ctrl+F）でフォアグラウンドを返す先（検索を開いた Ctrl+F の時点の前面窓）
+// nullptr は開いた時点で入力モードだったことを示し、解除後も入力モードに留まる。
+static HWND g_searchReturnFg = nullptr;
 
 // 一覧ポップアップが画面に出ているか（ウィンドウ未生成は非表示扱い）
 static bool isListPopupVisible() {
     return g_listWnd && IsWindowVisible(g_listWnd);
 }
 
-// 入力モードへ入る（登録欄のクリック時）
+// 一覧行の表示文字列が検索語を含むか（部分一致の AND 検索）
+// 検索語は空白（半角・全角・タブ）で区切った語ごとに部分一致を調べ、すべての語を含む行だけ true を返す。
+// （「山田 設定」は「山田」と「設定」の両方を含む行に一致する。語の順序は問わない）
+// 大文字小文字・全角半角・ひらがなカタカナを区別しない。（「abc」で「ＡＢＣ」、「けんさく」で「ケンサク」にも一致する）
+// 語が 1 つも無い（空・空白だけ）なら常に false を返す。（空欄で全行を着色しない）
+// ロケールは不変ロケールに固定し、利用者の地域設定で結果を変えない。
+static bool issueLabelMatches(const std::wstring& label, const std::wstring& query) {
+    static constexpr wchar_t SEPARATORS[] = L" \t　";
+    if (label.empty()) return false;
+    bool anyTerm = false;
+    size_t pos = query.find_first_not_of(SEPARATORS);
+    while (pos != std::wstring::npos) {
+        const size_t end = query.find_first_of(SEPARATORS, pos);
+        const size_t len = (end == std::wstring::npos ? query.size() : end) - pos;
+        if (FindNLSStringEx(LOCALE_NAME_INVARIANT,
+                            FIND_FROMSTART | NORM_IGNORECASE | NORM_IGNOREWIDTH | NORM_IGNOREKANATYPE,
+                            label.c_str(), static_cast<int>(label.size()),
+                            query.c_str() + pos, static_cast<int>(len),
+                            nullptr, nullptr, nullptr, 0) < 0) {
+            return false;
+        }
+        anyTerm = true;
+        pos = (end == std::wstring::npos) ? end : query.find_first_not_of(SEPARATORS, end);
+    }
+    return anyTerm;
+}
+
+// 一覧の全行の検索一致を、検索欄の文字列で判定し直す（検索欄の非表示中はすべて外す）
+// 判定するのは一覧に出ている行だけだ。（list_limit などで一覧から外れたチケットは対象外）
+static void applySearchHits() {
+    const std::wstring query = (g_searchActive && g_searchEdit) ? getControlText(g_searchEdit) : std::wstring{};
+    for (auto& it : g_issueItems) it.searchHit = issueLabelMatches(it.label, query);
+}
+
+// 入力モードへ入る（登録欄・検索欄のクリック時と、Ctrl+F で検索を開くとき）
 // WS_EX_NOACTIVATE を外してから前面化し、一覧をアクティブにしてキー入力を受けられるようにする。
 // 前面化は既存の forceForeground を使う。（クリック直後でも確実に権限を得るため）
 static void enterListInputMode(HWND hWnd) {
@@ -5751,24 +5811,26 @@ static void markIssueRead(int issueId);
 static void handleTrayCommand(UINT id);
 static void showRowContextMenu(int issueId, POINT screenPt);
 
-// クライアント座標 y の行ヒットテスト（セパレータと登録欄は対象外）。ヒットなしは -1
-// 登録欄の行背景のクリックでホット表示やクエリ画面遷移を起こさないため、登録欄も除く。
+// クライアント座標 y の行ヒットテスト（セパレータ・登録欄・検索欄は対象外）。ヒットなしは -1
+// 登録欄・検索欄の行背景のクリックでホット表示やクエリ画面遷移を起こさないため、入力欄の行も除く。
 static int listRowHitTest(int y) {
     for (size_t i = 0; i < g_listLayout.size(); ++i) {
         const auto& row = g_listLayout[i];
-        if (row.kind == ListRowKind::Separator || row.kind == ListRowKind::Register) continue;
+        if (row.kind == ListRowKind::Separator || row.kind == ListRowKind::Register
+            || row.kind == ListRowKind::Search) continue;
         if (y >= row.top && y < row.top + row.height) return static_cast<int>(i);
     }
     return -1;
 }
 
-// カーソルが登録欄の行（子コントロール上を含む）にあるか
-static bool cursorOnRegisterRow(HWND hWnd) {
+// カーソルが入力欄の行（登録欄・検索欄。子コントロール上を含む）にあるか
+static bool cursorOnInputRow(HWND hWnd) {
     POINT pt;
     GetCursorPos(&pt);
     ScreenToClient(hWnd, &pt);
     for (const auto& row : g_listLayout) {
-        if (row.kind == ListRowKind::Register && pt.y >= row.top && pt.y < row.top + row.height)
+        if ((row.kind == ListRowKind::Register || row.kind == ListRowKind::Search)
+            && pt.y >= row.top && pt.y < row.top + row.height)
             return true;
     }
     return false;
@@ -5851,6 +5913,7 @@ static void paintListWindow(HWND hWnd) {
             drawTextRow(hMem, rc, NO_ISSUES, hot);
             break;
         case ListRowKind::Register:
+        case ListRowKind::Search:
             break;  // 背景は全面塗りつぶし済み。子コントロールは自分で描く
         }
     }
@@ -5863,9 +5926,12 @@ static void paintListWindow(HWND hWnd) {
 
 // 一覧ポップアップのウィンドウプロシージャ
 // 通常は非アクティブ（WS_EX_NOACTIVATE + MA_NOACTIVATE）のためキー入力は届かない。
-// キー入力を受けるのは登録欄のクリックで入った入力モードの間だけで、Tab・Enter・Esc は
+// キー入力を受けるのは登録欄のクリックか Ctrl+F で入った入力モードの間だけで、Tab・Enter・Esc は
 // メッセージループの IsDialogMessageW が WM_COMMAND（IDOK・IDCANCEL）へ変換する。
 // 説明欄では Enter は改行で、Ctrl+Enter が IDOK になる。（regDescSubclassProc）
+// 検索欄では Enter は何もしない。（検索の解除は Ctrl+F のトグル）
+// Esc（IDCANCEL）はどの入力欄でも何もしない。（Esc を処理しない方針。入力モードでないときは届かず、
+// 効く場面と効かない場面が混ざるため。閉じるのは離脱・Alt+F4・アイコンのトグル・行クリック）
 // WM_CLOSE（入力モード中の Alt+F4）は破棄ではなく非表示で閉じる。（g_listWnd は使い回すため）
 // 行の左クリック＝チケットを開いて既読化して閉じる。フッタ・0 件行＝クエリ画面を開いて閉じる。
 // Ctrl+左クリックはどちらも閉じずに開く。（既読化した行はその場で再描画する）
@@ -5877,15 +5943,20 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
     }
     if (msg == WM_MOUSEACTIVATE) {
-        // 登録欄の行（子コントロール上を含む）のクリックでだけ入力モードへ入り、アクティブ化する。
+        // 入力欄の行（登録欄・検索欄。子コントロール上を含む）のクリックでだけ入力モードへ入り、アクティブ化する。
+        // （検索欄のクリックは、他アプリへの切り替えで入力モードを抜けた後に入力を再開する経路）
         // それ以外はアクティブ化しない（WS_EX_NOACTIVATE の補強。フォーカス非奪取の要）
-        if (!g_listInputMode && g_regEdit && cursorOnRegisterRow(hWnd)) enterListInputMode(hWnd);
+        if (!g_listInputMode && cursorOnInputRow(hWnd)) enterListInputMode(hWnd);
         return g_listInputMode ? MA_ACTIVATE : MA_NOACTIVATE;
     }
-    if (msg == WM_SETFOCUS && g_regEdit) {
-        // アクティブ化時に一覧自体へ来たフォーカスを件名欄へ渡す。（子のクリックなら続けて子へ移る）
-        SetFocus(g_regEdit);
-        return 0;
+    if (msg == WM_SETFOCUS) {
+        // アクティブ化時に一覧自体へ来たフォーカスを入力欄へ渡す。（子のクリックなら続けて子へ移る）
+        // 検索欄の表示中は検索欄、それ以外は件名欄へ渡す。
+        HWND target = g_searchActive ? g_searchEdit : g_regEdit;
+        if (target) {
+            SetFocus(target);
+            return 0;
+        }
     }
     if (msg == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE && g_listInputMode) {
         // 他アプリへ切り替わったら入力モードだけ抜け、以後は離脱監視に閉じる判断を任せる。
@@ -5899,7 +5970,7 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
     }
     if (msg == WM_CLOSE) {
-        // Alt+F4（入力モード中はアクティブなため届く）は Esc と同じく非表示で閉じる。
+        // Alt+F4（入力モード中はアクティブなため届く）は非表示で閉じる。
         // DefWindowProcW に落とすと DestroyWindow され、使い回している g_listWnd と
         // 登録欄の子コントロールのハンドルが失効して再起動まで一覧を開けなくなる
         if (g_hWnd) hideListPopup(g_hWnd);
@@ -5908,11 +5979,15 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     if (msg == WM_COMMAND) {
         const UINT id = LOWORD(wParam);
         if (id == IDOK) {  // 登録ボタン・Enter
-            submitRegistration();
+            // 検索欄の Enter も IsDialogMessageW が IDOK へ変換するため、フォーカスで除外する（検索欄の Enter で登録しない）
+            if (!(g_searchEdit && GetFocus() == g_searchEdit)) submitRegistration();
             return 0;
         }
-        if (id == IDCANCEL) {  // Esc
-            if (g_hWnd) hideListPopup(g_hWnd);
+        if (id == IDCANCEL) return 0;  // Esc は処理しない（ウィンドウプロシージャのコメントを参照）
+        if (id == IDC_SEARCH_EDIT && HIWORD(wParam) == EN_CHANGE) {
+            // 入力のたびに一致を判定し直して全面を描き直す。（行数は変わらないため組み直さない）
+            applySearchHits();
+            InvalidateRect(hWnd, nullptr, FALSE);
             return 0;
         }
         if (id == IDC_REG_EDIT && HIWORD(wParam) == EN_CHANGE) {
@@ -6073,6 +6148,22 @@ static void createRegisterControls(HWND parent, HINSTANCE hInst) {
     updateRegisterControls();
 }
 
+// 検索欄（1 行 Edit）を生成する（初回の Ctrl+F で 1 回。失敗時は次の Ctrl+F で再試行する）
+// 表示・位置・大きさは showListPopup が g_searchActive に合わせて決める。
+static bool createSearchEdit(HWND parent) {
+    g_searchEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL,
+        0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SEARCH_EDIT)),
+        GetModuleHandleW(nullptr), nullptr);
+    if (!g_searchEdit) {
+        writeLog("list: search edit creation failed: " + std::to_string(GetLastError()));
+        return false;
+    }
+    SendMessageW(g_searchEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_hMenuFont), FALSE);
+    SendMessageW(g_searchEdit, EM_SETCUEBANNER, TRUE,
+                 reinterpret_cast<LPARAM>(L"一覧に表示中の文字を検索（Ctrl+F で解除）"));
+    return true;
+}
+
 // 一覧ポップアップウィンドウの生成（初回のみ。以降は表示/非表示で使い回す）
 // WS_EX_NOACTIVATE：表示・クリックでもフォアグラウンドを奪わない（本ウィンドウの核。入力モード中は外す）
 // WS_EX_TOOLWINDOW：タスクバー・Alt+Tab に出さない
@@ -6113,7 +6204,9 @@ static HWND ensureListWindow() {
 // 位置は新規表示時のカーソル座標を基準に同じ規則で求め直す。
 // 離脱監視の状態（猶予・タイマー）は引き継ぐ。ホット行は現在のカーソル位置から求め直す。
 // 登録欄（登録先の確定時）は常に末尾の行で、作業領域による打ち切りでも必ず残す。
+// 検索欄（Ctrl+F で表示中のみ）は常に先頭の行に置き、一致した行の着色は組み直しのたびに判定し直す。
 // 子コントロールは組み直しのたびに置き直し、入力中の内容とフォーカスはそのまま保つ。
+// 新規表示では検索の Ctrl+F をホットキー登録する。（解除は hideListPopup）
 // 組み直しでは Z 順を変えない。（最前面へ上げ直すと、表示中の行メニュー・終了の確認ダイアログを一覧が覆うため）
 static void showListPopup(HWND trayWnd, bool refresh) {
     HWND hWnd = ensureListWindow();
@@ -6237,9 +6330,20 @@ static void showListPopup(HWND trayWnd, bool refresh) {
     // 登録欄とその上のセパレータの高さ（無効時は 0）
     const int  regTailH   = regEnabled ? 9 + regRowH : 0;
 
+    // 検索欄は先頭に置く。（画面下のタスクバーでは一覧が上へ伸びるため、出し入れしても既存の行の位置が変わらない）
+    // 高さは登録欄のコントロール行と揃える。先に積むため、チケット行の打ち切り判定にも含まれる
+    const bool searchShown = g_searchActive && g_searchEdit;
+    int searchTop = 0;
+    if (searchShown) {
+        searchTop = y;
+        pushRow(ListRowKind::Search, regCtrlH + 2 * REG_PAD, 0);
+        pushRow(ListRowKind::Separator, 9, 0);
+        width = (std::max)(width, SEARCH_EDIT_MIN_WIDTH + 2 * REG_PAD);
+    }
+
     if (rows.empty()) {
         g_listFooterText.clear();
-        width = textRowWidth(NO_ISSUES);
+        width = (std::max)(width, textRowWidth(NO_ISSUES));
         pushRow(ListRowKind::Empty, textRowHeight, 0);
     }
     else {
@@ -6269,6 +6373,7 @@ static void showListPopup(HWND trayWnd, bool refresh) {
         pushRow(ListRowKind::Separator, 9, 0);  // メニューのセパレータ相当（余白込み）
         pushRow(ListRowKind::Footer, textRowHeight, 0);
     }
+    applySearchHits();
     int regTop = 0;
     if (regEnabled) {
         width = (std::max)(width, regMinW);
@@ -6305,6 +6410,14 @@ static void showListPopup(HWND trayWnd, bool refresh) {
             resetRegisterDate();
             resetRegisterPriority();
         }
+    }
+    // 検索欄は全幅に広げる。（非表示中は隠すだけで、文字列は閉じる経路が消す）
+    if (g_searchEdit) {
+        if (searchShown) {
+            SetWindowPos(g_searchEdit, nullptr, REG_PAD, searchTop + REG_PAD, width - 2 * REG_PAD, regCtrlH,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        ShowWindow(g_searchEdit, searchShown ? SW_SHOWNA : SW_HIDE);
     }
 
     // クライアントサイズ → ウィンドウサイズ（WS_BORDER の枠分を上乗せ）
@@ -6378,6 +6491,16 @@ static void showListPopup(HWND trayWnd, bool refresh) {
         writeLog("list: SetTimer(IDT_LIST_WATCH) failed");
         ShowWindow(hWnd, SW_HIDE);
         g_popupShowing.store(false);
+        return;
+    }
+    // 検索の Ctrl+F を表示中だけ登録する。他アプリが登録済みなら失敗し、検索できないだけで一覧は使える。
+    // （ホバー表示のたびに失敗を書くとログが埋まるため、失敗のログは起動後の初回だけにする）
+    if (!RegisterHotKey(trayWnd, HOTKEY_ID_SEARCH, MOD_CONTROL | MOD_NOREPEAT, 'F')) {
+        static bool logged = false;
+        if (!logged) {
+            writeLog("list: RegisterHotKey(Ctrl+F) failed: " + std::to_string(GetLastError()));
+            logged = true;
+        }
     }
 }
 
@@ -6385,10 +6508,17 @@ static void showListPopup(HWND trayWnd, bool refresh) {
 // カーソルがまだアイコン上にある閉じ操作では、ホバー再表示を抑止する
 // （g_hoverSuppressed。NIN_POPUPCLOSE で解除）。閉じた直後の微動で NIN_POPUPOPEN が
 // 再送されても開き直さないための備えだ。（再送条件は文書化されていない）
-// 入力モードは非表示化より先に抜ける。（非表示化で届く WM_ACTIVATE の再入を避ける。入力内容は保持する）
+// 入力モードは非表示化より先に抜ける。（非表示化で届く WM_ACTIVATE の再入を避ける。登録欄の入力内容は保持する）
+// 検索は解除して検索語も消す。（次に開いたときに前回の着色を残さない）
 static void hideListPopup(HWND trayWnd) {
     if (g_listInputMode) exitListInputMode();
     if (g_listWnd) ShowWindow(g_listWnd, SW_HIDE);
+    UnregisterHotKey(trayWnd, HOTKEY_ID_SEARCH);
+    g_searchActive = false;
+    if (g_searchEdit) {
+        ShowWindow(g_searchEdit, SW_HIDE);
+        SetWindowTextW(g_searchEdit, L"");
+    }
     g_popupShowing.store(false);
     g_listHotRow = -1;
     // ホバー起点の記録を破棄する。（クリック猶予は表示中の一覧にだけ効かせる。
@@ -6398,6 +6528,48 @@ static void hideListPopup(HWND trayWnd) {
     KillTimer(trayWnd, IDT_LIST_WATCH);
     // バッジ（未読の有無）を最新化する
     updateTrayTooltip(trayWnd);
+}
+
+// 一覧の検索を開始する（検索欄の非表示中の Ctrl+F）
+// 先頭に検索欄を出し、入力モードへ入って検索欄へフォーカスを渡す。
+// 入力モードでなかったときは、その時点の前面窓を解除時に返す先として控える。
+// 入力モード（登録欄の入力中）から開いたときは控えず、解除後も入力モードに留める。
+static void openListSearch(HWND trayWnd) {
+    if (!g_searchEdit && !createSearchEdit(g_listWnd)) return;
+    g_searchReturnFg = g_listInputMode ? nullptr : GetForegroundWindow();
+    g_searchActive = true;
+    showListPopup(trayWnd, true);  // 検索欄の行を足して組み直す
+    if (!g_listInputMode) enterListInputMode(g_listWnd);
+    SetFocus(g_searchEdit);
+}
+
+// 一覧の検索を解除する（検索欄の表示中の Ctrl+F）
+// 検索欄と着色を消して一覧は残す。入力モード中なら、Ctrl+F の時点の前面窓が他スレッドの窓のときは
+// 入力モードを抜けてそこへフォアグラウンドを返す。（ホバー表示中の Ctrl+F で奪ったフォーカスを戻し、
+// 離脱監視に閉じる判断を任せる）それ以外は入力モードに留め、件名欄（無ければ一覧自体）へフォーカスを渡す。
+// 入力モードでないとき（他アプリへの切り替えで抜けた後）はフォーカスに触れない。（利用者の切り替えを尊重する）
+static void closeListSearch(HWND trayWnd) {
+    g_searchActive = false;
+    SetWindowTextW(g_searchEdit, L"");
+    const HWND back = g_searchReturnFg;
+    g_searchReturnFg = nullptr;
+    if (g_listInputMode) {
+        if (back && IsWindow(back) && GetWindowThreadProcessId(back, nullptr) != GetCurrentThreadId()) {
+            exitListInputMode();
+            SetForegroundWindow(back);
+        }
+        else {
+            SetFocus(g_regEdit ? g_regEdit : g_listWnd);
+        }
+    }
+    showListPopup(trayWnd, true);  // 検索欄の行を除いて組み直す
+}
+
+// 一覧の検索を切り替える（表示中の Ctrl+F。トレイウィンドウの WM_HOTKEY から呼ぶ）
+// 検索欄が出ていれば解除し、出ていなければ開始する。（検索の解除はこのトグルだけで、Esc は使わない）
+static void toggleListSearch(HWND trayWnd) {
+    if (g_searchActive) closeListSearch(trayWnd);
+    else openListSearch(trayWnd);
 }
 
 // 一覧行の状態（排他。行の右クリックメニューのラジオ項目に対応する）
@@ -6964,7 +7136,7 @@ static void enterDisabledMode(HWND hWnd, DisabledReason reason,
 }
 
 // トレイ用ウィンドウプロシージャ
-// トレイアイコン操作（左クリックトグル・右クリックメニュー・ホバー一覧）、一覧関連タイマー、
+// トレイアイコン操作（左クリックトグル・右クリックメニュー・ホバー一覧）、一覧関連タイマー、一覧検索の Ctrl+F、
 // tooltip・バッジ更新、無効モード遷移、右クリックメニューのオーナードロー（新版通知）、
 // スリープ復帰・ロック解除の即時ポーリング、エクスプローラ再起動時のアイコン再登録を振り分ける。
 static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -7018,6 +7190,12 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         }
         return 0;
     }
+    if (msg == WM_HOTKEY && wParam == HOTKEY_ID_SEARCH) {
+        // 一覧の表示中だけ登録している Ctrl+F。行メニュー・終了の確認ダイアログの表示中は、
+        // モーダルループ越しに一覧を前面化するとメニューやダイアログを覆うため無視する。
+        if (isListPopupVisible() && !g_rowMenuOpen) toggleListSearch(hWnd);
+        return 0;
+    }
     if (msg == WM_TIMER && wParam == IDT_HOVER_TRIGGER) {
         // ワンショット化：発火したら即座に殺してから表示に進む
         KillTimer(hWnd, IDT_HOVER_TRIGGER);
@@ -7030,7 +7208,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         if (g_listWnd && IsWindowVisible(g_listWnd)) {
             if (g_listInputMode) {
                 // 入力モード中は離脱で閉じない。（入力中にカーソルが外れても消さない。
-                // 閉じるのは Esc・Alt+F4・アイコンのトグル・非アクティブ化で入力モードを抜けた後の離脱）
+                // 閉じるのは Alt+F4・アイコンのトグル・非アクティブ化で入力モードを抜けた後の離脱）
                 // ただしフォアグラウンドが自スレッドの窓（一覧・登録欄・DTP のカレンダー）でなければ
                 // ここで入力モードを抜ける。カレンダーを開いたまま他アプリへ切り替わると、一覧自身には
                 // WM_ACTIVATE が届かず入力モードが残るため、タイマー側で検出する。
@@ -8149,7 +8327,7 @@ int wmain() {
         // WM_QUIT は IDM_EXIT 等の終了経路で PostQuitMessage(0) により投函される。
         MSG msg;
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-            // 一覧の登録欄の Tab（移動）・Enter（IDOK）・Esc（IDCANCEL）をダイアログ同様に処理する。
+            // 一覧の登録欄の Tab（移動）・Enter（IDOK）・Esc（IDCANCEL。一覧は何もしない）をダイアログ同様に処理する。
             // 説明欄は regDescSubclassProc が Tab・Esc・Ctrl+Enter だけを同じ経路へ流す
             if (g_listWnd && IsDialogMessageW(g_listWnd, &msg)) continue;
             TranslateMessage(&msg);

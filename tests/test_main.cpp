@@ -1257,6 +1257,28 @@ static void testRegisterProjectFromLogin() {
     CHECK_WSTR(registerProjectFromLogin(L"@example.com"), L"");   // 空
 }
 
+// ==================== issueLabelMatches ====================
+
+static void testIssueLabelMatches() {
+    const std::wstring label = L"#1234 山田/佐藤 サーバ設定の変更 Login Error";
+    CHECK(issueLabelMatches(label, L"1234"));          // 番号の部分一致
+    CHECK(issueLabelMatches(label, L"設定"));          // 件名の部分一致
+    CHECK(issueLabelMatches(label, L"山田/佐藤"));     // 記号を含む部分一致
+    CHECK(issueLabelMatches(label, L"設定 山田"));     // 空白区切りは AND（語の順序は問わない）
+    CHECK(issueLabelMatches(label, L"設定　\tlogin")); // 全角空白・タブも区切り、連続した区切りは 1 つとみなす
+    CHECK(!issueLabelMatches(label, L"設定 9999"));    // 1 語でも含まなければ不一致
+    CHECK(issueLabelMatches(label, L"login error"));   // 大文字小文字を区別しない
+    CHECK(issueLabelMatches(label, L"ＬＯＧＩＮ"));    // 全角半角を区別しない
+    CHECK(issueLabelMatches(label, L"さーば"));        // ひらがなカタカナを区別しない
+    CHECK(issueLabelMatches(label, L"　設定 "));       // 前後の空白（全角を含む）は除く
+    CHECK(!issueLabelMatches(label, L"9999"));         // 不一致
+    CHECK(!issueLabelMatches(label, L""));             // 空の検索語は一致しない
+    CHECK(!issueLabelMatches(label, L"　 "));          // 空白だけの検索語も一致しない
+    CHECK(!issueLabelMatches(L"", L"a"));              // 空のラベル
+    CHECK(!issueLabelMatches(L"#1234 abc", L"-"));     // 記号だけの検索語も、ラベルに無ければ一致しない
+    CHECK(!issueLabelMatches(L"#1234 abc", L"'"));
+}
+
 // テストの列挙実行と集計出力（失敗ありなら終了コード 1）
 int main() {
     // 失敗診断は日本語（UTF-8）を含むため、コンソールの出力コードページを合わせる
@@ -1298,6 +1320,7 @@ int main() {
     testBuildClipboardHtml();
     testBuildMarkdownLink();
     testRegisterProjectFromLogin();
+    testIssueLabelMatches();
     printf("checks: %d, failed: %d\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }
