@@ -8031,7 +8031,7 @@ static PollOutcome deliverPollResults(const std::wstring& dataDir, const Config&
                                       const std::vector<Issue>& issues, const PollState& prev,
                                       const std::string& polledOn)
 {
-    // 一覧・tooltip 用の共有状態を更新する
+    // 一覧・バッジ用の共有状態を更新する
     {
         std::lock_guard<std::mutex> lk(g_mtx);
         g_issues = issues;
