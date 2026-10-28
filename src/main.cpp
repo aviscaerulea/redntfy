@@ -171,11 +171,11 @@ static constexpr UINT IDM_OPEN_LOG            = 40007;
 static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリページを開く
 static constexpr UINT IDM_OPEN_QUERY          = 40009; // Redmine の代表画面（保存クエリ画面、フォールバック時は担当一覧）を開く
 static constexpr UINT IDM_STARTUP             = 40010; // Windows スタートアップ登録トグル
-static constexpr UINT IDM_ASSIGNED_TO_ME      = 40011; // 担当が自分個人以外（グループ・他ユーザ・未割当）のチケットを一覧・tooltip・通知から除外するトグル
+static constexpr UINT IDM_ASSIGNED_TO_ME      = 40011; // 担当が自分個人以外（グループ・他ユーザ・未割当）のチケットを一覧・バッジ・通知から除外するトグル
 static constexpr UINT IDM_UPDATE_NOW          = 40012; // 休止時間帯・クールダウンを無視した即時ポーリング
 // 40013（旧 IDM_SORT_BY_DUE）は欠番。並び順はサブメニュー「並び順」のラジオへ移行した
-static constexpr UINT IDM_EXCLUDE_NO_VERSION  = 40014; // バージョン未指定を一覧・tooltip・通知から除外するトグル（期日ありは例外的に残す）
-static constexpr UINT IDM_MUTE_OWN_CHANGES    = 40015; // 自分の操作による起票・更新を通知抑止するトグル（一覧・tooltip は変更しない）
+static constexpr UINT IDM_EXCLUDE_NO_VERSION  = 40014; // バージョン未指定を一覧・バッジ・通知から除外するトグル（期日ありは例外的に残す）
+static constexpr UINT IDM_MUTE_OWN_CHANGES    = 40015; // 自分の操作による起票・更新を通知抑止するトグル（一覧・バッジは変更しない）
 static constexpr UINT IDM_OPEN_GUIDE          = 40016; // セットアップガイド（GitHub Pages）を開く
 static constexpr UINT IDM_EXCLUDE_HIDDEN      = 40017; // 非表示チケットを一覧から除外するトグル（OFF はグレー＋取消線で表示）
 static constexpr UINT IDM_HOVER_POPUP         = 40018; // ホバーで一覧を自動表示するトグル（OFF でも左クリックでは開ける）
@@ -262,7 +262,7 @@ static std::atomic<bool> g_soundEnabled{true};
 static std::atomic<bool> g_muteInMeeting{true};
 
 // 担当者が自分個人のチケットだけを対象とするフラグ（レジストリで永続化、トレイメニュー）
-// グループ担当（query_ids 設定時は未割当・他ユーザ担当も）のチケットを一覧・tooltip・通知から外すためのもの。
+// グループ担当（query_ids 設定時は未割当・他ユーザ担当も）のチケットを一覧・バッジ・通知から外すためのもの。
 // 取得と state.json は常に全件のまま扱い、表示と通知の直前だけで絞る。
 // 追跡集合そのものを絞ると、OFF に戻したとき state.json に無い id が「新規」と誤検知される。
 // 対価として、ON 中に抑止した更新は state.json に記録済みのため OFF に戻しても再通知されない。
@@ -280,7 +280,7 @@ static constexpr ListSort LIST_SORT_LAST = ListSort::PriorityDue;  // 範囲判�
 // 同順位はこの期日順規則で安定させる。
 static std::atomic<int> g_listSort{static_cast<int>(ListSort::Updated)};
 
-// バージョン未指定のチケットを一覧・tooltip・通知から除外するトグル（レジストリ永続化）
+// バージョン未指定のチケットを一覧・バッジ・通知から除外するトグル（レジストリ永続化）
 // 期日が設定されているチケットは「時限のある未来課題」として、バージョン未指定でも残す。
 // 取得と state.json は常に全件のまま扱い、表示と通知の直前だけで絞る。
 // 追跡集合そのものを絞ると、OFF に戻したとき state.json に無い id が「新規」と誤検知される。
@@ -301,7 +301,7 @@ static std::atomic<bool> g_hoverPopupEnabled{true};
 // selectNotifyTargets の 3 か所の判定（新規流入の起票者、新規流入の直近更新者、既存更新の更新者）を
 // 一括で ON/OFF する。抑止対象になったチケットも state.json には全件記録するため、
 // OFF に戻したときに再通知は起きない。抑止した件数は「今すぐ更新」の応答 Toast に出す。
-// 一覧・tooltip・バッジ・並び順は本トグルの影響を受けない。（表示ではなく通知のみを制御する）
+// 一覧・バッジ・並び順は本トグルの影響を受けない。（表示ではなく通知のみを制御する）
 static std::atomic<bool> g_muteOwnChanges{true};
 
 // トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングループと通知スレッドが参照）
@@ -607,7 +607,7 @@ static std::string g_personalProjectName;
 // ポーリングスレッドが書き込み、担当者フィルタのため WndProc スレッドも読むので atomic とする。
 static std::atomic<int>        g_myUserId{0};
 
-// 一覧・tooltip・通知に出す対象かを判定する（トレイメニューの「担当がグループのチケットを除外」）
+// 一覧・バッジ・通知に出す対象かを判定する（トレイメニューの「担当がグループのチケットを除外」）
 // ON のときは担当者が自分個人のチケットだけを通し、グループ担当・他ユーザ担当・未割当は除外する。
 // メニュー名がグループだけを挙げるのは、既定の取得（assigned_to_id=me）で自分以外に残るのが
 // グループ担当だけだからだ。query_ids で未割当や他ユーザ担当を含むクエリを追跡する場合は、それらも除外される。
@@ -619,7 +619,7 @@ static bool passesAssigneeFilter(const Issue& is) {
     return is.assignedToId == me;
 }
 
-// 一覧・tooltip・通知に出す対象かを判定する（トレイメニューの「バージョン未指定のチケットを除外」）
+// 一覧・バッジ・通知に出す対象かを判定する（トレイメニューの「バージョン未指定のチケットを除外」）
 // バージョン未指定でも以下は通す：
 // - 期日あり（時限のある未来課題）
 // - バージョン欄がそもそも無いチケット（トラッカーで欄が無効、またはプロジェクトに
@@ -4741,7 +4741,7 @@ static void showTrayContextMenu(HWND hWnd) {
     AppendMenuW(hMenu, updateNowFlags, IDM_UPDATE_NOW, L"今すぐ更新");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
-    // 担当者フィルタ（レジストリ永続化。一覧・tooltip・通知のすべてに効く）
+    // 担当者フィルタ（レジストリ永続化。一覧・バッジ・通知のすべてに効く）
     AppendMenuW(hMenu, MF_STRING | (g_assignedToMeOnly ? MF_CHECKED : MF_UNCHECKED),
         IDM_ASSIGNED_TO_ME, L"担当がグループのチケットを除外");
 
@@ -4912,7 +4912,7 @@ static void handleTrayCommand(UINT id) {
         writeRegDword(REG_ASSIGNED_TO_ME, g_assignedToMeOnly.load() ? 1u : 0u);
         // 未読は消さない。未読件数は一覧に出る行から数えるため、切り替えても件数と
         // 一覧の太字は食い違わない。（表示条件を変えただけで読んだことにはならない）
-        // 一覧は次に開いた時点で g_issues から組み直されるが、tooltip とバッジは即時に更新する。
+        // 一覧は次に開いた時点で g_issues から組み直されるが、バッジは即時に更新する。
         // 取得済みの全件を保持しているため再ポーリングは不要。
         if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
         return;
@@ -4920,14 +4920,14 @@ static void handleTrayCommand(UINT id) {
     if (id == IDM_MUTE_OWN_CHANGES) {
         g_muteOwnChanges.store(!g_muteOwnChanges.load());
         writeRegDword(REG_MUTE_OWN_CHANGES, g_muteOwnChanges.load() ? 1u : 0u);
-        // 通知経路のみを切り替える設定で、一覧・tooltip・バッジは影響を受けない。
+        // 通知経路のみを切り替える設定で、一覧・バッジは影響を受けない。
         // 表示側の再計算も再ポーリングも不要。次回ポーリング以降の通知に効く。
         return;
     }
     if (id == IDM_EXCLUDE_NO_VERSION) {
         g_excludeNoVersion.store(!g_excludeNoVersion.load());
         writeRegDword(REG_EXCLUDE_NO_VERSION, g_excludeNoVersion.load() ? 1u : 0u);
-        // 担当者フィルタと同じ扱い。未読は消さず、tooltip・バッジは即時更新、再ポーリングは不要
+        // 担当者フィルタと同じ扱い。未読は消さず、バッジは即時更新、再ポーリングは不要
         if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
         return;
     }
@@ -7028,7 +7028,7 @@ static void setIssueState(int issueId, IssueRowState target) {
     // 書き出しはどちらも小さい。（tmp 経由の atomicWriteJson で破損もしない）
     savePins(g_dataDir);
     saveHidden(g_dataDir);
-    // 非表示への遷移で未読が消えることがあるため、tooltip とバッジを追随させる
+    // 非表示への遷移で未読が消えることがあるため、バッジを追随させる
     if (g_hWnd) PostMessage(g_hWnd, WM_UPDATE_TOOLTIP, 0, 0);
     writeLog("issue state: #" + std::to_string(item.id)
         + (nowPinned ? " pinned" : nowHidden ? " hidden" : " normal"));
