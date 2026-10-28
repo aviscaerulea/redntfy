@@ -2491,7 +2491,7 @@ struct UserNames {
 // 403・404（参照権限なし・ロック済みなど）と想定外の JSON 構造は確定的な失敗として両方空を
 // キャッシュし、毎回の再試行を抑える。（呼び出し側が姓をフルネームへフォールバックする）
 // 接続失敗・5xx などの一時的な失敗はキャッシュせず nullopt を返す。呼び出し側は表示名を
-// 確定せず、次回ポーリングで再解決する。（フルネームへの縮退を state.json に焼き付けないため）
+// 確定せず、次回ポーリングで再解決する。（フルネームへの縮退を state.json に保存しないため）
 static std::optional<UserNames> resolveUserNames(const Config& cfg, int userId,
                                                  std::unordered_map<int, UserNames>& cache)
 {
@@ -2551,7 +2551,7 @@ static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
         is.updaterId   = lu.userId;
         is.updaterName = lu.userName;
         // 取得失敗は表示名を空のまま残し、次回ポーリングのキャッシュミスで再解決する。
-        // （誤った名前を state.json に焼き付けない。抑止判定は userId 0 で通知側に倒れる）
+        // （誤った名前を state.json に保存しない。抑止判定は userId 0 で通知側に倒れる）
         if (!lu.ok) continue;
         is.changeOn  = lu.changeOn;
         is.changerId = lu.changerId;
