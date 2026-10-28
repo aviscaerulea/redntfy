@@ -1279,6 +1279,33 @@ static void testIssueLabelMatches() {
     CHECK(!issueLabelMatches(L"#1234 abc", L"'"));
 }
 
+// ==================== parseHotkey ====================
+
+static void testParseHotkey() {
+    UINT mods = 0, vk = 0;
+    // 既定値（修飾キー 3 つ＋英字）
+    CHECK(parseHotkey(DEFAULT_TOGGLE_HOTKEY, mods, vk));
+    CHECK(mods == (MOD_CONTROL | MOD_SHIFT | MOD_WIN));
+    CHECK(vk == 'R');
+    // 大文字小文字と + の前後の空白は問わない。Control は Ctrl と同じ
+    CHECK(parseHotkey(L" control + alt +k ", mods, vk));
+    CHECK(mods == (MOD_CONTROL | MOD_ALT));
+    CHECK(vk == 'K');
+    // 数字と F キー
+    CHECK(parseHotkey(L"Alt+7", mods, vk) && vk == '7');
+    CHECK(parseHotkey(L"Shift+F1", mods, vk) && vk == VK_F1);
+    CHECK(parseHotkey(L"Ctrl+F24", mods, vk) && vk == VK_F24);
+    // 修飾キーなし・キーなし・キー 2 つ・範囲外の F キー・解釈できない語・空文字は不可
+    CHECK(!parseHotkey(L"R", mods, vk));
+    CHECK(!parseHotkey(L"Ctrl+Shift", mods, vk));
+    CHECK(!parseHotkey(L"Ctrl+R+T", mods, vk));
+    CHECK(!parseHotkey(L"Ctrl+F25", mods, vk));
+    CHECK(!parseHotkey(L"Ctrl+F0", mods, vk));
+    CHECK(!parseHotkey(L"Ctrl+Space", mods, vk));
+    CHECK(!parseHotkey(L"Ctrl++R", mods, vk));
+    CHECK(!parseHotkey(L"", mods, vk));
+}
+
 // ==================== moveListSelection / isListNavTarget ====================
 
 static void testListNavigation() {
@@ -1371,6 +1398,7 @@ int main() {
     testRegisterProjectFromLogin();
     testIssueLabelMatches();
     testListNavigation();
+    testParseHotkey();
     printf("checks: %d, failed: %d\n", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }

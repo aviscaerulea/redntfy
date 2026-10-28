@@ -141,6 +141,10 @@ static constexpr long long DEFAULT_HOVER_CLICK_GUARD_MS = 300;
 static constexpr long long MIN_HOVER_CLICK_GUARD_MS     = 0;
 static constexpr long long MAX_HOVER_CLICK_GUARD_MS     = 5000;
 
+// 一覧の表示・非表示を切り替えるグローバルショートカットキーの既定値（[app] toggle_hotkey の未指定時）
+// 書式は parseHotkey を参照。Windows 標準の Win+R（ファイル名を指定して実行）と重ならないよう Ctrl+Shift を足した。
+static constexpr wchar_t DEFAULT_TOGGLE_HOTKEY[] = L"Ctrl+Shift+Win+R";
+
 // トレイアイコン用メッセージ ID
 static constexpr UINT WM_TRAYICON        = WM_USER + 1;
 static constexpr UINT WM_UPDATE_TOOLTIP  = WM_USER + 2;
@@ -521,6 +525,10 @@ struct Config {
 
     // ホバー自動表示直後にアイコン左クリックを無視する猶予（ms、0〜5000、0 で無効、デフォルト 300）
     long long hoverClickGuardMs;
+
+    // 一覧の表示・非表示を切り替えるグローバルショートカットキー（"Ctrl+Shift+Win+R" 形式の未解析の文字列）
+    // キー不在は DEFAULT_TOGGLE_HOTKEY、空文字は無効。書式の検証と登録は registerToggleHotkey が行う。
+    std::wstring toggleHotkey;
 
     // [guard] ガードトーン設定（BLE ヘッドホン対処）
     int   guardToneMs;      // ガードトーン長（冒頭・末尾共通、ms。0 で無効、デフォルト 1500）
@@ -1810,6 +1818,19 @@ static Config loadConfig(const std::wstring& exeDir) {
         static_cast<int>(DEFAULT_HOVER_CLICK_GUARD_MS),
         static_cast<int>(MIN_HOVER_CLICK_GUARD_MS),
         static_cast<int>(MAX_HOVER_CLICK_GUARD_MS));
+
+    // 一覧のトグルのグローバルショートカットキー
+    // local のキーを優先する。空文字は「無効」の明示なので、キーの有無で既定値と区別する。（readAppString は区別できない）
+    // 文字列以外の値は書式の誤りとして既定値を使い、ログに残す。
+    cfg.toggleHotkey = DEFAULT_TOGGLE_HOTKEY;
+    for (const auto* tbl : { local ? &*local : nullptr, base ? &*base : nullptr }) {
+        if (!tbl) continue;
+        const auto& node = (*tbl)["app"]["toggle_hotkey"];
+        if (!node) continue;  // キーが無い側だけ base へ進む
+        if (node.is_string()) cfg.toggleHotkey = toWide(**node.as_string());
+        else writeLog("config: [app] toggle_hotkey must be a string like \"Ctrl+Shift+Win+R\"; using default");
+        break;
+    }
 
     // [guard] ガードトーン設定
     cfg.guardToneMs = (int)readConfigFloat("guard", "tone_ms", 1500.0f, 0.0f, 10000.0f);
@@ -4467,7 +4488,8 @@ static TrayPopupPos computeTrayPopupPos(const POINT& cursor) {
 // cursor が作業領域 [workLo, workHi) の中央以降にあれば、パネルの奥側の辺を cursor + margin に
 // 合わせて中央方向（手前）へ広げる。中央より手前なら手前側の辺を cursor - margin に合わせて奥へ広げる。
 // margin はアイコンの外側の辺までの距離の上限で、アイコンをパネルの範囲に収めるために足す。
-// （アイコン矩形は DPI 非対応プロセスでカーソル座標と突き合わせられないため、カーソル基準にする）
+// （アイコン矩形は DPI 非対応プロセスでカーソル座標と突き合わせられないため、カーソル基準にする。
+// ショートカットキーで開くときは cursor に trayListAnchor の基準点が入る）
 // 作業領域外へのはみ出しは呼び出し側がクランプする
 static int alignTowardCenter(int cursor, int size, int workLo, int workHi, int margin) {
     if (cursor >= workLo + (workHi - workLo) / 2) return cursor + margin - size;
@@ -4478,6 +4500,8 @@ static int alignTowardCenter(int cursor, int size, int workLo, int workHi, int m
 // cursor 直下のトップレベルウィンドウがタスクバー（Shell_TrayWnd / Shell_SecondaryTrayWnd）でなければ、
 // アイコンはフライアウト内にあるとみなしてそのウィンドウ矩形を返す。
 // 新規表示時のカーソルはアイコン上にある前提のため、タスクバー以外ならフライアウトと判断できる。
+// ショートカットキーで開くときの基準点（trayListAnchor）は、タスクバーの位置を取れる限りタスクバー上の点のため、
+// フライアウトとは判定しない。
 // フライアウトのクラス名は OS で異なる（Win11 と Win10）ため、タスクバー側のクラスで判定する。
 // cursor と戻り値はともに本プロセスの仮想化座標系で、GetCursorPos と突き合わせてよい
 static bool getOverflowFlyoutRect(const POINT& cursor, RECT& rcOut) {
@@ -4493,7 +4517,8 @@ static bool getOverflowFlyoutRect(const POINT& cursor, RECT& rcOut) {
 // 失敗（アイコン未登録・過渡状態）は false を返し、呼び出し側は g_iconHovered の判定に委ねる。
 // 注意：返す矩形は実ピクセル座標であり、DPI 非対応の本プロセスでは表示スケール 100% 超の
 // 環境で GetCursorPos（仮想化座標）との突き合わせが成立しない。高 DPI では OS のホバー状態
-// （g_iconHovered）を正とし、本矩形は 100% 環境と旧方式フォールバックの補完に使う
+// （g_iconHovered）を正とし、本矩形は 100% 環境と旧方式フォールバックの補完に使う。
+// 座標を本プロセスの座標系で使うときは、trayListAnchor のように PhysicalToLogicalPointForPerMonitorDPI で変換する
 static bool getTrayIconRect(HWND hWnd, RECT& rcOut) {
     NOTIFYICONIDENTIFIER nii = { sizeof(nii) };
     nii.hWnd = hWnd;
@@ -4502,7 +4527,7 @@ static bool getTrayIconRect(HWND hWnd, RECT& rcOut) {
 }
 
 // 一覧ポップアップの表示・非表示・可視判定（実装は walkIssueLabel 等の描画基盤の後方にある）
-static void showListPopup(HWND trayWnd, bool refresh = false);
+static void showListPopup(HWND trayWnd, bool refresh = false, const POINT* anchor = nullptr);
 static void hideListPopup(HWND trayWnd);
 static bool isListPopupVisible();
 
@@ -5692,10 +5717,10 @@ static void startIssueUpdate(int issueId, const std::string& body, int expectSta
 // もう 1 つの例外は表示中の Ctrl+F で、先頭に検索欄を出して同じく入力モードへ入る。（toggleListSearch）
 // 入力モード中は離脱で閉じず、他アプリへの切り替えで入力モードだけ抜ける。
 // 開く：ホバー（OS の NIN_POPUPOPEN 通知から hover_delay_ms 後）または
-// アイコン左クリック（NIN_SELECT、即時）。
+// アイコン左クリック（NIN_SELECT、即時）、またはショートカットキー（toggleListByHotkey。検索欄へ入力できる状態で開く）。
 // 閉じる：アイコンとポップアップ両方からの離脱（IDT_LIST_WATCH が監視。入力モード中は除く）・
 // アイコン左クリックのトグル・行クリックかホット行の Enter でチケットを開いたとき（Ctrl 押下中を除く）・
-// 検索モードでないときの Esc・入力モード中の Alt+F4。（検索モード中の Esc は検索の解除）
+// 検索モードでないときの Esc・表示中のショートカットキー・入力モード中の Alt+F4。（検索モード中の Esc は検索の解除）
 // 起点によらず同一ルール。
 // 唯一の例外として、ホバー自動表示から hover_click_guard_ms 以内のアイコン左クリックは
 // 無視する。（詳細は handleTrayLeftClick を参照）
@@ -5747,6 +5772,10 @@ static bool g_searchActive = false;    // 検索欄を表示中＝検索モー�
 // 検索の解除（Ctrl+F・Esc）でフォアグラウンドを返す先（検索を開いた Ctrl+F の時点の前面窓）
 // nullptr は開いた時点で入力モードだったことを示し、解除後も入力モードに留まる。
 static HWND g_searchReturnFg = nullptr;
+// ショートカットキー（toggleListByHotkey）で開いた一覧か（hideListPopup で false に戻す）
+// カーソルが一覧から離れているため、検索を解除しても一覧はアクティブのまま残し、一覧自体が上下キー・Enter・Esc を受ける。
+// （前面窓へフォアグラウンドを返すと、離脱監視が直ちに一覧を閉じるため）
+static bool g_listKeyboardOpened = false;
 
 // 一覧のキー操作（上下キーで行を選び、Enter で開き、Esc で検索の解除か一覧のクローズ）
 // 入力モードでない表示中は一覧にキーが届かないため、上下キー・Enter・Ctrl+Enter・Esc をトレイウィンドウの
@@ -5760,12 +5789,56 @@ static constexpr int HOTKEY_ID_NAV_DOWN       = 3;
 static constexpr int HOTKEY_ID_NAV_ENTER      = 4;
 static constexpr int HOTKEY_ID_NAV_CTRL_ENTER = 5;
 static constexpr int HOTKEY_ID_NAV_ESC        = 6;
+// 一覧の表示・非表示を切り替えるグローバルショートカットキー（[app] toggle_hotkey。起動時に 1 回登録し、常駐中は保持する）
+static constexpr int HOTKEY_ID_TOGGLE         = 7;
 static bool  g_navHotkeysRegistered = false;
 // ホット行をキーで選んだか（組み直しで選択をチケット id で引き継ぎ、マウスの離脱で選択を消さない判定。
 // マウスを実際に動かすと false に戻す）
 static bool  g_listKeySelected = false;
 // 一覧上で最後に観測したカーソルのスクリーン座標（再配置で届く移動なしの WM_MOUSEMOVE を無視するため）
 static POINT g_listLastMouse = { LONG_MIN, LONG_MIN };
+
+// ショートカットキーの文字列を RegisterHotKey の修飾キーと仮想キーへ変換する
+// 書式は「修飾キー+…+キー」で、大文字小文字と + の前後の空白は問わない。（例："Ctrl+Shift+Win+R"、"alt + f9"）
+// 修飾キーは Ctrl（Control）・Shift・Alt・Win。キーは英字 1 文字・数字 1 文字・F1〜F24 のいずれか 1 つ。
+// 修飾キーが無い指定は false を返す。（修飾なしのグローバル登録は、全アプリでその文字の入力を奪うため）
+// キーが無い・2 つ以上・解釈できない語を含む指定も false を返す。
+static bool parseHotkey(const std::wstring& spec, UINT& mods, UINT& vk) {
+    mods = 0;
+    vk = 0;
+    size_t pos = 0;
+    while (pos <= spec.size()) {
+        const size_t plus = spec.find(L'+', pos);
+        const size_t end = (plus == std::wstring::npos) ? spec.size() : plus;
+        std::wstring tok = trimRegisterText(spec.substr(pos, end - pos));
+        for (auto& c : tok) {
+            if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>(c - L'a' + L'A');  // ASCII だけ大文字化する（ロケール非依存）
+        }
+        if (tok == L"CTRL" || tok == L"CONTROL") mods |= MOD_CONTROL;
+        else if (tok == L"SHIFT")                mods |= MOD_SHIFT;
+        else if (tok == L"ALT")                  mods |= MOD_ALT;
+        else if (tok == L"WIN")                  mods |= MOD_WIN;
+        else {
+            UINT key = 0;
+            if (tok.size() == 1 && ((tok[0] >= L'A' && tok[0] <= L'Z') || (tok[0] >= L'0' && tok[0] <= L'9'))) {
+                key = tok[0];  // 英字（大文字）と数字は仮想キーコードが文字コードと一致する
+            }
+            else if (tok.size() >= 2 && tok[0] == L'F') {
+                int n = 0;
+                for (size_t i = 1; i < tok.size(); ++i) {
+                    if (tok[i] < L'0' || tok[i] > L'9' || n > 24) { n = 0; break; }
+                    n = n * 10 + (tok[i] - L'0');
+                }
+                if (n >= 1 && n <= 24) key = VK_F1 + static_cast<UINT>(n - 1);
+            }
+            if (key == 0 || vk != 0) return false;  // 解釈できない語、またはキーが 2 つ以上
+            vk = key;
+        }
+        if (plus == std::wstring::npos) break;
+        pos = plus + 1;
+    }
+    return mods != 0 && vk != 0;
+}
 
 // 一覧ポップアップが画面に出ているか（ウィンドウ未生成は非表示扱い）
 static bool isListPopupVisible() {
@@ -6069,8 +6142,10 @@ static void paintListWindow(HWND hWnd) {
 
 // 一覧ポップアップのウィンドウプロシージャ
 // 通常は非アクティブ（WS_EX_NOACTIVATE + MA_NOACTIVATE）のためキー入力は届かない。
-// キー入力を受けるのは登録欄のクリックか Ctrl+F で入った入力モードの間だけで、Tab・Enter・Esc は
-// メッセージループの IsDialogMessageW が WM_COMMAND（IDOK・IDCANCEL）へ変換する。
+// キー入力を受けるのは登録欄のクリック・Ctrl+F・ショートカットキーで入った入力モードの間だけで、
+// 入力欄にフォーカスがあれば Tab・Enter・Esc をメッセージループの IsDialogMessageW が WM_COMMAND（IDOK・IDCANCEL）へ変換する。
+// 一覧自体にフォーカスがあるとき（ショートカットキーで開いた一覧の検索解除後など）は、WM_GETDLGCODE で全キーを受け、
+// 上下キー・Enter・Esc を WM_KEYDOWN で処理する。（入力モード外のホットキーと同じ働き）
 // 説明欄では Enter は改行で、Ctrl+Enter が IDOK になる。（regDescSubclassProc）
 // 検索欄では Enter はホット行を開き、登録はしない。（searchEditSubclassProc）
 // Esc（IDCANCEL）は検索モード中なら検索を解除し（Ctrl+F の解除と同じ）、それ以外は一覧を閉じる。（handleListEsc）
@@ -6079,7 +6154,8 @@ static void paintListWindow(HWND hWnd) {
 // 行の左クリック＝チケットを開いて既読化して閉じる。フッタ・0 件行＝クエリ画面を開いて閉じる。
 // Ctrl+左クリックはどちらも閉じずに開く。（既読化した行はその場で再描画する。openListRow）
 // ホット行はマウスとキー操作（上下キー）で共用し、Enter はホット行をクリックと同じく開く。
-// 検索欄での上下キーと Enter は searchEditSubclassProc で受ける。それ以外の表示中はトレイ側の WM_HOTKEY で受ける。
+// 検索欄での上下キーと Enter は searchEditSubclassProc、一覧自体にフォーカスがあるときは WM_KEYDOWN、
+// 入力モード外の表示中はトレイ側の WM_HOTKEY で受ける。
 // 行の右クリック＝行メニュー（showRowContextMenu）を開き、一覧は開いたまま。
 // 離脱による自動クローズはトレイ側の IDT_LIST_WATCH が担い、ここでは扱わない。
 static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -6097,11 +6173,30 @@ static LRESULT CALLBACK listWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     if (msg == WM_SETFOCUS) {
         // アクティブ化時に一覧自体へ来たフォーカスを入力欄へ渡す。（子のクリックなら続けて子へ移る）
         // 検索欄の表示中は検索欄、それ以外は件名欄へ渡す。
+        // ショートカットキーで開いた一覧の検索解除後は、一覧自体がキーを受けるため渡さない。（closeListSearch）
+        if (g_listKeyboardOpened && !g_searchActive) return 0;
         HWND target = g_searchActive ? g_searchEdit : g_regEdit;
         if (target) {
             SetFocus(target);
             return 0;
         }
+    }
+    if (msg == WM_GETDLGCODE) {
+        // 一覧自体にフォーカスがあるとき（ショートカットキーで開いた一覧の検索解除後）は、Tab 以外の全キーを自分で受ける。
+        // （IsDialogMessageW に上下キーをコントロール間の移動、Enter・Esc を IDOK・IDCANCEL へ変換させない。
+        // Tab だけは IsDialogMessageW に渡し、登録欄へ移れるようにする）
+        const MSG* m = reinterpret_cast<const MSG*>(lParam);
+        if (m && m->message == WM_KEYDOWN && m->wParam == VK_TAB) return 0;
+        return DLGC_WANTALLKEYS;
+    }
+    if (msg == WM_KEYDOWN) {
+        // 一覧自体にフォーカスがあるときのキー操作。（入力モード外のホットキーと同じ働き）
+        // Enter・Esc はキーリピート（lParam の bit 30）を無視し、1 回の押下で 1 回だけ働かせる。（ホットキーの MOD_NOREPEAT と揃える）
+        const bool repeat = (lParam & 0x40000000) != 0;
+        if (wParam == VK_UP || wParam == VK_DOWN)        moveListSelection(wParam == VK_UP ? -1 : 1);
+        else if (wParam == VK_RETURN && !repeat)         openListRow(g_listHotRow, GetKeyState(VK_CONTROL) < 0);
+        else if (wParam == VK_ESCAPE && !repeat && g_hWnd) handleListEsc(g_hWnd);
+        return 0;
     }
     if (msg == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE && g_listInputMode) {
         // 他アプリへ切り替わったら入力モードだけ抜け、以後は離脱監視に閉じる判断を任せる。
@@ -6280,7 +6375,8 @@ static LRESULT CALLBACK searchEditSubclassProc(HWND hWnd, UINT msg, WPARAM wPara
         return 0;
     }
     if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
-        openListRow(g_listHotRow, GetKeyState(VK_CONTROL) < 0);
+        // キーリピート（lParam の bit 30）は無視し、1 回の押下で 1 回だけ開く。（押し続けで同じチケットを連続で開かない）
+        if ((lParam & 0x40000000) == 0) openListRow(g_listHotRow, GetKeyState(VK_CONTROL) < 0);
         return 0;
     }
     if (msg == WM_CHAR && (wParam == L'\r' || wParam == L'\n')) return 0;
@@ -6344,6 +6440,8 @@ static HWND ensureListWindow() {
 // 表示中は IDT_LIST_WATCH（トレイ側タイマー）が離脱を監視して閉じる。
 // refresh は表示中の一覧を最新の状態で組み直す指定だ。
 // 位置は新規表示時のカーソル座標を基準に同じ規則で求め直す。
+// anchor は新規表示の基準点をカーソル座標の代わりに与える指定だ。（ショートカットキーで開くときのトレイアイコンの位置。
+// 組み直しでは無視する）
 // 離脱監視の状態（猶予・タイマー）は引き継ぐ。ホット行は、キーで選んだ行なら同じチケットの行へ移し
 // （一覧から消えたら選択を外す）、それ以外は現在のカーソル位置から求め直す。
 // 登録欄（登録先の確定時）は常に末尾の行で、作業領域による打ち切りでも必ず残す。
@@ -6351,7 +6449,7 @@ static HWND ensureListWindow() {
 // 子コントロールは組み直しのたびに置き直し、入力中の内容とフォーカスはそのまま保つ。
 // 新規表示では検索の Ctrl+F をホットキー登録する。（解除は hideListPopup）
 // 組み直しでは Z 順を変えない。（最前面へ上げ直すと、表示中の行メニュー・終了の確認ダイアログを一覧が覆うため）
-static void showListPopup(HWND trayWnd, bool refresh) {
+static void showListPopup(HWND trayWnd, bool refresh, const POINT* anchor) {
     HWND hWnd = ensureListWindow();
     if (!hWnd) return;
 
@@ -6400,7 +6498,8 @@ static void showListPopup(HWND trayWnd, bool refresh) {
         cursor = g_listAnchor;
     }
     else {
-        GetCursorPos(&cursor);
+        if (anchor) cursor = *anchor;
+        else GetCursorPos(&cursor);
         g_listAnchor = cursor;
         g_listInOverflow = getOverflowFlyoutRect(cursor, g_listOverflowRect);
     }
@@ -6681,6 +6780,7 @@ static void hideListPopup(HWND trayWnd) {
     UnregisterHotKey(trayWnd, HOTKEY_ID_SEARCH);
     updateListNavHotkeys();  // 非表示になったため、キー操作のホットキーも外れる
     g_listKeySelected = false;
+    g_listKeyboardOpened = false;
     g_searchActive = false;
     if (g_searchEdit) {
         ShowWindow(g_searchEdit, SW_HIDE);
@@ -6711,9 +6811,12 @@ static void openListSearch(HWND trayWnd) {
 }
 
 // 一覧の検索を解除する（検索欄の表示中の Ctrl+F と Esc。どちらもこの関数で同じ動作にする）
-// 検索欄と着色を消して一覧は残す。入力モード中なら、Ctrl+F の時点の前面窓が他スレッドの窓のときは
-// 入力モードを抜けてそこへフォアグラウンドを返す。（ホバー表示中の Ctrl+F で奪ったフォーカスを戻し、
-// 離脱監視に閉じる判断を任せる）それ以外は入力モードに留め、件名欄（無ければ一覧自体）へフォーカスを渡す。
+// 検索欄と着色を消して一覧は残す。入力モード中の扱いは次のとおり。
+// ・ショートカットキーで開いた一覧（g_listKeyboardOpened）は入力モードに留め、一覧自体へフォーカスを渡す。
+//   （カーソルが一覧から離れているため、前面窓へ返すと離脱監視が直ちに閉じる。一覧自体が上下キー・Enter・Esc を受ける）
+// ・それ以外で、Ctrl+F の時点の前面窓が他スレッドの窓なら、入力モードを抜けてそこへフォアグラウンドを返す。
+//   （ホバー表示中の Ctrl+F で奪ったフォーカスを戻し、離脱監視に閉じる判断を任せる）
+// ・どちらでもなければ入力モードに留め、件名欄（無ければ一覧自体）へフォーカスを渡す。
 // 入力モードでないとき（他アプリへの切り替えで抜けた後）はフォーカスに触れない。（利用者の切り替えを尊重する）
 static void closeListSearch(HWND trayWnd) {
     g_searchActive = false;
@@ -6721,7 +6824,10 @@ static void closeListSearch(HWND trayWnd) {
     const HWND back = g_searchReturnFg;
     g_searchReturnFg = nullptr;
     if (g_listInputMode) {
-        if (back && IsWindow(back) && GetWindowThreadProcessId(back, nullptr) != GetCurrentThreadId()) {
+        if (g_listKeyboardOpened) {
+            SetFocus(g_listWnd);
+        }
+        else if (back && IsWindow(back) && GetWindowThreadProcessId(back, nullptr) != GetCurrentThreadId()) {
             exitListInputMode();
             SetForegroundWindow(back);
         }
@@ -6744,6 +6850,85 @@ static void toggleListSearch(HWND trayWnd) {
 static void handleListEsc(HWND trayWnd) {
     if (g_searchActive) closeListSearch(trayWnd);
     else hideListPopup(trayWnd);
+}
+
+// ショートカットキーで開く一覧の基準点（新規表示時のカーソル座標の代わり）
+// トレイアイコンの中心を返す。（アイコンを開いたときと同じ位置規則に乗せるため）
+// アイコンがタスクバー上に無い（隠れているインジケーター内）か矩形を取れないときは、
+// タスクバーの通知領域側の端（水平なら右端、垂直なら下端）を返す。タスクバーの位置も取れなければカーソル座標を返す。
+// アイコン矩形は実ピクセル座標のため、PhysicalToLogicalPointForPerMonitorDPI で DPI 非対応の本プロセスの座標系
+// （カーソル座標・タスクバー矩形と同じ）へ直してから使う。変換の基準はトレイウィンドウのモニタの DPI だ。
+// 変換に失敗したとき、または変換後の点がタスクバー上に無いときは、アイコン矩形を使わずタスクバーの端へ退避する。
+// （表示スケール 100% 超・モニタ別スケールでの変換結果は実機で未確認。ずれても showListPopup が作業領域へ収める）
+static POINT trayListAnchor(HWND trayWnd) {
+    APPBARDATA abd = { sizeof(abd) };
+    const bool haveBar = SHAppBarMessage(ABM_GETTASKBARPOS, &abd) != FALSE;
+    RECT icon = {};
+    if (getTrayIconRect(trayWnd, icon)) {
+        POINT c = { (icon.left + icon.right) / 2, (icon.top + icon.bottom) / 2 };
+        if (PhysicalToLogicalPointForPerMonitorDPI(trayWnd, &c) && (!haveBar || PtInRect(&abd.rc, c))) return c;
+    }
+    if (haveBar) {
+        if (abd.uEdge == ABE_LEFT || abd.uEdge == ABE_RIGHT)
+            return { (abd.rc.left + abd.rc.right) / 2, abd.rc.bottom - 1 };
+        return { abd.rc.right - 1, (abd.rc.top + abd.rc.bottom) / 2 };
+    }
+    POINT pt = {};
+    GetCursorPos(&pt);
+    return pt;
+}
+
+// ショートカットキーでの一覧のトグル（[app] toggle_hotkey の WM_HOTKEY）
+// 表示中なら閉じる。非表示ならトレイアイコンの位置に開き、検索欄へ入力できる状態にする。（Ctrl+F と同じ openListSearch）
+// 無効モードへの遷移時は enterDisabledMode が登録を解除するため、isDisabled の判定は解除前に届いた分への備えだ。
+// 検索欄で入力モードに入るため、カーソルが一覧から離れていても閉じず、他アプリへ切り替えると離脱監視が閉じる。
+// 検索を解除しても一覧はアクティブのまま残る。（g_listKeyboardOpened）
+// 無効モード中と、行メニュー・終了の確認ダイアログ・トレイの右クリックメニューの表示中は何もしない。
+// （右クリックメニューは一覧を閉じて g_popupShowing を立てたままモーダルループに入る。ここで一覧を開くと、
+// メニュー終了時の g_popupShowing = false が可視の一覧とフラグを食い違わせる）
+static void toggleListByHotkey(HWND trayWnd) {
+    if (isDisabled() || g_rowMenuOpen) return;
+    if (g_popupShowing.load() && !isListPopupVisible()) return;  // トレイの右クリックメニューの表示中
+    if (isListPopupVisible()) {
+        hideListPopup(trayWnd);
+        return;
+    }
+    const POINT anchor = trayListAnchor(trayWnd);
+    showListPopup(trayWnd, false, &anchor);
+    if (!g_popupShowing.load()) return;  // 表示に失敗した（GetDC・タイマーの失敗）
+    g_hoverShownAt = 0;                   // ホバー起点ではない（クリック猶予を効かせない）
+    g_listKeyboardOpened = true;
+    openListSearch(trayWnd);
+}
+
+// 一覧のトグルのグローバルショートカットキーを登録する（起動時に 1 回。無効モードでは登録しない）
+// 空文字は無効。書式の誤りと登録の失敗（他アプリが使用中など）は Toast とログで知らせ、アプリはそのまま動く。
+static void registerToggleHotkey(HWND hWnd, const std::wstring& spec) {
+    if (spec.empty()) {
+        writeLog("toggle_hotkey: (disabled)");
+        return;
+    }
+    UINT mods = 0, vk = 0;
+    std::wstring reason;
+    if (!parseHotkey(spec, mods, vk)) {
+        reason = L"書き方が正しくありません（例：Ctrl+Shift+Win+R）";
+    }
+    else if (!RegisterHotKey(hWnd, HOTKEY_ID_TOGGLE, mods | MOD_NOREPEAT, vk)) {
+        writeLog("toggle_hotkey: RegisterHotKey failed: " + std::to_string(GetLastError()));
+        reason = L"他のアプリか Windows が同じキーを使っています";
+    }
+    if (reason.empty()) {
+        writeLog("toggle_hotkey: " + wideToUtf8(spec));
+        return;
+    }
+    writeLog("toggle_hotkey: not registered: " + wideToUtf8(spec));
+    try {
+        showToast(L"ショートカットキーを登録できません",
+                  L"toggle_hotkey の「" + spec + L"」は" + reason + L"。設定を変えて再起動してください", L"");
+    }
+    catch (...) {
+        writeLog("toggle_hotkey: error toast failed");
+    }
 }
 
 // 一覧行の状態（排他。行の右クリックメニューのラジオ項目に対応する）
@@ -7273,6 +7458,10 @@ static void ensureLocalTomlTemplate(const std::wstring& exeDir) {
 // ここでの ShellExecuteW は http(s) URL しか受け取らない。
 static void enterDisabledMode(HWND hWnd, DisabledReason reason,
                               const Config& cfg, const std::wstring& exeDir) {
+    // 一覧のトグルのショートカットキーを解除する。（無効モードでは一覧を出さず、復帰は再起動のみのため、
+    // 登録を残すと他アプリからキーを奪ったまま何もしない。起動時から無効モードなら未登録で、解除は失敗するだけ）
+    UnregisterHotKey(hWnd, HOTKEY_ID_TOGGLE);
+
     // 設定ファイルを開く（不在ならテンプレートを生成してから）
     ensureLocalTomlTemplate(exeDir);
     std::wstring configPath = exeDir + L"\\" + CONFIG_LOCAL_FILENAME;
@@ -7364,6 +7553,10 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             g_hoverSuppressed = false;
             KillTimer(hWnd, IDT_HOVER_TRIGGER);
         }
+        return 0;
+    }
+    if (msg == WM_HOTKEY && wParam == HOTKEY_ID_TOGGLE) {
+        toggleListByHotkey(hWnd);  // 一覧の表示・非表示の切り替え（[app] toggle_hotkey）
         return 0;
     }
     if (msg == WM_HOTKEY && wParam == HOTKEY_ID_SEARCH) {
@@ -8505,6 +8698,8 @@ int wmain() {
         // これによりネットワーク状態にかかわらずトレイアイコン右クリック等の UI が常時応答する。
         if (initReason == DisabledReason::None) {
             pollThread = std::thread(pollThreadFunc, g_dataDir, cfg);
+            // 一覧のトグルのショートカットキー（無効モードでは一覧を出さないため登録しない）
+            registerToggleHotkey(g_hWnd, cfg.toggleHotkey);
         }
         else {
             enterDisabledMode(g_hWnd, initReason, cfg, exeDir);
