@@ -577,7 +577,7 @@ static std::unordered_map<int, int> g_priorityPositions;
 static Config                  g_currentConfig;
 
 // 未読チケットの id 集合（g_mtx で保護。一覧の太字表示と tooltip の未読件数の唯一の根拠）
-// 通知対象になった id を入れ、一覧の行クリックでそのチケットを開いた時だけ取り除く。
+// 通知対象になった id を入れ、一覧の行クリックかホット行の Enter でそのチケットを開いた時だけ取り除く。
 // 一覧を開いただけでは既読にしない。（開いたことは読んだことではない）
 // 件数とバッジは buildListRows が返す行、すなわち一覧に出る行だけから数える。
 // そのため list_limit の窓外と LIST_ROW_MAX の打ち切りで落ちた id は数にも太字にも出ない。
@@ -4869,10 +4869,10 @@ static std::wstring getCurrentLogTarget() {
 }
 
 // 開いたチケット 1 件を既読にする
-// 行クリック時点では一覧ポップアップがまだ可視で、g_popupShowing 中の直接呼びは
+// 行クリックか Enter の時点では一覧ポップアップがまだ可視で、g_popupShowing 中の直接呼びは
 // updateTrayTooltip に捨てられる。PostMessage でキューに積んでおけば、
 // この後の hideListPopup（フラグ解除）を経てから必ず反映される。
-// Ctrl+クリックで一覧を開いたままにした場合は積んだ分も updateTrayTooltip が捨てるため、
+// Ctrl+クリック・Ctrl+Enter で一覧を開いたままにした場合は積んだ分も updateTrayTooltip が捨てるため、
 // 一覧を閉じたときの hideListPopup がバッジへ反映する。
 // ✨ は起票日時だけで決まるため、既読化では外れない。
 static void markIssueRead(int issueId) {
@@ -6435,7 +6435,7 @@ static HWND ensureListWindow() {
 
 // 一覧ポップアップの表示（ホバー・左クリック共通）
 // 表示行の選定・並べ替え・絞り込みは buildListRows に委ねる。（バッジの未読判定と同じ根拠）
-// 行の左クリックでチケットを開いてその 1 件だけ既読にする。（非表示のグレー行も同様に開ける）
+// 行の左クリックかホット行の Enter でチケットを開いてその 1 件だけ既読にする。（非表示のグレー行も同様に開ける）
 // フッタの「未処理 N 件」はフィルタを通った件数で、フィルタで外れたピンと非表示チケットは数えない。
 // 表示中は IDT_LIST_WATCH（トレイ側タイマー）が離脱を監視して閉じる。
 // refresh は表示中の一覧を最新の状態で組み直す指定だ。
@@ -7997,7 +7997,7 @@ static void emitNotifications(const Config& cfg, const std::vector<NotifyTarget>
     if (g_soundEnabled.load() && !(g_muteInMeeting.load() && isMeetingActive()))
         launchSound(cfg);
     {
-        // 未読 id を記録する。（一覧の太字・未読件数。行クリックで開いた分だけ取り除く）
+        // 未読 id を記録する。（一覧の太字・未読件数。行クリックかホット行の Enter で開いた分だけ取り除く）
         std::lock_guard<std::mutex> lk(g_mtx);
         for (const auto& t : targets) g_unreadIds.insert(t.issue->id);
     }
