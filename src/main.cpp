@@ -8430,7 +8430,7 @@ static void pollThreadFunc(std::wstring dataDir, Config cfg) {
                     && projectHasAnyVersion(cfg, is.projectId, session.projectHasVersions);
             }
 
-            // 一覧・tooltip は最終更新者の解決を待たずに先行公開する。初回起動や移行直後は
+            // 一覧は最終更新者の解決を待たずに先行公開する。初回起動や移行直後は
             // resolveUpdaters が全件分の HTTP を打つため、完了を待つと一覧が空のまま待たされる。
             // （姓の列は解決後、deliverPollResults の再公開で入る）
             {
