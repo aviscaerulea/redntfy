@@ -2306,7 +2306,6 @@ static bool fetchIssue(const Config& cfg, int id, Issue& out) {
     }
 }
 
-// 最終更新者（直近 journal の更新者）
 // UTC ISO 8601（YYYY-MM-DDThh:mm:ssZ）を epoch 秒に変換する
 // 解釈不能なら -1 を返す。journal と updated_on の突き合わせに使う。
 static long long isoUtcToEpoch(const std::string& iso) {
@@ -2381,6 +2380,7 @@ static bool journalMatchesUpdate(const std::string& journalCreatedOn, const std:
     return diff <= JOURNAL_MATCH_TOLERANCE_SEC && diff >= -JOURNAL_MATCH_TOLERANCE_SEC;
 }
 
+// 最終更新者（直近 journal の更新者）
 // ok は journals の取得・解析に成功したか。（journals が空でも成功。通信失敗と区別する）
 // userId 0 は journals 空（journal の無い新規チケット等）、最終 journal が updated_on と
 // 一致しない（journal を伴わない更新）、または取得失敗を表す。
