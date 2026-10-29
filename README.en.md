@@ -19,25 +19,26 @@ A sister tool, [gcalntfy](https://github.com/aviscaerulea/gcalntfy), notifies yo
 
 - Ticket notifications: polls Redmine and notifies you of new or updated tickets, via Windows notification and sound
 - System tray: view the open-ticket list and change settings from the tray icon
-  - List format: the order and items of each row can be specified with placeholders
-  - Pins: keep important tickets in the list (they stay even after being closed)
+  - List format: freely change which items each row shows and in what order
+  - Sorting: sort by updated date, due date, created date, priority, and more
+  - Pins: keep important tickets in the list
   - Hiding: excludes tickets you do not need to watch from notifications and the pending count
-  - Browser display: clicking a row or the footer opens it in the browser (Ctrl+click keeps the list open)
-  - Search: press Ctrl+F while the list is shown to highlight rows containing the text you type
-  - Keyboard: select a ticket with the Up/Down keys and open it with Enter
+  - Browser display: clicking a row opens the ticket in the browser
+  - Search: highlights tickets containing the text you type
+  - Keyboard: select and open tickets with the keyboard alone
   - Shortcut key: open and close the list from any app with a key combination
   - Ticket registration: create a ticket assigned to yourself from the list, without opening Redmine
-  - Row menu: right-click a row to copy the ticket, change its priority or due date, or close it with a comment
+  - Row menu: right-click to copy a ticket, change its priority or due date, or close it
 - Narrowing the target: Redmine custom queries (one or more) freely choose which tickets are notified and listed
 - Zero-configuration start: targets tickets assigned to you and your groups with just a URL and an API access key
 
 ### System tray
 
-The tray icon shows a red badge in the bottom-right corner when there are unread tickets.
+Hovering over or clicking the tray icon opens the open-ticket list.
+The tray icon shows a red badge when there are unread tickets.
 
-Each row of the list shows the author and the last commenter, project, due date, and days left until the due date, with icons. The project name is omitted for tickets in your personal project used for registration. Unread tickets and tickets with a due date are shown in bold. Tickets with the top priority ("Immediate") get a darker red background and those one level below ("Urgent") a lighter red background (except hidden and closed tickets). Right after the ticket number, tickets created within the last 24 hours are marked with ✨, and tickets whose description, assignee, or status was changed or that got a comment from someone else within the last 24 hours are marked with 🆙 (🆙 wins when both apply; the period is configurable). The pending count appears in the footer. Clicking a row opens the ticket in the browser and marks it as read. Ctrl+click keeps the list open, so you can open several tickets in a row. Pressing Ctrl+F while the list is shown opens a search box at the top and highlights rows containing the typed text with a yellow background (it matches the text visible in the row, such as the number, names, and subject, ignoring uppercase/lowercase, full-width/half-width, and hiragana/katakana differences). Separating words with spaces highlights only rows containing all of them. Pressing Ctrl+F again or Esc clears the search. While the list is shown, the Up/Down keys select a ticket and Enter opens it (Ctrl+Enter keeps the list open). When not searching, Esc closes the list. Pressing the shortcut key (Ctrl+Shift+Win+R by default) from any app opens the list at the tray icon, ready for typing a search. Pressing it again closes the list. During a search, only matching tickets are selected. Right-clicking a row opens a menu to copy the ticket number, URL, or the ticket as text, Markdown, or a link, switch between pinned and hidden, change the priority or due date, and close the ticket with a comment. The list order can be chosen from "並び順" (sort order) in the tray menu: by updated date, due date, created date, priority, or priority with due dates. The last one ranks tickets due today or earlier whose priority is below "急いで" (urgent) at the same priority as "急いで".
-
-When a target project is available, a subject field, a priority, a due date, and a register button appear at the bottom of the list. Press the "▾" button to the right of the register button to open an optional description area (Enter inserts a newline; Ctrl+Enter registers). Enter a subject (at least 3 characters), choose a priority (defaults to Redmine's default priority) and a due date (defaults to today), and register it to create a ticket assigned to yourself. If no target project is configured, tickets go to your personal project whose identifier matches your login name, if it exists.
+The list highlights unread tickets and tickets with a due date in bold, and high-priority tickets with a red background.
+Newly created tickets are marked with ✨, and tickets updated by someone else with 🆙.
 
 Right-clicking the tray icon opens the tray menu, which provides various settings.
 
