@@ -7,12 +7,7 @@
 [![Build](https://github.com/aviscaerulea/redntfy/actions/workflows/release.yml/badge.svg)](https://github.com/aviscaerulea/redntfy/actions/workflows/release.yml)
 
 A lightweight resident app that delivers Redmine ticket notifications and an issue list from the system tray.
-
-Its main features are notifications for new or updated tickets and the open-ticket list opened from the tray icon.
-Which tickets are notified and listed can be narrowed freely with Redmine custom queries.
-
 Measured physical memory usage is about 7 MB.
-
 A sister tool, [gcalntfy](https://github.com/aviscaerulea/gcalntfy), notifies you of Google Calendar events the same way.
 
 ## Features
@@ -66,20 +61,16 @@ scoop install redntfy
 
 Uninstalling leaves the following three behind. Delete them manually if you no longer need them.
 
-- The data folder `%LOCALAPPDATA%\redntfy` (detected ticket records, pins, hidden tickets, logs)
-- The registry key `HKEY_CURRENT_USER\SOFTWARE\redntfy` (settings changed from the tray menu)
-- The Start menu shortcut `redntfy.lnk` (required to display Windows notifications)
+- The data folder `%LOCALAPPDATA%\redntfy`
+- The settings registry key `HKEY_CURRENT_USER\SOFTWARE\redntfy`
+- The Start menu shortcut `redntfy.lnk`
 
 If you registered the app to start with Windows, turn that off from the tray menu before deleting them.
 
 ## Usage
 
-Initial setup:
-
-A step-by-step guide with screenshots is available in the [setup guide](https://aviscaerulea.github.io/redntfy/) (written in Japanese).
-
-1. Obtain an API key from "My account" → "API access key" in Redmine
-2. Create `redntfy.local.toml` next to `redntfy.exe` and write the connection settings
+1. Obtain an API access key from "My account" in Redmine
+2. Place `redntfy.local.toml` containing the connection settings next to `redntfy.exe`
 
    ```toml
    [redmine]
@@ -89,45 +80,22 @@ A step-by-step guide with screenshots is available in the [setup guide](https://
 
 3. Launch `redntfy.exe`
 
-That is all it takes — the app starts notifying you of updates to open tickets assigned to you (and your groups).
-If you want to narrow the target yourself, save a global custom query in Redmine.  
-Then set the id of that query in `query_ids`.  
-See the setup guide for the detailed steps.
+Once launched, the app starts notifying you of tickets assigned to you.
+To narrow which tickets are notified, see the [setup guide](https://aviscaerulea.github.io/redntfy/) with screenshots (written in Japanese).
 
 ## Configuration
 
-Runtime settings live in `redntfy.toml` next to `redntfy.exe`.
-Placing `redntfy.local.toml` overrides values of the same keys on a per-key basis, which is useful for separating connection settings or per-environment differences.
+Settings live in `redntfy.toml` next to `redntfy.exe`.
+Keys written in `redntfy.local.toml` override the same keys in `redntfy.toml`.
 
-Configurable items are the connection settings, the custom queries to target, the project that receives tickets registered from the list (`register_project`), the status used when closing a ticket from the row menu (`close_status_id`), the number of polls per hour for each hour of the day, the row count and row format of the list, the shortcut key that opens and closes the list (`toggle_hotkey`), loudness normalization for the notification sound, and the update check at startup.
-See the comments in `redntfy.toml` for the meaning and default value of each key.
-
-### Example of `query_ids`
-
-`query_ids` is optional.  
-Omit it and the app targets open tickets assigned to you (and your groups).
-
-```toml
-[redmine]
-url     = "https://redmine.example.com"
-api_key = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-
-# Ids of global saved queries, saved without specifying a project.
-# When several ids are given, the union of all queries is tracked.
-# The first id is used for the query screen opened from multi-issue notifications and the list footer.
-query_ids = [12, 34]
-```
-
-A good way is to start without `query_ids`.
-Once you want to narrow the target, create custom queries. Then set their ids in `query_ids`.
-Switching the setting does not flood you with notifications.
+You can change the connection target, which tickets are notified, how often the app polls, how the list looks, and more.
+See the comments in `redntfy.toml` for each item.
 
 ## Limitations
 
-- `query_ids` accepts global custom queries only (queries saved under a specific project cannot be referenced via the API)
-- With insufficient Redmine permissions, the group-assignee mark appears only for your own groups
-- The configuration file is not hot-reloaded; a restart is required to apply changes
-- If the connection settings are incomplete, the app stays resident with notifications turned off (the tray icon shows how to fix it)
+- Changes to the configuration file take effect only after a restart
+- Only global custom queries, which do not belong to a project, can be used to choose the notified tickets
+- If the connection settings are wrong, the app stops notifications and shows how to fix them on the tray icon
 
 ## License
 

@@ -6,13 +6,8 @@
 [![License](https://img.shields.io/github/license/aviscaerulea/redntfy)](LICENSE)
 [![Build](https://github.com/aviscaerulea/redntfy/actions/workflows/release.yml/badge.svg)](https://github.com/aviscaerulea/redntfy/actions/workflows/release.yml)
 
-システムトレイから Redmine チケットの通知と一覧表示を行う軽量常駐アプリです。
-
-主な機能は、チケットの新着や更新を知らせる通知と、トレイアイコンから開く未処理チケット一覧の表示です。
-通知と一覧の対象は、Redmine のカスタムクエリで自由に絞り込めます。
-
+システムトレイから Redmine チケットを通知し、一覧に表示する軽量常駐アプリです。
 実測での物理メモリ使用量は約 7MB です。
-
 Google カレンダーの予定を同じ仕組みで通知する姉妹ツール [gcalntfy](https://github.com/aviscaerulea/gcalntfy) もあります。
 
 ## 機能
@@ -66,19 +61,16 @@ scoop install redntfy
 
 アンインストールしても、以下の 3 つが残ります。不要であれば手動で削除してください。
 
-- データフォルダ `%LOCALAPPDATA%\redntfy`（検知済みチケットの記録、ピン留め、非表示、ログ）
-- レジストリキー `HKEY_CURRENT_USER\SOFTWARE\redntfy`（トレイメニューで変更した設定）
-- スタートメニューのショートカット `redntfy.lnk`（Windows 通知の表示に必要）
+- データフォルダ `%LOCALAPPDATA%\redntfy`
+- 設定のレジストリキー `HKEY_CURRENT_USER\SOFTWARE\redntfy`
+- スタートメニューのショートカット `redntfy.lnk`
 
 Windows へのスタートアップ登録は、削除の前にトレイメニューで解除してください。
 
 ## 使い方
 
-初回セットアップの手順です。  
-画像付きの詳しい手順は [セットアップガイド](https://aviscaerulea.github.io/redntfy/) を参照してください。
-
-1. Redmine の「個人設定」→「API アクセスキー」でキーを取得する
-2. `redntfy.exe` と同じフォルダに、接続情報を書いた `redntfy.local.toml` を作成する
+1. Redmine の「個人設定」で API アクセスキーを取得する
+2. `redntfy.exe` と同じフォルダに、接続情報を書いた `redntfy.local.toml` を置く
 
    ```toml
    [redmine]
@@ -88,44 +80,22 @@ Windows へのスタートアップ登録は、削除の前にトレイメニュ
 
 3. `redntfy.exe` を起動する
 
-これだけで、自分（と所属グループ）が担当する未完了チケットの更新を通知し始めます。
-対象を自分で絞り込みたいときは、Redmine でグローバルなカスタムクエリを保存します。  
-保存したクエリの id を `query_ids` に設定します。  
-手順の詳細はセットアップガイドを参照してください。
+起動すると、自分が担当するチケットの通知を始めます。
+通知の対象を絞り込む手順は、画像付きの [セットアップガイド](https://aviscaerulea.github.io/redntfy/) を参照してください。
 
 ## 設定
 
-動作設定は `redntfy.exe` と同じフォルダの `redntfy.toml` に記載します。
-`redntfy.local.toml` を置くと同名のキーをキー単位で上書きでき、接続情報の分離や環境ごとの差分管理に使えます。
+設定は `redntfy.exe` と同じフォルダの `redntfy.toml` に記載します。
+`redntfy.local.toml` に書いたキーは、`redntfy.toml` の同じキーを上書きします。
 
-設定できるのは、接続情報、対象にするカスタムクエリ、一覧から登録するチケットの登録先プロジェクト（`register_project`）、行メニューでチケットを終了するときのステータス（`close_status_id`）、時間帯ごとのポーリング回数、一覧の表示件数と行の書式、一覧を開閉するショートカットキー（`toggle_hotkey`）、通知音のラウドネス正規化、起動時の更新チェックです。
-各キーの意味と既定値は `redntfy.toml` のコメントを参照してください。
-
-### `query_ids` の記載例
-
-`query_ids` は省略でき、省略すると自分（と所属グループ）が担当する未完了チケットを対象にします。
-
-```toml
-[redmine]
-url     = "https://redmine.example.com"
-api_key = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-
-# プロジェクトを指定せずに保存したグローバル保存クエリの id を配列で指定する。
-# 複数指定時は全クエリの和集合を追跡する。
-# 先頭の id は複数件通知・一覧フッタから開くクエリ画面に使う。
-query_ids = [12, 34]
-```
-
-まずは設定なしで使い始めてください。
-対象を絞り込みたくなったら、カスタムクエリを作成します。次に `query_ids` を設定します。
-設定の切り替え時に通知があふれることはありません。
+接続先、通知の対象、ポーリングの頻度、一覧の見た目などを変えられます。
+各項目の説明は `redntfy.toml` のコメントを参照してください。
 
 ## 制限事項
 
-- `query_ids` に指定できるのはグローバルなカスタムクエリのみ（プロジェクト配下のクエリは参照不可）
-- Redmine の権限が足りないと、グループ担当の印は自分の所属グループの分だけ付く
-- 設定ファイルはホットリロード非対応で、変更を反映するには再起動が必要
-- 接続設定に不備があるときは通知を止めて常駐する（直し方をトレイアイコンに表示する）
+- 設定ファイルの変更を反映するには再起動が必要
+- 通知の対象に使えるのは、プロジェクトに属さない（グローバルな）カスタムクエリのみ
+- 接続設定に誤りがあると通知を止め、直し方をトレイアイコンに表示する
 
 ## ライセンス
 
