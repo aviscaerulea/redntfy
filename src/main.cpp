@@ -6787,13 +6787,13 @@ static void showListPopup(HWND trayWnd, bool refresh, const POINT* anchor) {
     const RegisterLayout rl = measureRegisterRow(hdc, tm.tmHeight, refresh);
 
     // 検索欄は先頭に置く。（画面下のタスクバーでは一覧が上へ伸びるため、出し入れしても既存の行の位置が変わらない）
-    // 高さは登録欄のコントロール行と揃える。先に積むため、チケット行の打ち切り判定にも含まれる
+    // 高さは登録欄のコントロール行と揃える。先に積むため、チケット行の打ち切り判定にも含まれる。
+    // 検索欄とチケット行の間に区切り線は引かない。（欄の余白だけで区切りは足り、線は目障りなため。ユーザ判断）
     const bool searchShown = g_searchActive && g_searchEdit;
     int searchTop = 0;
     if (searchShown) {
         searchTop = y;
         pushRow(ListRowKind::Search, rl.ctrlH + 2 * REG_PAD, 0);
-        pushRow(ListRowKind::Separator, 9, 0);
         width = (std::max)(width, SEARCH_EDIT_MIN_WIDTH + 2 * REG_PAD);
     }
 
