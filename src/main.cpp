@@ -168,7 +168,7 @@ static constexpr UINT IDM_MUTE_IN_MEETING  = 40004;
 static constexpr UINT IDM_SOUND_ENABLED       = 40005;
 static constexpr UINT IDM_OPEN_CONFIG         = 40006;
 static constexpr UINT IDM_OPEN_LOG            = 40007;
-static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub リポジトリページを開く
+static constexpr UINT IDM_OPEN_GITHUB         = 40008; // GitHub のリポジトリページを開く（新版あり時はリリースページ）
 static constexpr UINT IDM_OPEN_QUERY          = 40009; // Redmine の代表画面（保存クエリ画面、フォールバック時は担当一覧）を開く
 static constexpr UINT IDM_STARTUP             = 40010; // Windows スタートアップ登録トグル
 static constexpr UINT IDM_ASSIGNED_TO_ME      = 40011; // 担当が自分個人以外（グループ・他ユーザ・未割当）のチケットを一覧・バッジ・通知から除外するトグル
@@ -304,7 +304,7 @@ static std::atomic<bool> g_hoverPopupEnabled{true};
 // 一覧・バッジ・並び順は本トグルの影響を受けない。（表示ではなく通知のみを制御する）
 static std::atomic<bool> g_muteOwnChanges{true};
 
-// トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングループと通知スレッドが参照）
+// トレイウィンドウのハンドル（メインスレッドで作成し、ポーリングスレッドなどのワーカースレッドが参照）
 static HWND g_hWnd = nullptr;
 
 // トレイのポップアップ表示中フラグ（一覧ポップアップ可視、または右クリックメニュー表示中。
@@ -338,17 +338,23 @@ static bool      g_iconHovered       = false;
 static bool      g_hoverSuppressed   = false;
 static bool      g_trayV4            = false;
 
-// スリープ復帰・ロック解除時の即時ポーリングフラグ
+// スリープ復帰・ロック解除・NIC 変化時の即時ポーリングフラグ
 static std::atomic<bool> g_forcePoll{false};
+
+// スリープ復帰起点のポーリングを示すフラグ（g_forcePoll と同時に立て、取得時に消費する）
+// 復帰直後は回線の再確立前で取得が失敗しやすいため、この取得の失敗は接続エラー Toast を出さない。
+// （60 秒後の自動リトライで失敗が続けば通常どおり出す。「今すぐ更新」が重なった場合は Toast を優先する）
+static std::atomic<bool> g_resumePoll{false};
 
 // トレイメニュー「今すぐ更新」の即時ポーリングフラグ
 // 明示のユーザ操作のため、g_forcePoll と違い休止時間帯・クールダウンの抑止を受けない
 static std::atomic<bool> g_manualPoll{false};
 
-// 登録欄でチケットを登録した直後、または一覧の行メニューでチケットを更新した直後に行う即時ポーリングのフラグ
+// 操作の結果を一覧へ反映する即時ポーリングのフラグ
+// 登録欄でチケットを登録した直後と、一覧の行メニューでチケットを更新した直後に立てる。
 // 明示操作の結果を一覧へ反映するため休止時間帯・クールダウンを無視するが、
 // 「今すぐ更新」と違い応答 Toast・エラー Toast の強制・メタ情報の再取得は行わない
-static std::atomic<bool> g_registerPoll{false};
+static std::atomic<bool> g_reflectPoll{false};
 
 // 前回ポーリング成功時刻（GetTickCount64、stale 判定専用。取得成功時のみ更新する）
 // 即時ポーリングのクールダウンには使わない。そちらは試行時刻（g_lastPollAttemptTick）が基準。
@@ -396,23 +402,38 @@ static UINT WM_TASKBAR_CREATED = 0;
 
 // Redmine チケット 1 件分
 // updated_on は UTC ISO 8601（"YYYY-MM-DDTHH:MM:SSZ"）のため、文字列の辞書順比較で新旧を判定できる。
-struct Issue {
+// 一覧の表示に使うチケットの属性（Issue と PinEntry の共通部分）
+// 取得集合のチケット（Issue）とピン留めのキャッシュ（PinEntry）が同じ属性を持つため、
+// 基底にまとめて一覧行の組み立て（buildListRows）とピンへの複写（setIssueState）を 1 経路にする。
+// フィールドを足すときはここに足せば、両方の型と複写に同時に効く。（savePins・loadPins の
+// 入出力だけは永続化の形式のため個別に追記する）
+struct IssueView {
     int         id        = 0;
     std::string subject;
-    std::string projectName;       // 一覧の表示専用。通知判定にも state.json にも使わない
+    std::string projectName;       // 一覧の表示専用。通知判定にも state.json にも使わない。ピンは集合外でも表示できるよう永続化
     std::string updatedOn;
+    bool        closed    = false; // status.is_closed（一覧で打ち消し線表示）
+    std::string dueDate;           // due_date（"YYYY-MM-DD"、期限なしは空。一覧の日付表示に使う）
+    std::string createdOn;         // created_on（UTC ISO 8601。作成日順の並べ替えと ✨ の判定に使う。辞書順比較可。旧形式のピンは空で ✨ なし）
+    int         priorityId = 0;    // priority.id（優先度順の並べ替え専用。0 = 不明）
+    bool assignedToGroup = false;  // 担当がグループ（一覧の 👥 マーカー。取得後にグループ id 集合と突合して設定）
+    bool isBugTracker    = false;  // トラッカーが bug_trackers に一致（一覧の 💥 マーカー。パース時に判定）
+    // 最終更新者・起票者・最後のコメント投稿者の表示名（resolveUpdaters が journals から確定する）
+    std::string updaterDisplay;    // 一覧の {lastname} 用（姓。取得できない場合はフルネーム）
+    std::string updaterFirst;      // 一覧の {firstname} 用（姓と違いフォールバックせず、未取得は空）
+    std::string authorDisplay;     // 一覧の {author} 用（起票者の姓。取得できない場合はフルネーム）
+    std::string commenterDisplay;  // 一覧の {commenter} 用（最後のコメント投稿者の姓。コメントなしは空）
+
+    bool operator==(const IssueView&) const = default;
+};
+
+struct Issue : IssueView {
     int         authorId  = 0;     // 自分の起票を通知対象から外すために保持する
     std::string authorName;        // 起票者名（新規流入 Toast の表示用。更新者名が取れない場合のフォールバック）
     int         assignedToId = 0;  // 担当者 id（0 = 未割当）
                                    // Redmine はユーザとグループが同一 id 空間のため、自分の id と
                                    // 一致するかを見るだけでグループ担当を弾ける。型の判別は不要。
-    bool        closed    = false; // status.is_closed（一覧で打ち消し線表示）
-    std::string dueDate;           // due_date（"YYYY-MM-DD"、期限なしは空。一覧の日付表示に使う）
-    std::string createdOn;         // created_on（UTC ISO 8601。作成日順の並べ替えと ✨ の判定に使う。辞書順比較可）
-    int         priorityId = 0;    // priority.id（優先度順の並べ替え専用。0 = 不明）
     std::vector<int> queryIds;     // このチケットが現れた保存クエリ id（昇順）。クエリ流入の検知に使う
-    bool assignedToGroup = false;  // 担当がグループ（一覧の 👥 マーカー。取得後にグループ id 集合と突合して設定）
-    bool isBugTracker    = false;  // トラッカーが bug_trackers に一致（一覧の 💥 マーカー。パース時に判定）
     bool hasFixedVersion = false;  // fixed_version が JSON に含まれ非 null。バージョンフィルタで見る
     int  trackerId = 0;            // トラッカー id（バージョン欄の有無判定用。0 = 不明）
     int  projectId = 0;            // プロジェクト id（バージョン欄の有無判定用。0 = 不明）
@@ -421,38 +442,19 @@ struct Issue {
     // false のチケットは「バージョン未指定の除外」の対象にしない。（設定しようがないため）
     // 不明・判定不能時は true = 従来どおり除外対象。
     bool hasVersionField = true;
-    // 最終更新者（resolveUpdaters が journals から確定する。journal なしは起票者で代替）
+    // 最終更新者（resolveUpdaters が journals から確定する。journal なしは起票者で代替。表示名は IssueView）
     int         updaterId = 0;     // 自分の操作による通知の抑止判定に使う（0 = 未確定）
     std::string updaterName;       // フルネーム（Toast の「更新：○○」表示用）
-    std::string updaterDisplay;    // 一覧の表示名（姓。取得できない場合はフルネーム）
-    std::string updaterFirstName;  // 一覧の {firstname} 用（姓と違いフォールバックせず、未取得は空）
-    std::string authorDisplay;     // 一覧の {author} 用（起票者の姓。取得できない場合はフルネーム）
-    std::string commenterDisplay;  // 一覧の {commenter} 用（最後のコメント投稿者の姓。コメントなしは空）
     // 最後の主要変更（説明・担当者・ステータスの変更かコメントの journal。一覧の 🆙 用。resolveUpdaters が確定）
     std::string changeOn;          // その journal の created_on（UTC ISO 8601。主要変更なし・未取得は空）
     int         changerId = 0;     // その journal の投稿者 id（0 = 主要変更なし・未取得）
 };
 
-// ピン留め 1 件分
+// ピン留め 1 件分（IssueView の全属性を永続化する）
 // id 以外もキャッシュするのは、起動直後や API 失敗時にもピンだけは一覧に出せるようにするため。
-struct PinEntry {
-    int         id = 0;
-    std::string subject;
-    std::string projectName;       // プロジェクト名（集合外ピンも表示できるよう永続化）
-    std::string updatedOn;
-    bool        closed = false;
-    std::string dueDate;           // due_date（"YYYY-MM-DD"、期限なしは空。一覧の日付表示に使う）
-    std::string createdOn;         // created_on（作成日順の並べ替えと ✨ の判定用。集合外ピンにも効くよう永続化。旧形式は空で ✨ なし）
-    int         priorityId = 0;    // priority.id（優先度順の並べ替え用。同上）
-    bool assignedToGroup = false;  // 担当がグループ（👥 マーカー。集合外ピンも表示できるよう永続化）
-    bool isBugTracker    = false;  // バグ・障害トラッカー（💥 マーカー。集合外ピンも表示できるよう永続化）
-    std::string updaterDisplay;    // 最終更新者の表示名（姓。集合外ピンも表示できるよう永続化）
-    std::string updaterFirst;      // 最終更新者の名（{firstname} 用。集合外ピンも表示できるよう永続化）
-    std::string authorDisplay;     // 起票者の姓（{author} 用。集合外ピンも表示できるよう永続化）
-    std::string commenterDisplay;  // 最後のコメント投稿者の姓（{commenter} 用。同上。コメントなしは空）
-
-    // 全フィールドの一致で等価とする（refreshPins の変更検知が使う）
-    // 既定実装にする理由は、フィールド追加時に比較の追記漏れで更新が黙って捨てられるのを防ぐため。
+// 等価比較は IssueView の既定実装（全フィールド一致）で、refreshPins の変更検知が使う。
+// 既定実装にする理由は、フィールド追加時に比較の追記漏れで更新が黙って捨てられるのを防ぐため。
+struct PinEntry : IssueView {
     bool operator==(const PinEntry&) const = default;
 };
 
@@ -686,7 +688,7 @@ static std::wstring getExeDir() {
 // アプリが書き出すファイル（state.json・pins.json・hidden.json・logs）の置き場。
 // exe 同フォルダに置かないのは、Scoop の更新でバージョン別ディレクトリが切り替わっても
 // ピン留め・非表示・ログを引き継ぐためと、Program Files 等の書き込み不可の展開先でも
-// 動かすため。利用者が編集する設定ファイルは Scoop の persist と整合させて exe 同フォルダのまま。
+// 動かすため。ユーザが編集する設定ファイルは Scoop の persist と整合させて exe 同フォルダのまま。
 // 既知フォルダを解決できない、またはディレクトリを作成できなければ空文字を返す。
 // （ログも状態も残せないため呼び出し側は起動を中止する）
 static std::wstring getDataDir() {
@@ -731,22 +733,47 @@ static constexpr long long HNS_PER_DAY = 24LL * 60 * 60 * 10000000LL;
 // UTC SYSTEMTIME を JST SYSTEMTIME に変換する
 static SYSTEMTIME utcToJst(SYSTEMTIME st) { return shiftSystemTime(st, +JST_OFFSET_HNS); }
 
+// YYYYMMDD の整数と SYSTEMTIME の日付部分の相互変換
+// 時刻部分は 0 で埋める。どちらも値の実在（2/31 等）は検証しない。
+static int systemTimeToYmd(const SYSTEMTIME& st) {
+    return st.wYear * 10000 + st.wMonth * 100 + st.wDay;
+}
+static SYSTEMTIME ymdToSystemTime(int ymd) {
+    SYSTEMTIME st = {};
+    st.wYear  = static_cast<WORD>(ymd / 10000);
+    st.wMonth = static_cast<WORD>(ymd / 100 % 100);
+    st.wDay   = static_cast<WORD>(ymd % 100);
+    return st;
+}
+
+// ISO 8601（YYYY-MM-DDThh:mm:ss。末尾の Z は読み飛ばす）を SYSTEMTIME に読む
+// 書式が合わなければ false。値の実在（2/31 等）は検証しない。
+// （必要な呼び出し側が SystemTimeToFileTime の失敗で弾く）
+static bool parseIsoDateTime(const std::string& iso, SYSTEMTIME& st) {
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+    if (sscanf_s(iso.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6) return false;
+    st = {};
+    st.wYear   = static_cast<WORD>(y);
+    st.wMonth  = static_cast<WORD>(mo);
+    st.wDay    = static_cast<WORD>(d);
+    st.wHour   = static_cast<WORD>(h);
+    st.wMinute = static_cast<WORD>(mi);
+    st.wSecond = static_cast<WORD>(s);
+    return true;
+}
+
 // JST の今日を YYYYMMDD の整数で返す（期限日との比較用）
 // 日付だけの比較なので、時刻を持たない due_date と粒度が揃う。JST 固定は utcToJst と同じ方針。
 static int todayJstYmd() {
     SYSTEMTIME st;
     GetSystemTime(&st);
-    st = utcToJst(st);
-    return st.wYear * 10000 + st.wMonth * 100 + st.wDay;
+    return systemTimeToYmd(utcToJst(st));
 }
 
 // YYYYMMDD の日付に days 日を加えた日付を YYYYMMDD で返す（月末・年末・閏日をまたぐ加算用）
 // 暦の計算は OS の FILETIME 変換に任せる。ymd が実在しない日付なら ymd をそのまま返す。
 static int addDaysYmd(int ymd, int days) {
-    SYSTEMTIME st = {};
-    st.wYear  = static_cast<WORD>(ymd / 10000);
-    st.wMonth = static_cast<WORD>(ymd / 100 % 100);
-    st.wDay   = static_cast<WORD>(ymd % 100);
+    SYSTEMTIME st = ymdToSystemTime(ymd);
     FILETIME ft;
     if (!SystemTimeToFileTime(&st, &ft)) return ymd;
     ULARGE_INTEGER u;
@@ -756,7 +783,7 @@ static int addDaysYmd(int ymd, int days) {
     ft.dwLowDateTime  = u.LowPart;
     ft.dwHighDateTime = u.HighPart;
     if (!FileTimeToSystemTime(&ft, &st)) return ymd;
-    return st.wYear * 10000 + st.wMonth * 100 + st.wDay;
+    return systemTimeToYmd(st);
 }
 
 // 期限日の表示情報
@@ -801,16 +828,8 @@ static long long todayJstDaySerial() {
 // 解釈不能・空（旧形式 pins.json 由来のピン等）は空文字列を返し、何も表示しない。
 // クロックずれで未来になったら「（今日）」へ丸める。
 static std::wstring makeUpdatedAgoText(const std::string& updatedOn, long long todayDays) {
-    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
-    if (sscanf_s(updatedOn.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6)
-        return L"";
-    SYSTEMTIME st = {};
-    st.wYear   = static_cast<WORD>(y);
-    st.wMonth  = static_cast<WORD>(mo);
-    st.wDay    = static_cast<WORD>(d);
-    st.wHour   = static_cast<WORD>(h);
-    st.wMinute = static_cast<WORD>(mi);
-    st.wSecond = static_cast<WORD>(s);
+    SYSTEMTIME st;
+    if (!parseIsoDateTime(updatedOn, st)) return L"";
     // 実在しない日付（2/31 等）や範囲外の時分秒は変換失敗で弾く。systemTimeToUli は
     // 変換失敗を検知せずゼロを返すため、ここで検証しないと通算日 0 との差が
     // 桁外れの「x 日前」表示になる
@@ -829,6 +848,7 @@ static std::wstring makeUpdatedAgoText(const std::string& updatedOn, long long t
 static std::wstring makeDueLeftText(const std::string& due, long long todayDays) {
     int y = 0, m = 0, d = 0;
     if (sscanf_s(due.c_str(), "%d-%d-%d", &y, &m, &d) != 3) return L"";
+    // ymdToSystemTime を通さず直接入れる。（月・日が 2 桁を超える不正値を桁上がりで別の日付にしないため）
     SYSTEMTIME st = {};
     st.wYear  = static_cast<WORD>(y);
     st.wMonth = static_cast<WORD>(m);
@@ -1004,6 +1024,18 @@ static DWORD calcSleepUntilNextPoll(int pollsPerHour) {
 
 // ==================== HTTP ====================
 
+// WinHTTP ハンドルの RAII ガード
+// どの return 経路でも WinHttpCloseHandle を保証する。（セッション・接続・要求の 3 つを関数内で持ち、
+// 宣言の逆順＝要求 → 接続 → セッションの順に閉じる）
+struct WinHttpHandle {
+    HINTERNET h = nullptr;
+    explicit WinHttpHandle(HINTERNET v) : h(v) {}
+    ~WinHttpHandle() { if (h) WinHttpCloseHandle(h); }
+    WinHttpHandle(const WinHttpHandle&) = delete;
+    WinHttpHandle& operator=(const WinHttpHandle&) = delete;
+    explicit operator bool() const { return h != nullptr; }
+};
+
 // WinHTTP で HTTPS リクエストを実行する
 // method: L"GET"・L"POST"・L"PUT"
 // authHeader: 空でなければ "名前: 値" 形式のヘッダ 1 行としてそのまま付与
@@ -1017,10 +1049,15 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
     const std::wstring& authHeader, DWORD* outStatusCode = nullptr)
 {
     if (outStatusCode) *outStatusCode = 0;
-    HINTERNET hSession = WinHttpOpen(L"redntfy/1.0",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) return "";
+    // AUTOMATIC_PROXY は OS のプロキシ設定（PAC・自動検出・ユーザ設定）を使う。
+    // DEFAULT_PROXY は netsh winhttp の設定しか見ず、プロキシ必須の環境で全通信が失敗する。
+    // 要求ごとにセッションを作るが、自動検出と PAC の結果は Windows 8.1 以降の WinHTTP
+    // AutoProxy サービスがプロセス横断でキャッシュするため、毎回の検出待ちにはならない。
+    WinHttpHandle session(WinHttpOpen(L"redntfy/1.0",
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+    if (!session) return "";
+    const HINTERNET hSession = session.h;
     // タイムアウト値（名前解決・接続・送信・受信の順、単位はミリ秒）
     // 名前解決の 0 は無制限を意味する。（タイムアウトの無効ではなく待ち続ける設定）
     // 既定値から変更しているのは接続の 15 秒のみで、送信・受信は既定の 30 秒をそのまま指定する。
@@ -1036,22 +1073,16 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
     uc.dwHostNameLength = _countof(host);
     uc.lpszUrlPath      = path;
     uc.dwUrlPathLength  = _countof(path);
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) {
-        WinHttpCloseHandle(hSession);
-        return "";
-    }
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) return "";
 
-    HINTERNET hConnect = WinHttpConnect(hSession, host, uc.nPort, 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); return ""; }
+    WinHttpHandle connect(WinHttpConnect(hSession, host, uc.nPort, 0));
+    if (!connect) return "";
 
     DWORD reqFlags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, method, path,
-        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, reqFlags);
-    if (!hRequest) {
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return "";
-    }
+    WinHttpHandle request(WinHttpOpenRequest(connect.h, method, path,
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, reqFlags));
+    if (!request) return "";
+    const HINTERNET hRequest = request.h;
 
     // 認証ヘッダ付きは自動リダイレクトを禁止（API キー漏洩防止。関数コメント参照）
     if (!authHeader.empty()) {
@@ -1071,12 +1102,7 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
         headers.empty() ? 0 : static_cast<DWORD>(-1),
         bodyData, bodyLen, bodyLen, 0)
         && WinHttpReceiveResponse(hRequest, nullptr);
-    if (!ok) {
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return "";
-    }
+    if (!ok) return "";
 
     DWORD statusCode = 0, statusSize = sizeof(statusCode);
     WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
@@ -1101,9 +1127,6 @@ static std::string httpRequest(const wchar_t* method, const std::wstring& url,
         respBody.append(buf.data(), read);
     }
 
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
     if (!readOk) {
         writeLog("httpRequest: response body read failed: " + wideToUtf8(url)
                  + ", status=" + std::to_string(statusCode));
@@ -1350,7 +1373,7 @@ static bool saveState(const std::wstring& dir, const Config& cfg, const std::vec
             o.Insert(L"updated_on", JsonValue::CreateStringValue(winrt::to_hstring(is.updatedOn)));
             o.Insert(L"updater_id", JsonValue::CreateNumberValue(is.updaterId));
             o.Insert(L"updater",    JsonValue::CreateStringValue(winrt::to_hstring(is.updaterDisplay)));
-            o.Insert(L"updater_first", JsonValue::CreateStringValue(winrt::to_hstring(is.updaterFirstName)));
+            o.Insert(L"updater_first", JsonValue::CreateStringValue(winrt::to_hstring(is.updaterFirst)));
             o.Insert(L"author",     JsonValue::CreateStringValue(winrt::to_hstring(is.authorDisplay)));
             o.Insert(L"commenter",  JsonValue::CreateStringValue(winrt::to_hstring(is.commenterDisplay)));
             o.Insert(L"change_on",  JsonValue::CreateStringValue(winrt::to_hstring(is.changeOn)));
@@ -1627,13 +1650,11 @@ static int roundToDivisorOf60(int n) {
     return best;
 }
 
-// schedule 配列を TOML テーブルから読み込む（なければ nullopt）
+// schedule 配列（[app] の schedule の値）を読み込む（配列でなければ nullopt）
 // 各要素は [0, 60] にクランプし、60 の約数へ丸める。（0 = その時間帯は休止。丸めはログに残す）
 // 戻り値は常に 24 要素とする。（超過分は切り捨て、不足分は 1 で補完、非整数要素は 1 扱い）
 // 呼び出し側は時をそのまま添字に使い範囲検査をしないため、この要素数が前提になる。
-static std::optional<std::vector<int>> readSchedule(const std::optional<toml::table>& tbl) {
-    if (!tbl) return std::nullopt;
-    const auto* arr = (*tbl)["app"]["schedule"].as_array();
+static std::optional<std::vector<int>> readSchedule(const toml::array* arr) {
     if (!arr) return std::nullopt;
     std::vector<int> sched;
     for (const auto& el : *arr) {
@@ -1660,188 +1681,146 @@ static Config loadConfig(const std::wstring& exeDir) {
     auto local = loadToml(exeDir + L"\\" + CONFIG_LOCAL_FILENAME);
     if (local) writeLog("Loaded redntfy.local.toml (override active)");
 
-    // 文字列配列の読み込み（キー不在は nullopt を返し、空配列との区別に使う）
-    // [app] セクション下のキーだけを対象とする。（トップレベルへの記述は無視する）
-    auto readStrArray = [](const std::optional<toml::table>& tbl, const char* key)
-            -> std::optional<std::vector<std::string>> {
-        if (!tbl) return std::nullopt;
-        const auto* arr = (*tbl)["app"][key].as_array();
-        if (!arr) return std::nullopt;
+    // local → base の順でキーを探し、最初に見つかった側のノードを返す。（どちらにも無ければ空のビュー）
+    // 採否はキーの有無だけで決め、見つかった側の値の型が合わなくても他方へは進まない。
+    // （local の不正値で黙って base の値を拾わないため。型不一致は各読み込みが既定値へ落とす）
+    // セクション直下のキーだけを対象とする。（トップレベルへの記述は無視する）
+    auto findNode = [&](const char* section, const char* key) -> toml::node_view<const toml::node> {
+        for (const auto* tbl : { local ? &*local : nullptr, base ? &*base : nullptr }) {
+            if (!tbl) continue;
+            auto node = (*tbl)[section][key];
+            if (node) return node;
+        }
+        return {};
+    };
+
+    // [app] の文字列配列（キーが存在する側を採用する。空配列でも local を採る）
+    auto readStrArray = [&](const char* key) -> std::vector<std::string> {
         std::vector<std::string> out;
-        for (const auto& el : *arr) {
-            if (auto s = el.value<std::string>()) out.push_back(*s);
+        if (const auto* arr = findNode("app", key).as_array()) {
+            for (const auto& el : *arr) {
+                if (auto s = el.value<std::string>()) out.push_back(*s);
+            }
         }
         return out;
     };
-    // キーが存在する側を採用する（local 優先。空配列でも local を採る）
-    auto pickStrArray = [&](const char* key) -> std::vector<std::string> {
-        if (auto v = readStrArray(local, key)) return *v;
-        if (auto v = readStrArray(base, key))  return *v;
-        return {};
-    };
 
     Config cfg;
-    if (auto s = readSchedule(local)) {
-        cfg.schedule = std::move(*s);
-    }
-    else if (auto s = readSchedule(base)) {
-        cfg.schedule = std::move(*s);
-    }
-    else {
-        cfg.schedule.resize(24, 1);
-    }
+    // schedule も他のキーと同じく、キーが存在する側を採用する
+    if (auto s = readSchedule(findNode("app", "schedule").as_array())) cfg.schedule = std::move(*s);
+    else cfg.schedule.resize(24, 1);
 
-    cfg.bugTrackers = pickStrArray("bug_trackers");
+    cfg.bugTrackers = readStrArray("bug_trackers");
     // ダッキング対象はプロセス名の比較に wstring を使うため、ここで変換する
-    for (const auto& s : pickStrArray("duck_targets")) cfg.duckTargets.push_back(toWide(s));
+    for (const auto& s : readStrArray("duck_targets")) cfg.duckTargets.push_back(toWide(s));
 
-    // スカラー読み込みヘルパー（local → base → デフォルトの優先順）
-    auto readConfigBool = [&](const char* section, const char* key, bool def) -> bool {
-        if (local && (*local)[section][key].is_boolean()) return **(*local)[section][key].as_boolean();
-        if (base && (*base)[section][key].is_boolean())   return **(*base)[section][key].as_boolean();
-        return def;
+    // スカラー読み込み（findNode の側の値が型に合わなければ既定値）
+    auto readBool = [&](const char* section, const char* key, bool def) -> bool {
+        auto node = findNode(section, key);
+        return node.is_boolean() ? **node.as_boolean() : def;
     };
-    auto readConfigFloat = [&](const char* section, const char* key, float def, float lo, float hi) -> float {
-        double v = def;
-        if (local && (*local)[section][key].is_number()) v = (*local)[section][key].value_or(def);
-        else if (base && (*base)[section][key].is_number()) v = (*base)[section][key].value_or(def);
+    auto readFloat = [&](const char* section, const char* key, float def, float lo, float hi) -> float {
+        auto node = findNode(section, key);
+        const double v = node.is_number() ? node.value_or(static_cast<double>(def)) : def;
         return static_cast<float>((std::max)((double)lo, (std::min)((double)hi, v)));
     };
-    // [app] セクション下の整数
-    auto readAppInt = [&](const char* key, int def, int lo, int hi) -> int {
-        long long v = def;
-        if (local && (*local)["app"][key].is_integer())      v = **(*local)["app"][key].as_integer();
-        else if (base && (*base)["app"][key].is_integer())   v = **(*base)["app"][key].as_integer();
+    auto readInt = [&](const char* section, const char* key, int def, int lo, int hi) -> int {
+        auto node = findNode(section, key);
+        const long long v = node.is_integer() ? **node.as_integer() : def;
         return static_cast<int>((std::max)((long long)lo, (std::min)((long long)hi, v)));
     };
-    // [app] セクション下の文字列
-    auto readAppString = [&](const char* key) -> std::wstring {
-        if (local && (*local)["app"][key].is_string()) return toWide(**(*local)["app"][key].as_string());
-        if (base && (*base)["app"][key].is_string())   return toWide(**(*base)["app"][key].as_string());
-        return {};
-    };
-    // [redmine] セクションの文字列・整数
-    auto readRedmineString = [&](const char* key) -> std::wstring {
-        if (local && (*local)["redmine"][key].is_string()) return toWide(**(*local)["redmine"][key].as_string());
-        if (base && (*base)["redmine"][key].is_string())   return toWide(**(*base)["redmine"][key].as_string());
-        return {};
-    };
-    // [redmine] の register_project（識別子の文字列、または数値 id の整数）
-    // 整数は 10 進文字列に変換して識別子と同じ扱いにする。（Redmine の API はどちらも受ける。
-    // 整数を黙って無視すると、ログイン名由来の別プロジェクトへ登録されるため）
-    // local のキーが文字列・整数のどちらでも base より優先する。
-    auto readRegisterProject = [&]() -> std::wstring {
-        for (const auto* tbl : { local ? &*local : nullptr, base ? &*base : nullptr }) {
-            if (!tbl) continue;
-            const auto& node = (*tbl)["redmine"]["register_project"];
-            if (node.is_string())  return toWide(**node.as_string());
-            if (node.is_integer()) return std::to_wstring(**node.as_integer());
-        }
-        return {};
-    };
-    // [redmine] の整数配列（query_ids）
-    // 配列は「local にキーが存在するか」で採否を決める。（duck_targets / schedule と同じ方針）
-    // 0 以下・非整数の要素と重複 id は除外する。（同じ HTTP を 2 回叩かない）
-    auto readRedmineIntArray = [&](const std::optional<toml::table>& tbl, const char* key)
-            -> std::optional<std::vector<int>> {
-        if (!tbl) return std::nullopt;
-        const auto* arr = (*tbl)["redmine"][key].as_array();
-        if (!arr) return std::nullopt;
-        std::vector<int> ids;
-        for (const auto& el : *arr) {
-            auto v = el.value<int64_t>();
-            if (!v || *v <= 0 || *v > INT_MAX) continue;
-            int id = static_cast<int>(*v);
-            if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
-        }
-        return ids;
+    auto readString = [&](const char* section, const char* key) -> std::wstring {
+        auto node = findNode(section, key);
+        return node.is_string() ? toWide(**node.as_string()) : std::wstring{};
     };
 
     // [redmine] 接続設定（url・api_key の欠落チェックは wmain で行い、欠けていれば無効モードで常駐する。
     // query_ids は省略可でフォールバックモードになる）
-    cfg.redmineUrl = readRedmineString("url");
+    cfg.redmineUrl = readString("redmine", "url");
     while (!cfg.redmineUrl.empty() && cfg.redmineUrl.back() == L'/')
         cfg.redmineUrl.pop_back();  // 末尾スラッシュを除去して URL 連結を単純化する
-    cfg.apiKey  = readRedmineString("api_key");
-    cfg.registerProject = readRegisterProject();
-    // close_status_id は local のキーを優先し、1〜INT_MAX の整数だけ採用する（範囲外・非整数は未設定扱い）
-    for (const auto* tbl : { local ? &*local : nullptr, base ? &*base : nullptr }) {
-        if (!tbl) continue;
-        const auto& node = (*tbl)["redmine"]["close_status_id"];
-        if (!node) continue;  // キーが無い側だけ base へ進む（local の不正値で base を拾わない）
-        auto v = node.value<int64_t>();
-        if (v && *v > 0 && *v <= INT_MAX) cfg.closeStatusId = static_cast<int>(*v);
-        break;
+    cfg.apiKey  = readString("redmine", "api_key");
+    // register_project は識別子の文字列、または数値 id の整数。
+    // 整数は 10 進文字列に変換して識別子と同じ扱いにする。（Redmine の API はどちらも受ける。
+    // 整数を黙って無視すると、ログイン名由来の別プロジェクトへ登録されるため）
+    {
+        auto node = findNode("redmine", "register_project");
+        if (node.is_string())       cfg.registerProject = toWide(**node.as_string());
+        else if (node.is_integer()) cfg.registerProject = std::to_wstring(**node.as_integer());
     }
-    if (auto q = readRedmineIntArray(local, "query_ids"))     cfg.queryIds = std::move(*q);
-    else if (auto q = readRedmineIntArray(base, "query_ids")) cfg.queryIds = std::move(*q);
+    // close_status_id は 1〜INT_MAX の整数だけ採用する（範囲外・非整数は未設定扱い）
+    if (auto v = findNode("redmine", "close_status_id").value<int64_t>(); v && *v > 0 && *v <= INT_MAX)
+        cfg.closeStatusId = static_cast<int>(*v);
+    // query_ids は 0 以下・非整数の要素と重複 id を除外する。（同じ HTTP を 2 回叩かない）
+    if (const auto* arr = findNode("redmine", "query_ids").as_array()) {
+        for (const auto& el : *arr) {
+            auto v = el.value<int64_t>();
+            if (!v || *v <= 0 || *v > INT_MAX) continue;
+            int id = static_cast<int>(*v);
+            if (std::find(cfg.queryIds.begin(), cfg.queryIds.end(), id) == cfg.queryIds.end())
+                cfg.queryIds.push_back(id);
+        }
+    }
 
     // 旧キー query_id は廃止。設定エラー Toast だけでは移行漏れの原因が分からないためログで補う
-    if ((local && (*local)["redmine"]["query_id"].is_integer())
-        || (base && (*base)["redmine"]["query_id"].is_integer())) {
+    if (findNode("redmine", "query_id").is_integer())
         writeLog("config: [redmine] query_id is obsolete; use query_ids = [12, 34]");
-    }
 
     // 一覧の表示件数と行フォーマット
     // 上限 40 は LIST_ROW_MAX（50 行）の内側に、ピン・非表示の行を足す余地を残す値
-    cfg.listLimit = readAppInt("list_limit", 20, 1, 40);
+    cfg.listLimit = readInt("app", "list_limit", 20, 1, 40);
 
     // 一覧の行フォーマット（空・未指定は既定テンプレート）
-    std::wstring fmtStr = readAppString("list_format");
+    std::wstring fmtStr = readString("app", "list_format");
     if (fmtStr.empty()) fmtStr = LIST_FORMAT_DEFAULT;
     cfg.listFormat = parseListFormat(fmtStr);
 
     // 旧キーは廃止。読み捨てられていることをログで補う（query_id の前例に倣う）
     for (const char* obsolete : { "subject_max_chars", "project_max_chars" }) {
-        if ((local && (*local)["app"][obsolete].is_integer())
-            || (base && (*base)["app"][obsolete].is_integer())) {
+        if (findNode("app", obsolete).is_integer()) {
             writeLog(std::string("config: [app] ") + obsolete
                 + " is obsolete; use list_format placeholders like {subject:40}");
         }
     }
 
     // バージョン欄判定情報の再取得間隔（時間）
-    cfg.versionMetaRefreshHours = readAppInt("version_meta_refresh_hours", 24, 1, 168);
+    cfg.versionMetaRefreshHours = readInt("app", "version_meta_refresh_hours", 24, 1, 168);
 
     // 一覧の ✨ と 🆙 を付ける期間（✨ は起票から、🆙 は他人の最後の主要変更からの時間）
-    cfg.newMarkHours = readAppInt("new_mark_hours", 24, 0, 720);
+    cfg.newMarkHours = readInt("app", "new_mark_hours", 24, 0, 720);
 
     // hover_delay_ms（OS のホバー検出から一覧を表示するまでの追加遅延、ms 単位。
     // デフォルト 100、0〜5000 にクランプ、0 でホバー検出と同時に表示）
-    cfg.hoverDelayMs = readAppInt("hover_delay_ms",
+    cfg.hoverDelayMs = readInt("app", "hover_delay_ms",
         static_cast<int>(DEFAULT_HOVER_DELAY_MS),
         static_cast<int>(MIN_HOVER_DELAY_MS),
         static_cast<int>(MAX_HOVER_DELAY_MS));
 
     // ホバー自動表示直後に左クリックを無視する猶予（ms 単位。デフォルト 300、0〜5000 にクランプ、0 で無効）
-    cfg.hoverClickGuardMs = readAppInt("hover_click_guard_ms",
+    cfg.hoverClickGuardMs = readInt("app", "hover_click_guard_ms",
         static_cast<int>(DEFAULT_HOVER_CLICK_GUARD_MS),
         static_cast<int>(MIN_HOVER_CLICK_GUARD_MS),
         static_cast<int>(MAX_HOVER_CLICK_GUARD_MS));
 
     // 一覧のトグルのグローバルショートカットキー
-    // local のキーを優先する。空文字は「無効」の明示なので、キーの有無で既定値と区別する。（readAppString は区別できない）
+    // 空文字は「無効」の明示なので、キーの有無で既定値と区別する。（readString は区別できない）
     // 文字列以外の値は書式の誤りとして既定値を使い、ログに残す。
     cfg.toggleHotkey = DEFAULT_TOGGLE_HOTKEY;
-    for (const auto* tbl : { local ? &*local : nullptr, base ? &*base : nullptr }) {
-        if (!tbl) continue;
-        const auto& node = (*tbl)["app"]["toggle_hotkey"];
-        if (!node) continue;  // キーが無い側だけ base へ進む
+    if (auto node = findNode("app", "toggle_hotkey")) {
         if (node.is_string()) cfg.toggleHotkey = toWide(**node.as_string());
         else writeLog("config: [app] toggle_hotkey must be a string like \"Ctrl+Shift+Win+R\"; using default");
-        break;
     }
 
-    // [guard] ガードトーン設定
-    cfg.guardToneMs = (int)readConfigFloat("guard", "tone_ms", 1500.0f, 0.0f, 10000.0f);
+    // [guard] ガードトーン設定（整数・小数のどちらでも書けるよう数値として読む）
+    cfg.guardToneMs = static_cast<int>(readFloat("guard", "tone_ms", 1500.0f, 0.0f, 10000.0f));
 
     // [loudness] ラウドネスノーマライズ設定
-    cfg.loudnessEnabled     = readConfigBool("loudness", "enabled", true);
-    cfg.loudnessTarget      = readConfigFloat("loudness", "target", -16.0f, -60.0f, 0.0f);
-    cfg.loudnessPeakCeiling = readConfigFloat("loudness", "peak_ceiling", 0.891f, 0.1f, 1.0f);
+    cfg.loudnessEnabled     = readBool("loudness", "enabled", true);
+    cfg.loudnessTarget      = readFloat("loudness", "target", -16.0f, -60.0f, 0.0f);
+    cfg.loudnessPeakCeiling = readFloat("loudness", "peak_ceiling", 0.891f, 0.1f, 1.0f);
 
     // [update] 更新チェック設定
-    cfg.updateCheckEnabled = readConfigBool("update", "enabled", true);
+    cfg.updateCheckEnabled = readBool("update", "enabled", true);
 
     return cfg;
 }
@@ -2179,8 +2158,10 @@ static std::wstring issuesFilterQuery(int queryId) {
 // ただし順位の安定は「走査済みページからのチケット離脱による前詰め」を防げない。
 // 前詰めが起きると offset 境界の 1 件が飛び、total_count も同数減るため
 // 末尾の offset < total チェックでは構造的に検出できない。そこで全ページで
-// total_count の不変を検証し、変化したら取得を破棄して次回リトライに委ねる。
-// （空振りのコストは誤「新規」通知よりはるかに軽い）
+// total_count の不変を検証し、変化したら部分結果を破棄して先頭ページから取り直す。
+// 取り直しは PAGING_RESTART_MAX 回までで、超えたら失敗を返して次回ポーリングに委ねる。
+// （空振りのコストは誤「新規」通知よりはるかに軽い。取り直さずに失敗にすると、集合の
+// 正常な更新が接続エラーの Toast として通知されるため、関数内で取り直す）
 // 失敗ログにクエリ id を含めるのは、複数クエリ運用でどのクエリが壊れているかを
 // ログだけで切り分けられるようにするため。
 // outAuthError は省略可（nullptr）。HTTP 401 検出時に true を書き込む。呼び出し側が
@@ -2196,9 +2177,13 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
     outIssues.clear();
 
     const std::string logTag = "fetchQueryIssues(" + std::to_string(queryId) + ")";
+    static constexpr int PAGING_RESTART_MAX = 2;  // total_count の変化による先頭からの取り直しの上限
+    int restarts = 0;
     int offset = 0;
     int total  = -1;  // 初回ページの total_count で確定する（-1 は未確定）
-    do {
+    // do-while にしないのは、取り直しの continue が末尾条件（offset < total）へ飛び、
+    // 0 < -1 でループを抜けて空の結果を成功にしてしまうため。終了判定は末尾に明示する
+    for (;;) {
         std::wstring url = cfg.redmineUrl + L"/issues.json?" + issuesFilterQuery(queryId)
             + L"&sort=id&limit=100&offset=" + std::to_wstring(offset);
         DWORD status = 0;
@@ -2214,7 +2199,7 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
                 return false;
             }
             // total_count がページ間で変化した＝走査中に集合が増減した。前詰めによる
-            // 取りこぼしの可能性があるため、部分結果を破棄して失敗扱いにする
+            // 取りこぼしの可能性があるため、部分結果を破棄して先頭ページから取り直す
             const int pageTotal = static_cast<int>(obj.GetNamedNumber(L"total_count", 0));
             if (total < 0) {
                 total = pageTotal;
@@ -2222,8 +2207,12 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
             else if (pageTotal != total) {
                 writeLog(logTag + ": total_count changed during paging ("
                     + std::to_string(total) + " -> " + std::to_string(pageTotal)
-                    + "), discarded");
-                return false;
+                    + "), " + (restarts < PAGING_RESTART_MAX ? "restarting" : "discarded"));
+                if (restarts++ >= PAGING_RESTART_MAX || g_shutdownRequested) return false;
+                outIssues.clear();
+                offset = 0;
+                total  = -1;
+                continue;
             }
             auto arr = obj.GetNamedArray(L"issues");
             if (arr.Size() == 0) break;  // total_count 不整合による無限ループ防止
@@ -2237,7 +2226,8 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
             writeLog(logTag + ": unexpected JSON structure");
             return false;
         }
-    } while (offset < total && !g_shutdownRequested);
+        if (offset >= total || g_shutdownRequested) break;
+    }
 
     // シャットダウンによる中断や total_count 不整合で全件に達しなかった場合は失敗扱いとする。
     // 部分集合のまま成功を返すと state.json が欠落込みで上書きされ、次回に「新規」誤通知が出る
@@ -2309,15 +2299,15 @@ static bool fetchIssue(const Config& cfg, int id, Issue& out) {
 // UTC ISO 8601（YYYY-MM-DDThh:mm:ssZ）を epoch 秒に変換する
 // 解釈不能なら -1 を返す。journal と updated_on の突き合わせに使う。
 static long long isoUtcToEpoch(const std::string& iso) {
-    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
-    if (sscanf_s(iso.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6) return -1;
+    SYSTEMTIME st;
+    if (!parseIsoDateTime(iso, st)) return -1;
     struct tm t = {};
-    t.tm_year = y - 1900;
-    t.tm_mon  = mo - 1;
-    t.tm_mday = d;
-    t.tm_hour = h;
-    t.tm_min  = mi;
-    t.tm_sec  = s;
+    t.tm_year = st.wYear - 1900;
+    t.tm_mon  = st.wMonth - 1;
+    t.tm_mday = st.wDay;
+    t.tm_hour = st.wHour;
+    t.tm_min  = st.wMinute;
+    t.tm_sec  = st.wSecond;
     long long e = static_cast<long long>(_mkgmtime(&t));
     return e < 0 ? -1 : e;
 }
@@ -2540,7 +2530,7 @@ static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
             && it->second.hasChange) {
             is.updaterId        = it->second.updaterId;
             is.updaterDisplay   = it->second.updaterDisplay;
-            is.updaterFirstName = it->second.updaterFirst;
+            is.updaterFirst = it->second.updaterFirst;
             is.authorDisplay    = it->second.authorDisplay;
             is.commenterDisplay = it->second.commenterDisplay;
             is.changeOn         = it->second.changeOn;
@@ -2567,7 +2557,7 @@ static void resolveUpdaters(const Config& cfg, std::vector<Issue>& issues,
         // 再解決する。（フルネームへの縮退が state.json のキャッシュに残り、更新まで戻らなくなるため）
         if (!names || !authorNames || !commenterNames) continue;
         is.updaterDisplay   = names->lastName;
-        is.updaterFirstName = names->firstName;
+        is.updaterFirst = names->firstName;
         if (is.updaterDisplay.empty()) is.updaterDisplay = dispName;
         // 起票者と最後のコメント投稿者の姓（{author}・{commenter}）。姓が取れなければフルネーム
         is.authorDisplay = authorNames->lastName.empty() ? is.authorName : authorNames->lastName;
@@ -2820,7 +2810,7 @@ static bool isRegistryDeviceInUse(const wchar_t* deviceType) {
     basePath += deviceType;
 
     auto checkSubKeys = [](const std::wstring& keyPath, bool skipNonPackaged) -> bool {
-        // RAII ガード: 例外（std::bad_alloc 等）でもハンドルを確実に閉じる
+        // RAII ガード：例外（std::bad_alloc 等）でもハンドルを確実に閉じる
         struct Guard { HKEY h = nullptr; ~Guard() { if (h) RegCloseKey(h); } };
 
         Guard kg;
@@ -2862,7 +2852,7 @@ static bool isRegistryDeviceInUse(const wchar_t* deviceType) {
 
 // WASAPI でマイクキャプチャセッションがアクティブかを判定する
 //
-// 通知スレッドの MTA COM を利用。（呼び出し元スレッドで CoInitializeEx 済み前提）
+// ポーリングスレッドの MTA COM を利用。（呼び出し元スレッドで CoInitializeEx 済み前提）
 // レジストリで検出できない仮想オーディオデバイス経由の使用を補完検出する。
 static bool isMicCaptureActive() {
     winrt::com_ptr<IMMDeviceEnumerator> enumerator;
@@ -2975,7 +2965,7 @@ static void normalizeLoudness(std::vector<int16_t>& samples, int channels,
 // 起動時（設定読み込み後）に 1 回だけ呼び出す。以降の再生は g_wavCache を使い回す。
 // 16bit PCM WAV のみ対応。ファイルが存在しない場合は g_wavCache.valid = false のまま。
 static void loadWavAndNormalize(const std::wstring& exeDir, const Config& cfg) {
-    g_wavCache = WavCache{};  // リセット
+    g_wavCache = WavCache{};
 
     std::wstring soundPath = exeDir + L"\\" + DEFAULT_SOUND_FILE;
     HANDLE hFile = CreateFileW(soundPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
@@ -3029,9 +3019,11 @@ static void loadWavAndNormalize(const std::wstring& exeDir, const Config& cfg) {
                 }
                 if (chunkSize > readSize)
                     SetFilePointer(hFile, (LONG)(chunkSize - readSize), nullptr, FILE_CURRENT);
+                // nBlockAlign は再生時の memcpy の長さに使うため nChannels×2（16bit）と一致を要求する。
+                // （不整合なファイルでは samples の末尾を越えて読む）
                 if (wavFmt.wFormatTag != WAVE_FORMAT_PCM || wavFmt.wBitsPerSample != 16
-                        || wavFmt.nSamplesPerSec == 0 || wavFmt.nBlockAlign == 0
-                        || wavFmt.nChannels == 0) {
+                        || wavFmt.nSamplesPerSec == 0 || wavFmt.nChannels == 0
+                        || wavFmt.nBlockAlign != wavFmt.nChannels * 2) {
                     writeLog("loadWavAndNormalize: unsupported format, only 16bit PCM WAV is supported");
                     goto cleanup;
                 }
@@ -3424,7 +3416,10 @@ static std::wstring buildIconTag() {
 // xml は </visual> まで構築済みの文字列を渡す。（</toast> は内部で付加する）
 // buttonLabel はボタンの表示文言。既定はチケット通知向けで、新版通知など開く先が
 // チケットでない Toast は呼び出し側が文言を差し替える。
+// 例外は投げない。WinRT の失敗は Toast の 1 行目を添えてログに残し、呼び出し側の処理は続ける。
+// （どの呼び出し側も Toast の失敗で処理を変えないため、例外処理をここに集約する）
 static void dispatchToastXml(std::wstring xml, const std::wstring& permalink,
+                             const std::wstring& line1,
                              const std::wstring& buttonLabel = L"チケットを開く")
 {
     if (!permalink.empty() && isHttpUrl(permalink)) {
@@ -3435,19 +3430,27 @@ static void dispatchToastXml(std::wstring xml, const std::wstring& permalink,
     }
     xml += L"</toast>";
 
-    winrt::Windows::Data::Xml::Dom::XmlDocument doc;
-    doc.LoadXml(xml);
+    try {
+        winrt::Windows::Data::Xml::Dom::XmlDocument doc;
+        doc.LoadXml(xml);
 
-    auto notifier = winrt::Windows::UI::Notifications::ToastNotificationManager
-        ::CreateToastNotifier(APP_AUMID);
-    auto notification = winrt::Windows::UI::Notifications::ToastNotification(doc);
+        auto notifier = winrt::Windows::UI::Notifications::ToastNotificationManager
+            ::CreateToastNotifier(APP_AUMID);
+        auto notification = winrt::Windows::UI::Notifications::ToastNotification(doc);
 
-    notifier.Show(notification);
+        notifier.Show(notification);
+    }
+    catch (winrt::hresult_error const& e) {
+        writeLog("toast failed (" + wideToUtf8(line1) + "): " + winrt::to_string(e.message()));
+    }
+    catch (...) {
+        writeLog("toast failed (" + wideToUtf8(line1) + "): unknown exception");
+    }
 }
 
 // Toast 通知を表示する
 //
-// OS に通知を登録して即 return する。（コールバック待機なし）
+// OS に通知を登録して即 return する。（コールバック待機なし。失敗はログのみで例外は投げない）
 // アプリアイコン（exe 同フォルダの app.ico）を含む通知を表示する。
 // permalink が非空かつ http(s) のときだけ「チケットを開く」ボタンが付く。空で渡すとボタンなし。
 // silent=true（デフォルト）：OS 通知音を無効化する。（アプリ側で sound.wav を鳴らすため）
@@ -3464,7 +3467,7 @@ static void showToast(const std::wstring& line1, const std::wstring& line2,
         L"</binding></visual>"
         + (silent ? L"<audio silent=\"true\"/>" : L"");
 
-    dispatchToastXml(std::move(xml), permalink);
+    dispatchToastXml(std::move(xml), permalink, line1);
 }
 
 // 3 行 Toast 通知を表示する（更新チェックの新版通知、無効モードの案内用）
@@ -3486,7 +3489,7 @@ static void showToast3(const std::wstring& line1, const std::wstring& line2,
         L"</binding></visual>"
         + (silent ? L"<audio silent=\"true\"/>" : L"");
 
-    dispatchToastXml(std::move(xml), permalink, buttonLabel);
+    dispatchToastXml(std::move(xml), permalink, line1, buttonLabel);
 }
 
 // エラー Toast 表示（クールダウン制御付き）
@@ -3504,28 +3507,20 @@ static void showErrorToast(const std::wstring& title, const std::wstring& body,
     ULONGLONG last = g_lastErrorToastTime.load();
     if (!force && last != 0 && now - last < ERROR_TOAST_COOLDOWN_MS) return;
     g_lastErrorToastTime.store(now);
-    try {
-        showToast(title, body, L"");
-    }
-    catch (winrt::hresult_error const& e) {
-        writeLog("showErrorToast failed: " + winrt::to_string(e.message()));
-    }
-    catch (...) {
-        writeLog("showErrorToast failed: unknown exception");
-    }
+    showToast(title, body, L"");
 }
 
-// ==================== トレイアイコン ====================
+// ==================== ポーリングの待機 ====================
 
 // バックグラウンドスレッド用の中断可能 Sleep
 //
 // メッセージは処理しない。（呼び出し元がメインスレッドではないため）
-// g_shutdownRequested・g_forcePoll・g_manualPoll・g_registerPoll のいずれかが true になった時点で即座にリターンする。
-// 100 ms 単位で各フラグをポーリングするため、最大 100 ms の中断遅延が発生する。
+// g_shutdownRequested・g_forcePoll・g_manualPoll・g_reflectPoll のいずれかが true になった時点で即座にリターンする。
+// 100ms 単位で各フラグをポーリングするため、最大 100ms の中断遅延が発生する。
 static void waitInterruptible(DWORD ms) {
     ULONGLONG end = GetTickCount64() + ms;
     while (!g_shutdownRequested && !g_forcePoll.load() && !g_manualPoll.load()
-           && !g_registerPoll.load()) {
+           && !g_reflectPoll.load()) {
         ULONGLONG now = GetTickCount64();
         if (end <= now) break;
         ULONGLONG remain = end - now;
@@ -3533,6 +3528,8 @@ static void waitInterruptible(DWORD ms) {
         Sleep(chunk);
     }
 }
+
+// ==================== トレイアイコン ====================
 
 // NOTIFYICONDATAW の共通フィールドを初期化する
 static NOTIFYICONDATAW makeTrayNid(HWND hWnd) {
@@ -3573,9 +3570,9 @@ static void addTrayIcon(HWND hWnd) {
         nid.uFlags |= NIF_SHOWTIP;
     }
     UINT iconId = isDisabled() ? IDI_APP_ICON_DISABLE : IDI_APP_ICON;
+    // LoadIconW が返す共有アイコンは DestroyIcon しない。（API の契約。破棄は createBadgedIcon の生成物だけ）
     nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(iconId));
     Shell_NotifyIconW(NIM_ADD, &nid);
-    if (nid.hIcon) DestroyIcon(nid.hIcon);
     nid.uVersion = NOTIFYICON_VERSION_4;
     g_trayV4 = Shell_NotifyIconW(NIM_SETVERSION, &nid) != FALSE;
     if (!g_trayV4) {
@@ -3705,14 +3702,16 @@ static void updateTrayIcon(HWND hWnd, bool hasUnread) {
     // シェルが表示指定を呼び出しごとの状態と解釈しても、案内のツールチップを消さないため。
     // 付与条件は updateTrayTooltip の無効モード分岐と一致させること
     nid.uFlags = NIF_ICON | (isDisabled() ? NIF_SHOWTIP : 0u);
+    // createBadgedIcon の生成物だけを DestroyIcon する。（LoadIconW の共有アイコンは破棄しない契約）
+    HICON badged = nullptr;
     switch (style) {
     case TrayIconStyle::Disabled:
         nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON_DISABLE));
         break;
     case TrayIconStyle::NormalBadged:
-        nid.hIcon = createBadgedIcon();
-        if (!nid.hIcon)
-            nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
+        badged = createBadgedIcon();
+        nid.hIcon = badged ? badged
+                           : LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
         break;
     default:
         nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON));
@@ -3721,7 +3720,7 @@ static void updateTrayIcon(HWND hWnd, bool hasUnread) {
     // 成功時のみ前回状態を更新する。失敗時に先へ進めると、次回同じ状態の要求が差分なしと
     // 判定されてスキップされ、実アイコンが古いまま残り続けるため
     if (Shell_NotifyIconW(NIM_MODIFY, &nid)) g_trayIconStyle = style;
-    if (nid.hIcon) DestroyIcon(nid.hIcon);
+    if (badged) DestroyIcon(badged);
 }
 
 // トレイアイコンのツールチップをクリアする（ポップアップ表示前に呼ぶ）
@@ -3731,6 +3730,8 @@ static void clearTrayTooltip(HWND hWnd) {
     nid.szTip[0] = L'\0';
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
+
+// ==================== 一覧の行モデルとラベル ====================
 
 // 一覧に出す 1 行の素材（表示文字列の組み立て前）
 // 生成側は指定初期化子で書く。同じ型のメンバが連続するため、位置指定だと
@@ -3829,6 +3830,20 @@ static std::vector<ListRow> buildListRows(int& visible) {
         return false;
     };
 
+    // 一覧行の共通部分（IssueView から写す属性）。ピン・非表示・未読・マーカーは呼び出し側が決める
+    auto baseRow = [&](const IssueView& v) {
+        return ListRow{.id = v.id, .subject = v.subject, .projectName = projectLabel(v.projectName),
+                       .updater = v.updaterDisplay, .updaterFirst = v.updaterFirst,
+                       .author = v.authorDisplay, .commenter = v.commenterDisplay,
+                       .dueDate = v.dueDate,
+                       .updatedOn = v.updatedOn, .createdOn = v.createdOn,
+                       .priorityRank = rankOf(v.priorityId),
+                       .priorityHighlight = priorityHighlightOf(v.priorityId, priorities),
+                       .assignedToGroup = v.assignedToGroup,
+                       .isBugTracker = v.isBugTracker,
+                       .closed = v.closed};
+    };
+
     std::vector<ListRow>    rows;
     std::unordered_set<int> shown;
     visible = 0;
@@ -3847,38 +3862,25 @@ static std::vector<ListRow> buildListRows(int& visible) {
         else if (!hidden) {
             ++visible;
         }
-        rows.push_back({.id = is.id, .subject = is.subject, .projectName = projectLabel(is.projectName),
-                        .updater = is.updaterDisplay, .updaterFirst = is.updaterFirstName,
-                        .author = is.authorDisplay, .commenter = is.commenterDisplay,
-                        .dueDate = is.dueDate,
-                        .updatedOn = is.updatedOn, .createdOn = is.createdOn,
-                        .priorityRank = rankOf(is.priorityId),
-                        .priorityHighlight = priorityHighlightOf(is.priorityId, priorities),
-                        .assignedToGroup = is.assignedToGroup,
-                        .isBugTracker = is.isBugTracker,
-                        .pinned = pinned, .hidden = hidden, .closed = is.closed,
-                        .unread = !hidden && unread.count(is.id) != 0,
-                        .newMark = hidden ? NewMark::None
-                                 : newMarkOf(is.createdOn, is.changeOn, is.changerId, myUserId,
-                                             nowEpoch, g_currentConfig.newMarkHours)});
+        ListRow row = baseRow(is);
+        row.pinned  = pinned;
+        row.hidden  = hidden;
+        row.unread  = !hidden && unread.count(is.id) != 0;
+        row.newMark = hidden ? NewMark::None
+                             : newMarkOf(is.createdOn, is.changeOn, is.changerId, myUserId,
+                                         nowEpoch, g_currentConfig.newMarkHours);
+        rows.push_back(std::move(row));
         shown.insert(is.id);
     }
     for (const auto& p : pins) {
         if (shown.count(p.id)) continue;
         // 集合外ピンは個別取得が journals を含まず主要変更が分からないため、✨ だけを判定する
-        rows.push_back({.id = p.id, .subject = p.subject, .projectName = projectLabel(p.projectName),
-                        .updater = p.updaterDisplay, .updaterFirst = p.updaterFirst,
-                        .author = p.authorDisplay, .commenter = p.commenterDisplay,
-                        .dueDate = p.dueDate,
-                        .updatedOn = p.updatedOn, .createdOn = p.createdOn,
-                        .priorityRank = rankOf(p.priorityId),
-                        .priorityHighlight = priorityHighlightOf(p.priorityId, priorities),
-                        .assignedToGroup = p.assignedToGroup,
-                        .isBugTracker = p.isBugTracker,
-                        .pinned = true, .closed = p.closed,
-                        .unread = unread.count(p.id) != 0,
-                        .newMark = isWithinHours(p.createdOn, nowEpoch, g_currentConfig.newMarkHours)
-                                   ? NewMark::Created : NewMark::None});
+        ListRow row = baseRow(p);
+        row.pinned  = true;
+        row.unread  = unread.count(p.id) != 0;
+        row.newMark = isWithinHours(p.createdOn, nowEpoch, g_currentConfig.newMarkHours)
+                      ? NewMark::Created : NewMark::None;
+        rows.push_back(std::move(row));
     }
 
     // 期日順の比較規則。期日は ISO 形式のため文字列辞書順で昇順に比較でき、期日なしは末尾、
@@ -4166,7 +4168,7 @@ static bool ensurePinD2D(HDC hdc) {
             return false;
         }
         // フェイス名と em 高は実際に GDI が描画に使う g_hMenuFont 自身から引く。（二重管理を避ける）
-        // RT を 96 DPI 固定にするため 1 DIP = 1 px。lfHeight の符号解釈を避け、
+        // RT を 96 DPI 固定にするため 1 DIP = 1px。lfHeight の符号解釈を避け、
         // GDI の実効 em 高（セル高 - internal leading）を渡して送り幅を GDI 計測値と揃える。
         LOGFONTW    lf = {};
         TEXTMETRICW tm = {};
@@ -4197,8 +4199,8 @@ static bool ensurePinD2D(HDC hdc) {
     }
 
     // デバイス依存資源（D2DERR_RECREATE_TARGET 後はここから作り直す）
-    // 96 DPI 固定で 1 DIP = 1 px とし、GDI 計測の px 矩形・フォントサイズと揃える。
-    // SOFTWARE 指定は、20 px 程度の矩形に GPU 経路は無駄で、RDP 等での初期化失敗も避けるため。
+    // 96 DPI 固定で 1 DIP = 1px とし、GDI 計測の px 矩形・フォントサイズと揃える。
+    // SOFTWARE 指定は、20px 程度の矩形に GPU 経路は無駄で、RDP 等での初期化失敗も避けるため。
     D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
         D2D1_RENDER_TARGET_TYPE_SOFTWARE,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
@@ -4324,62 +4326,36 @@ static constexpr wchar_t UPDATED_MARK[] = L"🆙";
 //   {new} は ✨・🆙 を空白なしで展開し、マーカーのない行も 🆙 を透明（invisible の範囲）で置くため空にならない。
 //   （行ごとにマーカーの有無が違っても、後続の要素の位置を揃えるため）
 //   期限切れ行の "!" 指定要素と、常に赤いバグマーカーは ALERT_TEXT_COLOR で描くため、
-//   位置を ranges に記録する。新規・更新マーカーも NEW_MARK_COLOR・UPDATED_MARK_COLOR で描くため、
-//   マーカーのない行の透明の 🆙 も描かないため範囲を持つ。期日は "!" の有無によらず常に半太字の範囲を持つ。
+//   位置を ranges に記録する。新規・更新マーカーも NEW_MARK_COLOR・UPDATED_MARK_COLOR で描くため範囲を持つ。
+//   マーカーのない行にある透明の 🆙 も、描画を省くために範囲を持つ。期日は "!" の有無によらず常に半太字の範囲を持つ。
 //   "@" で縮小した要素も、サイズを描画側へ渡すため範囲を持つ。
 //   （ranges はオフセット昇順で並べる契約。展開順の追記がそのまま昇順になる）
 // 引数に ListRow を丸ごと取るのは、同じ型の要素が増えて位置引数では取り違えを防げないため。
 // ピン記号はラベルに含めない。drawIssueRow が IssueItem::pinned を見てマーカー列に描く。
+// 組み立ては 3 段で行う。第 1 段で書式のトークン列を片（リテラルか値）の列へ展開し、第 2 段で
+// 空の値を起点に区切りと括弧対を片の列の上で取り除き、第 3 段で連結して範囲のオフセットを確定する。
+// （1 回の走査で状態変数を持ち回る方式は、括弧対や区切りの規則を足すたびに条件の相互依存が増えて
+// 修正を繰り返したため、規則ごとに独立した段へ分けた）
 static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
                                   long long todayDays) {
     // 空要素を囲む括弧対（開き → 閉じ）
     static constexpr std::pair<wchar_t, wchar_t> BRACKETS[] = {
         { L'[', L']' }, { L'［', L'］' }, { L'(', L')' }, { L'（', L'）' }, { L'【', L'】' }, { L'「', L'」' },
     };
-    IssueLabel r;
-    bool prevEmpty = false;    // 直前のプレースホルダが空に展開されたか（空白整理の条件）
-    wchar_t pendingClose = 0;  // 空要素の直前が開き括弧だったときの対の閉じ括弧（0 = なし）
-    // 直前にリテラルを足した時点の text の長さ（npos = 末尾はリテラルでない）。
-    // 空要素の前の区切り除去をリテラルの末尾に限るための判定に使う。
-    size_t literalEnd = std::wstring::npos;
-    // 直前に要素の値を足した時点の text の長さ（これより後ろはすべてリテラル。0 = 値をまだ足していない）。
-    // 空要素の直前の開き括弧の判定をリテラルに限るための判定に使う。（値の末尾の括弧は値の一部）
-    // literalEnd の一致で判定しないのは、区切り "/" の除去で 1 文字短くなった後（"(/" → "("）も
-    // リテラルの開き括弧を対の候補にするため。
-    size_t literalBegin = 0;
-    // 末尾がリテラルの開き括弧なら対の閉じ括弧を返す（0 = 該当なし）
-    auto literalOpenClose = [&]() -> wchar_t {
-        if (r.text.size() <= literalBegin) return 0;
-        for (const auto& [open, close] : BRACKETS) {
-            if (r.text.back() == open) return close;
-        }
-        return 0;
+    // 展開した片（リテラルか値）。値の片は色・ウェイト・サイズの指定を持ち、offset は第 3 段で確定する
+    struct Piece {
+        bool         literal    = false;
+        std::wstring text;
+        bool         emptyValue = false;  // 空に展開された値（区切り・括弧対の除去の起点）
+        bool         hasRange   = false;  // 範囲を持つ値（色・ウェイト・サイズ・透明のいずれかが既定でない）
+        ColorRange   range{};
     };
+
+    // 第 1 段：トークンを片へ展開する
+    std::vector<Piece> pieces;
     for (const auto& tk : g_currentConfig.listFormat) {
         if (tk.element == FMT_LITERAL) {
-            std::wstring lit = tk.literal;
-            if (prevEmpty && pendingClose && !lit.empty() && lit[0] == pendingClose) {
-                // 外側もリテラルの括弧対なら続けて取り除く。（"[({a})]" の a が空なら全体が消える）
-                do {
-                    r.text.pop_back();  // 開き括弧
-                    lit.erase(0, 1);    // 閉じ括弧
-                } while (!lit.empty() && literalOpenClose() == lit[0]);
-                // リテラルを使い切ったら、外側の開き括弧が次の空要素を囲む候補になる。（"[({a}){b}]"）
-                pendingClose = lit.empty() ? literalOpenClose() : 0;
-            }
-            else {
-                pendingClose = 0;
-            }
-            if (prevEmpty && (r.text.empty() || r.text.back() == L' ')) {
-                size_t i = 0;
-                while (i < lit.size() && lit[i] == L' ') ++i;
-                lit.erase(0, i);
-            }
-            if (!lit.empty()) {
-                r.text += lit;
-                literalEnd = r.text.size();
-                prevEmpty = false;
-            }
+            pieces.push_back({.literal = true, .text = tk.literal});
             continue;
         }
         std::wstring val;
@@ -4401,23 +4377,11 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
         if (tk.maxChars > 0)
             val = truncateText(val, static_cast<size_t>(tk.maxChars), tk.element == FMT_SUBJECT);
         if (val.empty()) {
-            // 空要素の直前がリテラル末尾の区切り "/" "／" なら消す。（"{author}/{commenter}" でコメントが
-            // 無い行に "山田/" を残さないため）
-            // 直前の要素の値が "/" で終わるとき（"docs/" で終わる件名など）は値の一部なので削らない。
-            // 括弧の除去（開き括弧の pop_back）を挟むと長さが一致しなくなり、区切りは残る。
-            if (r.text.size() == literalEnd && (r.text.back() == L'/' || r.text.back() == L'／'))
-                r.text.pop_back();
-            // 連続する空要素では最初の要素の判定を保つ。（"[{a}{b}]" の両方が空なら括弧ごと消す）
-            // 対の候補にする開き括弧はリテラルのものだけ。直前の要素の値が開き括弧で終わるとき
-            // （"Alpha[" に切り詰めたプロジェクト名など）に、値の末尾と後続の閉じ括弧を削らないため。
-            if (!prevEmpty) pendingClose = literalOpenClose();
-            prevEmpty = true;
+            pieces.push_back({.emptyValue = true});
             continue;
         }
-        pendingClose = 0;
-        literalEnd   = std::wstring::npos;
         bool alertNow = tk.alert && due.overdue;  // "!" 指定かつ期限切れ行
-        ColorRange range{.offset = r.text.size(), .len = val.size(), .color = ALERT_TEXT_COLOR,
+        ColorRange range{.offset = 0, .len = val.size(), .color = ALERT_TEXT_COLOR,
                          .keepColor = true, .sizePct = tk.sizePct};
         if (tk.element == FMT_DUE) {
             // 期日は常に半太字で強調する。（一覧の中で期日行を素早く拾えるようにする）
@@ -4445,10 +4409,72 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
         // マーカーのない行は幅だけ確保して描かない。（"!" の期限切れ指定でも描かない）
         if (tk.element == FMT_NEW && row.newMark == NewMark::None) range.invisible = true;
         // 色、ウェイト、サイズ、透明のいずれも既定のままなら範囲を持たない（範囲外と同じ描画で足りる）。
-        if (range.len > 0 && (range.bold || !range.keepColor || range.sizePct != 100 || range.invisible))
-            r.ranges.push_back(range);
-        r.text += val;
-        literalBegin = r.text.size();
+        const bool hasRange = range.len > 0
+            && (range.bold || !range.keepColor || range.sizePct != 100 || range.invisible);
+        pieces.push_back({.text = std::move(val), .hasRange = hasRange, .range = range});
+    }
+
+    // 第 2 段：空の値を起点に区切りと括弧対を取り除く。対象はリテラルの片だけで、値の片の末尾は削らない。
+    // （直前の要素の値が "/" や開き括弧で終わるとき＝"docs/" で終わる件名や "Alpha[" に切り詰めた
+    // プロジェクト名は値の一部）
+    // 区切りの除去は、"{author}/{commenter}" でコメントが無い行に "山田/" を残さないために行い、
+    // 括弧対の判定より先に行う。（"(/" → "(" の後で括弧対を判定する）
+    // {author} が空で "/佐藤" になる場合は、"/" が空の値の後ろにあるため対象外。
+    for (size_t i = 1; i < pieces.size(); ++i) {
+        if (!pieces[i].emptyValue) continue;
+        std::wstring& prev = pieces[i - 1].text;
+        if (pieces[i - 1].literal && !prev.empty() && (prev.back() == L'/' || prev.back() == L'／'))
+            prev.pop_back();
+    }
+    // 空の値をリテラルの括弧対が直接囲んでいれば括弧ごと取り除く。変化がなくなるまで繰り返し、
+    // 入れ子の括弧対は内側から何重でも取り除く。（"[({a})]" の a が空なら全体が消える）
+    // 繰り返しの先頭で、空になったリテラルを除き、隣り合う空の値を 1 つにまとめる。
+    // （"[{a}{b}]" の両方が空なら括弧ごと消す。"[({a}){b}]" は内側の除去で a と b が隣り合う）
+    for (bool changed = true; changed;) {
+        changed = false;
+        std::vector<Piece> merged;
+        for (auto& p : pieces) {
+            if (p.literal && p.text.empty()) continue;
+            if (p.emptyValue && !merged.empty() && merged.back().emptyValue) continue;
+            merged.push_back(std::move(p));
+        }
+        pieces = std::move(merged);
+        for (size_t i = 1; i + 1 < pieces.size(); ++i) {
+            if (!pieces[i].emptyValue) continue;
+            Piece& l = pieces[i - 1];
+            Piece& r = pieces[i + 1];
+            if (!l.literal || !r.literal || l.text.empty() || r.text.empty()) continue;
+            for (const auto& [open, close] : BRACKETS) {
+                if (l.text.back() != open || r.text.front() != close) continue;
+                l.text.pop_back();
+                r.text.erase(0, 1);
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    // 第 3 段：連結して範囲のオフセットを確定する。
+    // 空の値の直後のリテラル先頭空白は、出力末尾が空白か行頭なら取り除く。（二重空白と行頭空白を残さない）
+    IssueLabel r;
+    bool prevEmpty = false;  // 直前の値が空に展開されたか（リテラルの先頭空白を整理する条件）
+    for (auto& p : pieces) {
+        if (p.emptyValue) {
+            prevEmpty = true;
+            continue;
+        }
+        std::wstring text = std::move(p.text);
+        if (p.literal && prevEmpty && (r.text.empty() || r.text.back() == L' ')) {
+            size_t i = 0;
+            while (i < text.size() && text[i] == L' ') ++i;
+            text.erase(0, i);
+        }
+        if (text.empty()) continue;
+        if (p.hasRange) {
+            p.range.offset = r.text.size();
+            r.ranges.push_back(p.range);
+        }
+        r.text += text;
         prevEmpty = false;
     }
     while (!r.text.empty() && r.text.back() == L' ') r.text.pop_back();
@@ -4632,17 +4658,14 @@ static void checkForUpdates() {
             g_updateAvailable.store(true);
             writeLog("update available: " + wideToUtf8(tagName));
 
-            // Toast: 同一版は 1 回のみ（通知済み版をレジストリに先書きし、変化があれば通知）
+            // Toast：同一版は 1 回のみ（通知済み版をレジストリに先書きし、変化があれば通知）
             std::wstring notifiedVer = readRegString(REG_NOTIFIED_VERSION);
             writeRegString(REG_NOTIFIED_VERSION, tagName);
             if (notifiedVer != tagName) {
-                try {
-                    showToast3(L"新しいバージョンがあります",
-                               std::wstring(L"v") + APP_VERSION + L" → " + tagName,
-                               L"ボタンからリリースページを開いてください",
-                               GITHUB_RELEASES_URL, false, L"リリースページを開く");
-                }
-                catch (...) {}
+                showToast3(L"新しいバージョンがあります",
+                           std::wstring(L"v") + APP_VERSION + L" → " + tagName,
+                           L"ボタンからリリースページを開いてください",
+                           GITHUB_RELEASES_URL, false, L"リリースページを開く");
             }
         } while (false);
     }
@@ -4651,21 +4674,29 @@ static void checkForUpdates() {
     }
 }
 
+// 更新通知メニュー項目の文言（現行版のプレフィックスと新版の 2 部。計測と描画で共有する）
+struct VersionMenuText {
+    std::wstring prefix;  // "redntfy v1.2.3 → "
+    std::wstring latest;  // 新版のタグ名（g_latestVersion）
+};
+static VersionMenuText versionMenuText() {
+    VersionMenuText t;
+    t.prefix = std::wstring(L"redntfy v") + APP_VERSION + L" → ";
+    std::lock_guard<std::mutex> lk(g_mtx);
+    t.latest = g_latestVersion;
+    return t;
+}
+
 // 更新通知メニュー項目のサイズを計算する
-// GetDC 失敗時は既定サイズ（200×20）を返し、項目自体は必ず描かせる。
-static BOOL measureVersionMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
-    std::wstring prefix = std::wstring(L"redntfy v") + APP_VERSION + L" → ";
-    std::wstring latest;
-    {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        latest = g_latestVersion;
-    }
-    std::wstring full = prefix + latest;
+// GetDC 失敗時は既定サイズ（200×20）とし、項目自体は必ず描かせる。
+static void measureVersionMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
+    const VersionMenuText t = versionMenuText();
+    const std::wstring full = t.prefix + t.latest;
     HDC hdc = GetDC(hWnd);
     if (!hdc) {
         mis->itemWidth  = 200;
         mis->itemHeight = 20;
-        return TRUE;
+        return;
     }
     HFONT old = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
     SIZE  sz  = {};
@@ -4674,18 +4705,14 @@ static BOOL measureVersionMenuItem(HWND hWnd, MEASUREITEMSTRUCT* mis) {
     ReleaseDC(hWnd, hdc);
     mis->itemWidth  = static_cast<UINT>(sz.cx) + 32;
     mis->itemHeight = static_cast<UINT>(sz.cy) + 6;
-    return TRUE;
 }
 
 // 更新通知メニュー項目を描画する
 // プレフィックス部分を通常色、新バージョン部分を赤色で描く
-static BOOL drawVersionMenuItem(DRAWITEMSTRUCT* dis) {
-    std::wstring prefix = std::wstring(L"redntfy v") + APP_VERSION + L" → ";
-    std::wstring latest;
-    {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        latest = g_latestVersion;
-    }
+static void drawVersionMenuItem(DRAWITEMSTRUCT* dis) {
+    const VersionMenuText t = versionMenuText();
+    const std::wstring& prefix = t.prefix;
+    const std::wstring& latest = t.latest;
     bool selected = (dis->itemState & ODS_SELECTED) != 0;
     FillRect(dis->hDC, &dis->rcItem,
         reinterpret_cast<HBRUSH>(
@@ -4710,8 +4737,9 @@ static BOOL drawVersionMenuItem(DRAWITEMSTRUCT* dis) {
     DrawTextW(dis->hDC, latest.c_str(), -1, &newVerRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
 
     SelectObject(dis->hDC, oldFont);
-    return TRUE;
 }
+
+// ==================== トレイメニューとコマンド ====================
 
 // トレイ右クリックメニューの構築と表示
 // メニュー項目はトグル状態（音声通知・スタートアップ等）を読み取り、
@@ -4809,6 +4837,9 @@ static void showTrayContextMenu(HWND hWnd) {
     auto pos = computeTrayPopupPos(pt);
     forceForeground(hWnd);
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | pos.alignFlags, pos.x, pos.y, 0, hWnd, nullptr);
+    // 通知領域のメニューの定石（KB135788）。前面化した所有者へ空メッセージを送り、
+    // メニュー外クリックで閉じない症状と、2 回目がすぐ閉じる症状を防ぐ
+    PostMessage(hWnd, WM_NULL, 0, 0);
     DestroyMenu(hMenu);
     g_popupShowing.store(false);
     updateTrayTooltip(hWnd);
@@ -5163,15 +5194,15 @@ static SIZE measureIssueRow(HDC hdc, const IssueItem& item) {
     SIZE markSz = {};
     GetTextExtentPoint32W(hdc, PIN_MARK, static_cast<int>(wcslen(PIN_MARK)), &markSz);
     SelectObject(hdc, old);
-    // パディングは左 4 px + 右 16 px。（左はピンマーカー列が続くため控えめにする）
+    // パディングは左 4px + 右 16px。（左はピンマーカー列が続くため控えめにする）
     sz.cx += markSz.cx + 20;
     sz.cy += 6;
     return sz;
 }
 
 // 一覧行の描画
-// 背景色は issueRowBackground（hot・高優先度の強調）で決め、テキスト色は hot に応じて切り替える。closed または hidden
-// フラグが立つ項目には DrawTextW 後に 2 px の取消線を手動で重ね描画する。
+// 背景色は issueRowBackground（hot・検索一致・高優先度の強調）で決め、テキスト色は hot に応じて切り替える。closed または hidden
+// フラグが立つ項目には DrawTextW 後に 2px の取消線を手動で重ね描画する。
 // （非表示はグレー一色だけでは通常行との差が分かりにくいため、取消線で「除外済」を示す）
 // IssueLabel::ranges に色付け範囲がある行は、範囲ごとに文字色を変えて分割描画する。
 // hidden フラグが立つ項目は非活性の慣例に合わせて全体を COLOR_GRAYTEXT 一色で描く。
@@ -5227,9 +5258,9 @@ static void drawIssueRow(HDC hdc, const RECT& rcItem, const IssueItem& item, boo
     SetTextColor(hdc, textColor);  // 打ち消し線が textColor を使うため戻す
     if (item.closed || item.hidden) {
         constexpr int STRIKE_THICKNESS = 2;
-        // 中央から 1 px だけ下寄せにして視認性を上げる
+        // 中央から 1px だけ下寄せにして視認性を上げる
         constexpr int STRIKE_Y_OFFSET  = 1;
-        // テキスト左端より 3 px、右端より 4 px 外側まで線を伸ばす
+        // テキスト左端より 3px、右端より 4px 外側まで線を伸ばす
         constexpr int STRIKE_MARGIN_LEFT  = 3;
         constexpr int STRIKE_MARGIN_RIGHT = 4;
         int lineY = (textRect.top + textRect.bottom) / 2 + STRIKE_Y_OFFSET;
@@ -5274,8 +5305,9 @@ static constexpr int    REG_DESC_MAX_CHARS = 65535;
 static constexpr wchar_t REG_DESC_MARK_CLOSED[] = L"▾";
 static constexpr wchar_t REG_DESC_MARK_OPEN[]   = L"▴";
 
-// 登録欄の入力（件名・説明）の前後から空白（全角空白を含む）を除去する
-static std::wstring trimRegisterText(const std::wstring& s) {
+// 入力文字列の前後から空白（全角空白を含む）を除去する
+// 登録欄の件名・説明のほか、終了ダイアログのコメント、ショートカットキーの書式、検索語にも使う。
+static std::wstring trimText(const std::wstring& s) {
     static constexpr wchar_t SPACES[] = L" \t\r\n　";
     const size_t b = s.find_first_not_of(SPACES);
     if (b == std::wstring::npos) return {};
@@ -5340,7 +5372,7 @@ static std::string buildIssueCreateBody(const std::wstring& project, const std::
         + "\",\"due_date\":\"" + jsonEscape(dueIso)
         + "\",\"assigned_to_id\":" + std::to_string(assigneeId);
     if (priorityId > 0) body += ",\"priority_id\":" + std::to_string(priorityId);
-    const std::wstring desc = trimRegisterText(description);
+    const std::wstring desc = trimText(description);
     if (!desc.empty()) body += ",\"description\":\"" + jsonEscape(wideToUtf8(desc)) + "\"";
     return body + "}}";
 }
@@ -5396,11 +5428,7 @@ static std::thread g_registerThread;
 // 期日を JST の当日に戻す（登録欄の既定値）
 static void resetRegisterDate() {
     if (!g_regDate) return;
-    const int ymd = todayJstYmd();
-    SYSTEMTIME st = {};
-    st.wYear  = static_cast<WORD>(ymd / 10000);
-    st.wMonth = static_cast<WORD>(ymd / 100 % 100);
-    st.wDay   = static_cast<WORD>(ymd % 100);
+    SYSTEMTIME st = ymdToSystemTime(todayJstYmd());
     DateTime_SetSystemtime(g_regDate, GDT_VALID, &st);
 }
 
@@ -5472,7 +5500,7 @@ static std::wstring getControlText(HWND h) {
 
 // 件名欄の入力を trim して返す
 static std::wstring getRegisterSubject() {
-    return g_regEdit ? trimRegisterText(getControlText(g_regEdit)) : std::wstring{};
+    return g_regEdit ? trimText(getControlText(g_regEdit)) : std::wstring{};
 }
 
 // 説明欄の入力をそのまま返す（trim と空の省略は buildIssueCreateBody が行う。未生成なら空）
@@ -5509,18 +5537,38 @@ static std::wstring joinRedmineErrors(const std::string& resp) {
     return msg;
 }
 
-// 登録失敗の Toast 本文（ステータス別の案内。422 は Redmine の検証エラー文言をそのまま示す）
-static std::wstring describeRegisterError(DWORD status, const std::string& resp) {
+// 送信失敗の Toast 本文（登録と更新で共通。403・404・422 の既定文言だけが操作ごとに違う）
+// 422 は Redmine の検証エラー文言をそのまま示し、取れなければ unprocessable を使う。
+static std::wstring describeHttpError(DWORD status, const std::string& resp,
+                                      const wchar_t* forbidden, const wchar_t* notFound,
+                                      const wchar_t* unprocessable) {
     switch (status) {
     case 0:   return L"Redmine に接続できません";
-    case 403: return L"登録先プロジェクトへの登録権限がありません";
-    case 404: return L"register_project のプロジェクトが見つかりません";
+    case 403: return forbidden;
+    case 404: return notFound;
     case 422:
         if (auto msg = joinRedmineErrors(resp); !msg.empty()) return msg;
-        return L"入力内容が受け付けられませんでした";
+        return unprocessable;
     default:
         return L"HTTP ステータス " + std::to_wstring(status);
     }
+}
+
+// 送信スレッドを起動する（登録と更新で共通）
+// 前回分の join → 起動 → busy を立てる。前回分は完了通知の受信後（busy = false）に限って
+// 呼ばれるため join は即座に戻る。起動に失敗したらログを残して false を返し、busy は立てない。
+template <class F>
+static bool startWorkerThread(std::thread& worker, bool& busy, const char* tag, F&& fn) {
+    if (worker.joinable()) worker.join();
+    try {
+        worker = std::thread(std::forward<F>(fn));
+    }
+    catch (const std::system_error& e) {
+        writeLog(std::string(tag) + ": failed to start thread: " + e.what());
+        return false;
+    }
+    busy = true;
+    return true;
 }
 
 // 登録要求の送信スレッド本体（submitRegistration が 1 回の送信ごとに起動する）
@@ -5546,12 +5594,11 @@ static void registerIssueThreadFunc(std::string body) {
     else {
         writeLog("register: failed, status=" + std::to_string(status));
         if (apartment.ok) {
-            try {
-                showToast(L"チケットを登録できません", describeRegisterError(status, resp), L"");
-            }
-            catch (...) {
-                writeLog("register: error toast failed");
-            }
+            showToast(L"チケットを登録できません",
+                      describeHttpError(status, resp, L"登録先プロジェクトへの登録権限がありません",
+                                        L"register_project のプロジェクトが見つかりません",
+                                        L"入力内容が受け付けられませんでした"),
+                      L"");
         }
     }
     if (g_hWnd) PostMessage(g_hWnd, WM_REGISTER_DONE, ok ? 1 : 0, 0);
@@ -5566,36 +5613,23 @@ static void submitRegistration() {
     if (!isRegisterSubjectValid(subject)) return;
     const int me = g_myUserId.load();
     if (me <= 0) {
-        try {
-            showToast(L"チケットを登録できません", L"ユーザ情報を取得できていません。接続を確認してください", L"");
-        }
-        catch (...) {
-            writeLog("register: user-unknown toast failed");
-        }
+        showToast(L"チケットを登録できません", L"ユーザ情報を取得できていません。接続を確認してください", L"");
         return;
     }
     SYSTEMTIME st = {};
     if (DateTime_GetSystemtime(g_regDate, &st) != GDT_VALID) return;
     const std::string body = buildIssueCreateBody(currentRegisterProject(), subject,
-        ymdToIsoDate(st.wYear * 10000 + st.wMonth * 100 + st.wDay), me, getRegisterPriorityId(),
+        ymdToIsoDate(systemTimeToYmd(st)), me, getRegisterPriorityId(),
         getRegisterDescription());
-    // 前回分は完了通知の受信後（busy = false）なので、join は即座に戻る
-    if (g_registerThread.joinable()) g_registerThread.join();
-    try {
-        g_registerThread = std::thread(registerIssueThreadFunc, body);
-    }
-    catch (const std::system_error& e) {
-        writeLog(std::string("register: failed to start thread: ") + e.what());
-        return;
-    }
-    g_registerBusy = true;
-    updateRegisterControls();
+    if (startWorkerThread(g_registerThread, g_registerBusy, "register",
+                          [body] { registerIssueThreadFunc(body); }))
+        updateRegisterControls();
 }
 
 // ==================== 一覧の行メニューからのチケット更新 ====================
 // 優先度・期日・終了（close_status_id）を PUT /issues/{id}.json で 1 項目ずつ更新する。
 // 送信は専用スレッド（issueUpdateThreadFunc）で行い、完了を WM_ISSUE_UPDATE_DONE でメインへ返す。
-// 成功時は g_registerPoll で即時ポーリングし、一覧の組み直しを更新の応答とする。（成功 Toast は出さない）
+// 成功時は g_reflectPoll で即時ポーリングし、一覧の組み直しを更新の応答とする。（成功 Toast は出さない）
 // 自分の操作による更新は g_muteOwnChanges（既定 ON）が通知を抑止するため、更新で Toast は鳴らない。
 
 // チケット更新 API（PUT /issues/{id}.json）の要求本文
@@ -5609,23 +5643,37 @@ static std::string buildIssueUpdateBody(const char* key, const std::string& json
 // notes は trim して空なら送らない。（空コメントの journal を作らない。改行は jsonEscape が通す）
 static std::string buildIssueCloseBody(int statusId, const std::wstring& notes) {
     std::string body = "{\"issue\":{\"status_id\":" + std::to_string(statusId);
-    const std::wstring trimmed = trimRegisterText(notes);
+    const std::wstring trimmed = trimText(notes);
     if (!trimmed.empty()) body += ",\"notes\":\"" + jsonEscape(wideToUtf8(trimmed)) + "\"";
     return body + "}}";
 }
 
-// 更新失敗の Toast 本文（ステータス別の案内。422 は Redmine の検証エラー文言をそのまま示す）
-static std::wstring describeUpdateError(DWORD status, const std::string& resp) {
-    switch (status) {
-    case 0:   return L"Redmine に接続できません";
-    case 403: return L"このチケットを更新する権限がありません";
-    case 404: return L"チケットが見つかりません";
-    case 422:
-        if (auto msg = joinRedmineErrors(resp); !msg.empty()) return msg;
-        return L"変更内容が受け付けられませんでした";
-    default:
-        return L"HTTP ステータス " + std::to_wstring(status);
+// 終了後のステータス照合の結果
+enum class StatusVerify { Matched, Mismatched, Unknown };
+
+// チケットを取得し直し、ステータスが expectStatusId になったかを照合する
+// 取得に失敗したときと応答の形が想定外のときは Unknown。（確かめようがないため、
+// 呼び出し側は更新を成功として扱う）不一致はログに実際の id を残す。
+static StatusVerify verifyIssueStatus(const Config& cfg, int issueId, int expectStatusId) {
+    auto obj = redmineGetJson(cfg, issueUrl(cfg, issueId) + L".json", "issue update verify");
+    const std::string tag = "issue update: #" + std::to_string(issueId);
+    if (!obj) {
+        writeLog(tag + " status verify skipped (fetch failed)");
+        return StatusVerify::Unknown;
     }
+    int actual = 0;
+    try {
+        actual = static_cast<int>(
+            obj.GetNamedObject(L"issue").GetNamedObject(L"status").GetNamedNumber(L"id", 0));
+    }
+    catch (...) {
+        writeLog(tag + " status verify skipped (unexpected response)");
+        return StatusVerify::Unknown;
+    }
+    if (actual == expectStatusId) return StatusVerify::Matched;
+    writeLog(tag + " status not changed (expected " + std::to_string(expectStatusId)
+        + ", actual " + std::to_string(actual) + ")");
+    return StatusVerify::Mismatched;
 }
 
 // 更新要求の送信スレッド。WM_ISSUE_UPDATE_DONE を投函し得るため、wmain の終了処理で
@@ -5642,7 +5690,7 @@ static bool g_issueUpdateBusy = false;  // 更新要求の送信中（メイン�
 // 照合の取得に失敗したときは確かめようがないため、更新は成功として扱う。
 // notesSent は本文に notes を含めたかで、照合不一致の Toast にコメントが記録済みである旨を添える。
 // （Redmine は捨てた status_id と同じ PUT の notes を記録するため。再試行でコメントを二重に投稿させない）
-// notesSent のときはログに本文を書かず、status_id とコメントの有無だけを書く。（コメントは利用者の自由記述のため）
+// notesSent のときはログに本文を書かず、status_id とコメントの有無だけを書く。（コメントはユーザの自由記述のため）
 static void issueUpdateThreadFunc(int issueId, std::string body, int expectStatusId, bool notesSent) {
     WinRtApartment apartment;  // 応答の JSON 解析と Toast のため
     const Config& cfg = g_currentConfig;
@@ -5650,49 +5698,25 @@ static void issueUpdateThreadFunc(int issueId, std::string body, int expectStatu
     const std::string resp = redminePut(issueUrl(cfg, issueId) + L".json", cfg.apiKey, body, &status);
     // Redmine は 204 を返すが、版やプロキシによっては 200 になるため両方を成功とする
     bool ok = (status == 204 || status == 200);
-    // notes（利用者が書いたコメント）はログに残さず、有無だけを書く。（登録が説明文をログに出さないのと揃える）
+    // notes（ユーザが書いたコメント）はログに残さず、有無だけを書く。（登録が説明文をログに出さないのと揃える）
     const std::string logBody = notesSent
         ? "status_id=" + std::to_string(expectStatusId) + " with notes" : body;
     writeLog("issue update: #" + std::to_string(issueId) + " " + logBody
         + (ok ? " ok" : " failed, status=" + std::to_string(status)));
     std::wstring title = L"チケットを更新できません";
     std::wstring reason;
-    if (ok && expectStatusId > 0 && apartment.ok) {
-        auto obj = redmineGetJson(cfg, issueUrl(cfg, issueId) + L".json", "issue update verify");
-        int actual = -1;  // -1 = 応答の形が想定外で確かめられない
-        if (obj) {
-            try {
-                actual = static_cast<int>(
-                    obj.GetNamedObject(L"issue").GetNamedObject(L"status").GetNamedNumber(L"id", 0));
-            }
-            catch (...) {}
-        }
-        if (actual >= 0) {
-            if (actual != expectStatusId) {
-                ok = false;
-                title  = L"チケットを終了できません";
-                reason = L"ステータスが変わりませんでした。（ワークフローや、未完了の子チケット・ブロック関連の状態によっては終了できません）";
-                if (notesSent) reason += L"コメントは記録されました。";
-                writeLog("issue update: #" + std::to_string(issueId) + " status not changed (expected "
-                    + std::to_string(expectStatusId) + ", actual " + std::to_string(actual) + ")");
-            }
-        }
-        else {
-            writeLog("issue update: #" + std::to_string(issueId) + " status verify skipped ("
-                + (obj ? "unexpected response" : "fetch failed") + ")");
-        }
+    if (ok && expectStatusId > 0 && apartment.ok
+            && verifyIssueStatus(cfg, issueId, expectStatusId) == StatusVerify::Mismatched) {
+        ok = false;
+        title  = L"チケットを終了できません";
+        reason = L"ステータスが変わりませんでした（ワークフローや、未完了の子チケット・ブロック関連の状態によっては終了できません）。";
+        if (notesSent) reason += L"コメントは記録されました。";
     }
     else if (!ok) {
-        reason = describeUpdateError(status, resp);
+        reason = describeHttpError(status, resp, L"このチケットを更新する権限がありません",
+                                   L"チケットが見つかりません", L"変更内容が受け付けられませんでした");
     }
-    if (!ok && apartment.ok) {
-        try {
-            showToast(title, L"#" + std::to_wstring(issueId) + L"：" + reason, L"");
-        }
-        catch (...) {
-            writeLog("issue update: error toast failed");
-        }
-    }
+    if (!ok && apartment.ok) showToast(title, L"#" + std::to_wstring(issueId) + L"：" + reason, L"");
     if (g_hWnd) PostMessage(g_hWnd, WM_ISSUE_UPDATE_DONE, ok ? 1 : 0, 0);
 }
 
@@ -5702,16 +5726,10 @@ static void issueUpdateThreadFunc(int issueId, std::string body, int expectStatu
 static void startIssueUpdate(int issueId, const std::string& body, int expectStatusId = 0,
                              bool notesSent = false) {
     if (g_issueUpdateBusy) return;
-    // 前回分は完了通知の受信後（busy = false）なので、join は即座に戻る
-    if (g_issueUpdateThread.joinable()) g_issueUpdateThread.join();
-    try {
-        g_issueUpdateThread = std::thread(issueUpdateThreadFunc, issueId, body, expectStatusId, notesSent);
-    }
-    catch (const std::system_error& e) {
-        writeLog(std::string("issue update: failed to start thread: ") + e.what());
-        return;
-    }
-    g_issueUpdateBusy = true;
+    startWorkerThread(g_issueUpdateThread, g_issueUpdateBusy, "issue update",
+        [issueId, body, expectStatusId, notesSent] {
+            issueUpdateThreadFunc(issueId, body, expectStatusId, notesSent);
+        });
 }
 
 // ==================== 一覧ポップアップウィンドウ ====================
@@ -5734,6 +5752,7 @@ static void startIssueUpdate(int issueId, const std::string& body, int expectSta
 // 唯一の例外として、ホバー自動表示から hover_click_guard_ms 以内のアイコン左クリックは
 // 無視する。（詳細は handleTrayLeftClick を参照）
 
+// 一覧ポップアップのウィンドウクラス名
 static constexpr wchar_t LIST_WND_CLASS[] = L"redntfy_list";
 
 // 一覧ポップアップのウィンドウスタイル（CreateWindowExW と AdjustWindowRectEx で共有する）
@@ -5819,7 +5838,7 @@ static bool parseHotkey(const std::wstring& spec, UINT& mods, UINT& vk) {
     while (pos <= spec.size()) {
         const size_t plus = spec.find(L'+', pos);
         const size_t end = (plus == std::wstring::npos) ? spec.size() : plus;
-        std::wstring tok = trimRegisterText(spec.substr(pos, end - pos));
+        std::wstring tok = trimText(spec.substr(pos, end - pos));
         for (auto& c : tok) {
             if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>(c - L'a' + L'A');  // ASCII だけ大文字化する（ロケール非依存）
         }
@@ -5887,7 +5906,7 @@ static void updateListNavHotkeys() {
 // （「山田 設定」は「山田」と「設定」の両方を含む行に一致する。語の順序は問わない）
 // 大文字小文字・全角半角・ひらがなカタカナを区別しない。（「abc」で「ＡＢＣ」、「けんさく」で「ケンサク」にも一致する）
 // 語が 1 つも無い（空・空白だけ）なら常に false を返す。（空欄で全行を着色しない）
-// ロケールは不変ロケールに固定し、利用者の地域設定で結果を変えない。
+// ロケールは不変ロケールに固定し、ユーザの地域設定で結果を変えない。
 static bool issueLabelMatches(const std::wstring& label, const std::wstring& query) {
     static constexpr wchar_t SEPARATORS[] = L" \t　";
     if (label.empty()) return false;
@@ -6010,7 +6029,7 @@ static void setListHotRow(int hit) {
 
 // 検索語でキー操作の移動先を絞るか（検索欄の表示中で、語が 1 つ以上あるとき）
 static bool listSearchHasTerms() {
-    return g_searchActive && g_searchEdit && !trimRegisterText(getControlText(g_searchEdit)).empty();
+    return g_searchActive && g_searchEdit && !trimText(getControlText(g_searchEdit)).empty();
 }
 
 // キー操作の移動先になる行か（チケット行だけ。filter のときは検索に一致した行だけ）
@@ -6370,7 +6389,7 @@ static void createRegisterControls(HWND parent, HINSTANCE hInst) {
 // （変換先の既定ボタンは登録欄の登録ボタン（IDOK）で、件名が空の間は無効のため、
 // IsDialogMessageW が警告音だけ鳴らして IDOK を送らず、Enter が効かなかった）
 // Enter が生む WM_CHAR（Enter は '\r'、Ctrl+Enter は '\n'）も捨てる。（1 行 Edit が警告音を鳴らすため）
-static constexpr UINT_PTR SEARCH_EDIT_SUBCLASS_ID = 1;
+static constexpr UINT_PTR SEARCH_EDIT_SUBCLASS_ID = 1;  // 検索欄の SetWindowSubclass 識別子
 static LRESULT CALLBACK searchEditSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam,
                                                UINT_PTR, DWORD_PTR) {
     if (msg == WM_GETDLGCODE) {
@@ -6442,6 +6461,188 @@ static HWND ensureListWindow() {
     return g_listWnd;
 }
 
+// メニューフォント（g_hMenuFont）での文字列の幅を計測する（DC の選択状態に依存させない）
+static int textWidthWithMenuFont(HDC hdc, const wchar_t* text) {
+    HFONT prev = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
+    SIZE sz = {};
+    GetTextExtentPoint32W(hdc, text, static_cast<int>(wcslen(text)), &sz);
+    SelectObject(hdc, prev);
+    return static_cast<int>(sz.cx);
+}
+
+// 登録欄の寸法（measureRegisterRow が計測し、showListPopup の打ち切り予約と placeRegisterControls が使う）
+struct RegisterLayout {
+    bool enabled = false;  // 登録欄あり（登録先の確定時。g_regEdit の有無）
+    bool prio    = false;  // 優先度コンボあり（g_priorities が取得済み）
+    bool desc    = false;  // 説明欄を開いている
+    int  ctrlH   = 0;      // コントロール行の高さ（文字高＋枠。検索欄も同じ高さで、登録欄が無くても求める）
+    int  descH   = 0;      // 説明欄の高さ（REG_DESC_ROWS 行分）
+    int  rowH    = 0;      // 登録欄の行高（コントロール行＋余白。説明欄の表示中はその分を足す）
+    int  dateW   = 0;      // 期日 DTP の幅
+    int  buttonW = 0;      // 登録ボタンの幅
+    int  toggleW = 0;      // 説明トグルの幅
+    int  prioW   = 0;      // 優先度コンボの幅（非表示なら 0）
+    int  minW    = 0;      // 登録欄が要る一覧の最小幅
+    int  tailH   = 0;      // 登録欄とその上のセパレータの高さ（無効時は 0。打ち切りの予約に使う）
+};
+
+// 登録欄の寸法を計測する
+// コントロールの高さは文字高＋枠、DTP の幅は固定書式の見本＋ドロップダウンボタン、
+// 優先度コンボの幅は最長の優先度名＋ドロップダウンボタン。（未取得で隠すときは幅 0 で余白も詰める）
+// 説明トグルの幅は記号＋左右の余白で、行高より細くしない。
+// 新規表示（refresh=false）では書きかけの説明があるときだけ説明欄を開き、トグルの表示記号も合わせる。
+// （組み直しではトグルの状態を保つ。行高が表示状態に依存するため、ここで先に決める）
+static RegisterLayout measureRegisterRow(HDC hdc, int fontHeight, bool refresh) {
+    RegisterLayout rl;
+    // コントロール行の高さは登録欄が無くても求める。（検索欄の行高と Edit の高さに使う）
+    rl.ctrlH   = fontHeight + 8;
+    rl.descH   = fontHeight * REG_DESC_ROWS + 8;
+    rl.enabled = (g_regEdit != nullptr);
+    if (!rl.enabled) return rl;
+    rl.prio = syncRegisterPriorities();
+    if (!refresh) {
+        SendMessageW(g_regDescToggle, BM_SETCHECK,
+                     GetWindowTextLengthW(g_regDesc) > 0 ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+    rl.desc    = isRegisterDescShown();
+    rl.rowH    = rl.ctrlH + 2 * REG_PAD + (rl.desc ? rl.descH + REG_PAD : 0);
+    rl.dateW   = textWidthWithMenuFont(hdc, L"0000/00/00") + GetSystemMetrics(SM_CXVSCROLL) + 8;
+    rl.buttonW = textWidthWithMenuFont(hdc, L"登録") + 32;
+    rl.toggleW = (std::max)(textWidthWithMenuFont(hdc, REG_DESC_MARK_CLOSED) + 16, rl.ctrlH);
+    SetWindowTextW(g_regDescToggle, rl.desc ? REG_DESC_MARK_OPEN : REG_DESC_MARK_CLOSED);
+    if (rl.prio) {
+        std::vector<PriorityEntry> list;
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            list = g_priorities;
+        }
+        for (const auto& e : list)
+            rl.prioW = (std::max)(rl.prioW, textWidthWithMenuFont(hdc, toWide(e.name).c_str()));
+        rl.prioW += GetSystemMetrics(SM_CXVSCROLL) + 12;
+    }
+    const int prioSpan = rl.prio ? REG_PAD + rl.prioW : 0;
+    rl.minW  = REG_PAD * 5 + REG_EDIT_MIN_WIDTH + prioSpan + rl.dateW + rl.buttonW + rl.toggleW;
+    rl.tailH = 9 + rl.rowH;
+    return rl;
+}
+
+// 登録欄の子コントロールを配置する（regTop は登録欄の行の上端、width は一覧のクライアント幅）
+// 右から「説明トグル・登録・期日・優先度」と詰め、件名欄を残りの幅に広げる。
+// 説明欄はその下に全幅で置き、閉じている間は隠す。（隠しても入力内容は保持し、送信にも含める）
+// 新規表示（refresh=false）で書きかけの件名が無ければ期日と優先度を既定に戻す。（日をまたいで開き直した場合の既定値）
+static void placeRegisterControls(const RegisterLayout& rl, int regTop, int width, bool refresh) {
+    const int cy = regTop + REG_PAD;
+    int x = width - REG_PAD - rl.toggleW;
+    SetWindowPos(g_regDescToggle, nullptr, x, cy, rl.toggleW, rl.ctrlH, SWP_NOZORDER | SWP_NOACTIVATE);
+    x -= REG_PAD + rl.buttonW;
+    SetWindowPos(g_regButton, nullptr, x, cy, rl.buttonW, rl.ctrlH, SWP_NOZORDER | SWP_NOACTIVATE);
+    x -= REG_PAD + rl.dateW;
+    SetWindowPos(g_regDate, nullptr, x, cy, rl.dateW, rl.ctrlH, SWP_NOZORDER | SWP_NOACTIVATE);
+    if (rl.prio) {
+        x -= REG_PAD + rl.prioW;
+        // ドロップダウンリストのコンボは高さがリスト込みのため、行高の 8 倍を与える。
+        // （選択欄の高さはフォントから決まり、行高には影響しない）
+        SetWindowPos(g_regPriority, nullptr, x, cy, rl.prioW, rl.ctrlH * 8,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    SetWindowPos(g_regEdit, nullptr, REG_PAD, cy, x - REG_PAD * 2, rl.ctrlH,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(g_regDesc, nullptr, REG_PAD, cy + rl.ctrlH + REG_PAD, width - 2 * REG_PAD, rl.descH,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    ShowWindow(g_regDesc, rl.desc ? SW_SHOWNA : SW_HIDE);
+    if (!refresh && GetWindowTextLengthW(g_regEdit) == 0) {
+        resetRegisterDate();
+        resetRegisterPriority();
+    }
+}
+
+// 一覧ウィンドウの左上座標を求める（cursor は基準点、mi はそのモニタ情報で null なら作業領域のクランプなし）
+// 位置はタスクバーの辺に密着させる。computeTrayPopupPos のアライメント指示
+// （BOTTOMALIGN＝底辺を y に、RIGHTALIGN＝右辺を x に合わせる）を座標へ翻訳する。
+// タスクバー沿いの軸は、アイコンを範囲に収めたまま画面中央方向へ展開し直す。
+// （トレイは画面端にあり、端方向へ広げると隅に張り付くため）
+// ただしアイコンがフライアウト内（g_listInOverflow）なら、タスクバー沿いの軸はフライアウトの横（画面中央方向）へ並べる。
+// （従来の位置ではタスクバー際に出るフライアウトを覆い、アイコンのドラッグや右クリックを妨げるため）
+// 最後にメニューの自動反転の代わりにモニタ作業領域内へクランプして画面外を防ぐ
+static POINT listWindowOrigin(const POINT& cursor, const MONITORINFO* mi, int w, int h) {
+    auto pos = computeTrayPopupPos(cursor);
+    int wx = pos.x;
+    int wy = pos.y;
+    if (pos.alignFlags & TPM_RIGHTALIGN)  wx -= w;
+    if (pos.alignFlags & TPM_BOTTOMALIGN) wy -= h;
+    if (!mi) return { wx, wy };
+    const RECT& work = mi->rcWork;
+    if (g_listInOverflow) {
+        // フライアウトの中心が作業領域の中央以降なら手前側へ、中央より手前なら奥側へ置く
+        const RECT& fo = g_listOverflowRect;
+        if (pos.alongX) {
+            wx = (fo.left + fo.right) / 2 >= (work.left + work.right) / 2 ? fo.left - w : fo.right;
+        }
+        else {
+            wy = (fo.top + fo.bottom) / 2 >= (work.top + work.bottom) / 2 ? fo.top - h : fo.bottom;
+        }
+    }
+    else if (pos.alongX) {
+        wx = alignTowardCenter(cursor.x, w, work.left, work.right, GetSystemMetrics(SM_CXSMICON));
+    }
+    else {
+        wy = alignTowardCenter(cursor.y, h, work.top, work.bottom, GetSystemMetrics(SM_CYSMICON));
+    }
+    wx = (std::max)(static_cast<int>(work.left), (std::min)(wx, static_cast<int>(work.right) - w));
+    wy = (std::max)(static_cast<int>(work.top),  (std::min)(wy, static_cast<int>(work.bottom) - h));
+    return { wx, wy };
+}
+
+// 組み直し後のホット行を復元する（離脱監視は引き継ぐ）
+// -1 のままだと次のマウス移動までハイライトが消え、猶予を戻すと離脱判定が遅れる。
+// keepSelectedId（キーで選んでいたチケット id。0 = なし）があれば同じチケットの行へ移す。
+// （並びが変わっても選択を保つ。一覧から消えたら選択を外す）それ以外はカーソル位置の行にする。
+static void restoreHotRowAfterRefresh(HWND hWnd, int keepSelectedId) {
+    if (keepSelectedId != 0) {
+        for (size_t i = 0; i < g_listLayout.size(); ++i) {
+            const auto& row = g_listLayout[i];
+            if (row.kind == ListRowKind::Issue && row.index < g_issueItems.size()
+                && g_issueItems[row.index].id == keepSelectedId) {
+                g_listHotRow = static_cast<int>(i);
+                break;
+            }
+        }
+        g_listKeySelected = (g_listHotRow >= 0);
+        return;
+    }
+    POINT pt;
+    GetCursorPos(&pt);
+    ScreenToClient(hWnd, &pt);
+    RECT client;
+    GetClientRect(hWnd, &client);
+    g_listHotRow = PtInRect(&client, pt) ? listRowHitTest(pt.y) : -1;
+}
+
+// 新規表示の離脱監視とホットキーを開始する（表示直後に 1 回だけ呼ぶ）
+// 離脱監視（IDT_LIST_WATCH）の開始に失敗したら表示を諦めて閉じる。（閉じる手段が離脱かクリックしかなく、
+// 監視なしでは出しっぱなしになるため）
+// 検索の Ctrl+F を表示中だけ登録する。他アプリが登録済みなら失敗し、検索できないだけで一覧は使える。
+// （ホバー表示のたびに失敗を書くとログが埋まるため、失敗のログは起動後の初回だけにする）
+static void startListWatch(HWND trayWnd, HWND hWnd) {
+    g_popupShowing.store(true);
+    // 負値から数え始め、表示直後の約 1 秒は離脱と数えない（LIST_SHOW_GRACE_TICKS を参照）
+    g_listOutsideTicks = -LIST_SHOW_GRACE_TICKS;
+    if (!SetTimer(trayWnd, IDT_LIST_WATCH, LIST_WATCH_POLL_MS, nullptr)) {
+        writeLog("list: SetTimer(IDT_LIST_WATCH) failed");
+        ShowWindow(hWnd, SW_HIDE);
+        g_popupShowing.store(false);
+        return;
+    }
+    if (!RegisterHotKey(trayWnd, HOTKEY_ID_SEARCH, MOD_CONTROL | MOD_NOREPEAT, 'F')) {
+        static bool logged = false;
+        if (!logged) {
+            writeLog("list: RegisterHotKey(Ctrl+F) failed: " + std::to_string(GetLastError()));
+            logged = true;
+        }
+    }
+    updateListNavHotkeys();  // 上下キー・Enter のキー操作（updateListNavHotkeys を参照）
+}
+
 // 一覧ポップアップの表示（ホバー・左クリック・ショートカットキー共通）
 // 表示行の選定・並べ替え・絞り込みは buildListRows に委ねる。（バッジの未読判定と同じ根拠）
 // 行の左クリックかホット行の Enter でチケットを開いてその 1 件だけ既読にする。（非表示のグレー行も同様に開ける）
@@ -6497,10 +6698,6 @@ static void showListPopup(HWND trayWnd, bool refresh, const POINT* anchor) {
         if (hot.kind == ListRowKind::Issue && hot.index < g_issueItems.size()) keepSelectedId = g_issueItems[hot.index].id;
     }
 
-    g_issueItems.clear();
-    g_listLayout.clear();
-    g_listHotRow = -1;
-
     // カーソル位置のモニタ作業領域を先に取得する。（行の打ち切り判定と位置クランプの両方に使う）
     POINT cursor;
     if (refresh) {
@@ -6526,11 +6723,15 @@ static void showListPopup(HWND trayWnd, bool refresh, const POINT* anchor) {
     // GetDC 失敗（GDI ハンドル枯渇）時は一覧を出さずに諦める。以降の計測が全滅し、
     // パディングの下駄だけが残った幅 20px・行高 6px の判読不能な極小ウィンドウが出るためだ。
     // 次のホバー・左クリックで再試行するので操作は失われない。
+    // 行データの消去は GetDC の成功後に行う。（先に消すと、組み直しの失敗で表示中の一覧が空白になる）
     HDC hdc = GetDC(hWnd);
     if (!hdc) {
         writeLog("list: GetDC failed; popup skipped");
         return;
     }
+    g_issueItems.clear();
+    g_listLayout.clear();
+    g_listHotRow = -1;
     int width = 0;
     int y     = 0;
     auto pushRow = [&](ListRowKind kind, int h, size_t index) {
@@ -6544,49 +6745,9 @@ static void showListPopup(HWND trayWnd, bool refresh, const POINT* anchor) {
     GetTextMetricsW(hdc, &tm);
     const int textRowHeight = tm.tmHeight + 6;
     SelectObject(hdc, oldFont);
-    auto textWidth = [&](const wchar_t* text) {
-        HFONT prev = static_cast<HFONT>(SelectObject(hdc, g_hMenuFont));
-        SIZE sz = {};
-        GetTextExtentPoint32W(hdc, text, static_cast<int>(wcslen(text)), &sz);
-        SelectObject(hdc, prev);
-        return static_cast<int>(sz.cx);
-    };
-    auto textRowWidth = [&](const wchar_t* text) { return textWidth(text) + 20; };
+    auto textRowWidth = [&](const wchar_t* text) { return textWidthWithMenuFont(hdc, text) + 20; };
 
-    // 登録欄の寸法（コントロールの高さは文字高＋枠、DTP の幅は固定書式の見本＋ドロップダウンボタン、
-    // 優先度コンボの幅は最長の優先度名＋ドロップダウンボタン。未取得で隠すときは幅 0 で余白も詰める。
-    // 説明トグルの幅は記号＋左右の余白で、行高より細くしない）
-    const bool regEnabled = (g_regEdit != nullptr);
-    const bool regPrio    = regEnabled && syncRegisterPriorities();
-    // 新規表示では書きかけの説明があるときだけ説明欄を開く。（組み直しではトグルの状態を保つ。
-    // 行高が表示状態に依存するため、ここで先に決める）
-    if (regEnabled && !refresh) {
-        SendMessageW(g_regDescToggle, BM_SETCHECK,
-                     GetWindowTextLengthW(g_regDesc) > 0 ? BST_CHECKED : BST_UNCHECKED, 0);
-    }
-    const bool regDesc    = regEnabled && isRegisterDescShown();
-    const int  regCtrlH   = tm.tmHeight + 8;
-    const int  regDescH   = tm.tmHeight * REG_DESC_ROWS + 8;
-    // 説明欄の表示中はコントロール行の下に説明欄を足す。（この行高が regTailH 経由で打ち切りの予約にも効く）
-    const int  regRowH    = regCtrlH + 2 * REG_PAD + (regDesc ? regDescH + REG_PAD : 0);
-    const int  regDateW   = textWidth(L"0000/00/00") + GetSystemMetrics(SM_CXVSCROLL) + 8;
-    const int  regButtonW = textWidth(L"登録") + 32;
-    const int  regToggleW = (std::max)(textWidth(REG_DESC_MARK_CLOSED) + 16, regCtrlH);
-    if (regEnabled) SetWindowTextW(g_regDescToggle, regDesc ? REG_DESC_MARK_OPEN : REG_DESC_MARK_CLOSED);
-    int regPrioW = 0;
-    if (regPrio) {
-        std::vector<PriorityEntry> list;
-        {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            list = g_priorities;
-        }
-        for (const auto& e : list) regPrioW = (std::max)(regPrioW, textWidth(toWide(e.name).c_str()));
-        regPrioW += GetSystemMetrics(SM_CXVSCROLL) + 12;
-    }
-    const int  regPrioSpan = regPrio ? REG_PAD + regPrioW : 0;
-    const int  regMinW    = REG_PAD * 5 + REG_EDIT_MIN_WIDTH + regPrioSpan + regDateW + regButtonW + regToggleW;
-    // 登録欄とその上のセパレータの高さ（無効時は 0）
-    const int  regTailH   = regEnabled ? 9 + regRowH : 0;
+    const RegisterLayout rl = measureRegisterRow(hdc, tm.tmHeight, refresh);
 
     // 検索欄は先頭に置く。（画面下のタスクバーでは一覧が上へ伸びるため、出し入れしても既存の行の位置が変わらない）
     // 高さは登録欄のコントロール行と揃える。先に積むため、チケット行の打ち切り判定にも含まれる
@@ -6594,7 +6755,7 @@ static void showListPopup(HWND trayWnd, bool refresh, const POINT* anchor) {
     int searchTop = 0;
     if (searchShown) {
         searchTop = y;
-        pushRow(ListRowKind::Search, regCtrlH + 2 * REG_PAD, 0);
+        pushRow(ListRowKind::Search, rl.ctrlH + 2 * REG_PAD, 0);
         pushRow(ListRowKind::Separator, 9, 0);
         width = (std::max)(width, SEARCH_EDIT_MIN_WIDTH + 2 * REG_PAD);
     }
@@ -6606,7 +6767,7 @@ static void showListPopup(HWND trayWnd, bool refresh, const POINT* anchor) {
     }
     else {
         // セパレータとフッタ（と登録欄）は必ず出すため、その高さを先に予約して行を詰める
-        const int tailHeight = 9 + textRowHeight + regTailH;
+        const int tailHeight = 9 + textRowHeight + rl.tailH;
         size_t idx = 0;
         for (const auto& row : rows) {
             g_issueItems.push_back(makeItem(row));
@@ -6633,46 +6794,19 @@ static void showListPopup(HWND trayWnd, bool refresh, const POINT* anchor) {
     }
     applySearchHits();
     int regTop = 0;
-    if (regEnabled) {
-        width = (std::max)(width, regMinW);
+    if (rl.enabled) {
+        width = (std::max)(width, rl.minW);
         pushRow(ListRowKind::Separator, 9, 0);
         regTop = y;
-        pushRow(ListRowKind::Register, regRowH, 0);
+        pushRow(ListRowKind::Register, rl.rowH, 0);
     }
     ReleaseDC(hWnd, hdc);
 
-    // 登録欄の子コントロールを右から「説明トグル・登録・期日・優先度」と詰め、件名欄を残りの幅に広げる。
-    // 説明欄はその下に全幅で置き、閉じている間は隠す。（隠しても入力内容は保持し、送信にも含める）
-    if (regEnabled) {
-        const int cy = regTop + REG_PAD;
-        int x = width - REG_PAD - regToggleW;
-        SetWindowPos(g_regDescToggle, nullptr, x, cy, regToggleW, regCtrlH, SWP_NOZORDER | SWP_NOACTIVATE);
-        x -= REG_PAD + regButtonW;
-        SetWindowPos(g_regButton, nullptr, x, cy, regButtonW, regCtrlH, SWP_NOZORDER | SWP_NOACTIVATE);
-        x -= REG_PAD + regDateW;
-        SetWindowPos(g_regDate, nullptr, x, cy, regDateW, regCtrlH, SWP_NOZORDER | SWP_NOACTIVATE);
-        if (regPrio) {
-            x -= REG_PAD + regPrioW;
-            // ドロップダウンリストのコンボは高さがリスト込みのため、行高の 8 倍を与える。
-            // （選択欄の高さはフォントから決まり、行高には影響しない）
-            SetWindowPos(g_regPriority, nullptr, x, cy, regPrioW, regCtrlH * 8,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-        SetWindowPos(g_regEdit, nullptr, REG_PAD, cy, x - REG_PAD * 2, regCtrlH,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-        SetWindowPos(g_regDesc, nullptr, REG_PAD, cy + regCtrlH + REG_PAD, width - 2 * REG_PAD, regDescH,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-        ShowWindow(g_regDesc, regDesc ? SW_SHOWNA : SW_HIDE);
-        // 新規表示で書きかけの件名が無ければ期日と優先度を既定に戻す。（日をまたいで開き直した場合の既定値）
-        if (!refresh && GetWindowTextLengthW(g_regEdit) == 0) {
-            resetRegisterDate();
-            resetRegisterPriority();
-        }
-    }
+    if (rl.enabled) placeRegisterControls(rl, regTop, width, refresh);
     // 検索欄は全幅に広げる。（非表示中は隠すだけで、文字列は閉じる経路が消す）
     if (g_searchEdit) {
         if (searchShown) {
-            SetWindowPos(g_searchEdit, nullptr, REG_PAD, searchTop + REG_PAD, width - 2 * REG_PAD, regCtrlH,
+            SetWindowPos(g_searchEdit, nullptr, REG_PAD, searchTop + REG_PAD, width - 2 * REG_PAD, rl.ctrlH,
                          SWP_NOZORDER | SWP_NOACTIVATE);
         }
         ShowWindow(g_searchEdit, searchShown ? SW_SHOWNA : SW_HIDE);
@@ -6683,98 +6817,18 @@ static void showListPopup(HWND trayWnd, bool refresh, const POINT* anchor) {
     AdjustWindowRectEx(&wr, LIST_WND_STYLE, FALSE, LIST_WND_EXSTYLE);
     const int w = wr.right - wr.left;
     const int h = wr.bottom - wr.top;
-
-    // 位置はタスクバーの辺に密着させる。computeTrayPopupPos のアライメント指示
-    // （BOTTOMALIGN＝底辺を y に、RIGHTALIGN＝右辺を x に合わせる）を座標へ翻訳する。
-    // タスクバー沿いの軸は、アイコンを範囲に収めたまま画面中央方向へ展開し直す。
-    // （トレイは画面端にあり、端方向へ広げると隅に張り付くため）
-    // ただしアイコンがフライアウト内なら、タスクバー沿いの軸はフライアウトの横（画面中央方向）へ並べる。
-    // （従来の位置ではタスクバー際に出るフライアウトを覆い、アイコンのドラッグや右クリックを妨げるため）
-    // 最後にメニューの自動反転の代わりにモニタ作業領域内へクランプして画面外を防ぐ
-    auto pos = computeTrayPopupPos(cursor);
-    int wx = pos.x;
-    int wy = pos.y;
-    if (pos.alignFlags & TPM_RIGHTALIGN)  wx -= w;
-    if (pos.alignFlags & TPM_BOTTOMALIGN) wy -= h;
-    if (haveMi) {
-        if (g_listInOverflow) {
-            // フライアウトの中心が作業領域の中央以降なら手前側へ、中央より手前なら奥側へ置く
-            const RECT& fo = g_listOverflowRect;
-            if (pos.alongX) {
-                wx = (fo.left + fo.right) / 2 >= (mi.rcWork.left + mi.rcWork.right) / 2
-                    ? fo.left - w : fo.right;
-            }
-            else {
-                wy = (fo.top + fo.bottom) / 2 >= (mi.rcWork.top + mi.rcWork.bottom) / 2
-                    ? fo.top - h : fo.bottom;
-            }
-        }
-        else if (pos.alongX) {
-            wx = alignTowardCenter(cursor.x, w, mi.rcWork.left, mi.rcWork.right,
-                                   GetSystemMetrics(SM_CXSMICON));
-        }
-        else {
-            wy = alignTowardCenter(cursor.y, h, mi.rcWork.top, mi.rcWork.bottom,
-                                   GetSystemMetrics(SM_CYSMICON));
-        }
-        wx = (std::max)(static_cast<int>(mi.rcWork.left),
-                        (std::min)(wx, static_cast<int>(mi.rcWork.right) - w));
-        wy = (std::max)(static_cast<int>(mi.rcWork.top),
-                        (std::min)(wy, static_cast<int>(mi.rcWork.bottom) - h));
-    }
+    const POINT origin = listWindowOrigin(cursor, haveMi ? &mi : nullptr, w, h);
 
     // SWP_NOACTIVATE でフォーカスを奪わずに表示する。組み直し（refresh）では Z 順を変えない
-    SetWindowPos(hWnd, HWND_TOPMOST, wx, wy, w, h,
+    SetWindowPos(hWnd, HWND_TOPMOST, origin.x, origin.y, w, h,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW | (refresh ? SWP_NOZORDER : 0));
     InvalidateRect(hWnd, nullptr, FALSE);
 
-    // 組み直しではホット行を復元し、離脱監視は引き継ぐ。
-    // （-1 のままだと次のマウス移動までハイライトが消え、猶予を戻すと離脱判定が遅れる）
-    // キーで選んだ行は同じチケットの行へ移す。（並びが変わっても選択を保つ。一覧から消えたら選択を外す）
-    // それ以外はカーソル位置の行にする。
     if (refresh) {
-        if (keepSelectedId != 0) {
-            for (size_t i = 0; i < g_listLayout.size(); ++i) {
-                const auto& row = g_listLayout[i];
-                if (row.kind == ListRowKind::Issue && row.index < g_issueItems.size()
-                    && g_issueItems[row.index].id == keepSelectedId) {
-                    g_listHotRow = static_cast<int>(i);
-                    break;
-                }
-            }
-            g_listKeySelected = (g_listHotRow >= 0);
-            return;
-        }
-        POINT pt;
-        GetCursorPos(&pt);
-        ScreenToClient(hWnd, &pt);
-        RECT client;
-        GetClientRect(hWnd, &client);
-        g_listHotRow = PtInRect(&client, pt) ? listRowHitTest(pt.y) : -1;
+        restoreHotRowAfterRefresh(hWnd, keepSelectedId);
         return;
     }
-
-    g_popupShowing.store(true);
-    // 負値から数え始め、表示直後の約 1 秒は離脱と数えない（LIST_SHOW_GRACE_TICKS を参照）
-    g_listOutsideTicks = -LIST_SHOW_GRACE_TICKS;
-    // 離脱監視の開始。失敗時は表示を諦めて閉じる。（閉じる手段が離脱かクリックしかなく、
-    // 監視なしでは出しっぱなしになるため）
-    if (!SetTimer(trayWnd, IDT_LIST_WATCH, LIST_WATCH_POLL_MS, nullptr)) {
-        writeLog("list: SetTimer(IDT_LIST_WATCH) failed");
-        ShowWindow(hWnd, SW_HIDE);
-        g_popupShowing.store(false);
-        return;
-    }
-    // 検索の Ctrl+F を表示中だけ登録する。他アプリが登録済みなら失敗し、検索できないだけで一覧は使える。
-    // （ホバー表示のたびに失敗を書くとログが埋まるため、失敗のログは起動後の初回だけにする）
-    if (!RegisterHotKey(trayWnd, HOTKEY_ID_SEARCH, MOD_CONTROL | MOD_NOREPEAT, 'F')) {
-        static bool logged = false;
-        if (!logged) {
-            writeLog("list: RegisterHotKey(Ctrl+F) failed: " + std::to_string(GetLastError()));
-            logged = true;
-        }
-    }
-    updateListNavHotkeys();  // 上下キー・Enter のキー操作（updateListNavHotkeys を参照）
+    startListWatch(trayWnd, hWnd);
 }
 
 // 一覧ポップアップを閉じる（離脱・トグル・行クリック・Enter の共通経路）
@@ -6826,7 +6880,7 @@ static void openListSearch(HWND trayWnd) {
 // ・それ以外で、Ctrl+F の時点の前面窓が他スレッドの窓なら、入力モードを抜けてそこへフォアグラウンドを返す。
 //   （ホバー表示中の Ctrl+F で奪ったフォーカスを戻し、離脱監視に閉じる判断を任せる）
 // ・どちらでもなければ入力モードに留め、件名欄（無ければ一覧自体）へフォーカスを渡す。
-// 入力モードでないとき（他アプリへの切り替えで抜けた後）はフォーカスに触れない。（利用者の切り替えを尊重する）
+// 入力モードでないとき（他アプリへの切り替えで抜けた後）はフォーカスに触れない。（ユーザの切り替えを尊重する）
 static void closeListSearch(HWND trayWnd) {
     g_searchActive = false;
     SetWindowTextW(g_searchEdit, L"");
@@ -6931,13 +6985,8 @@ static void registerToggleHotkey(HWND hWnd, const std::wstring& spec) {
         return;
     }
     writeLog("toggle_hotkey: not registered: " + wideToUtf8(spec));
-    try {
-        showToast(L"ショートカットキーを登録できません",
-                  L"toggle_hotkey の「" + spec + L"」は" + reason + L"。設定を変えて再起動してください", L"");
-    }
-    catch (...) {
-        writeLog("toggle_hotkey: error toast failed");
-    }
+    showToast(L"ショートカットキーを登録できません",
+              L"toggle_hotkey の「" + spec + L"」は" + reason + L"。設定を変えて再起動してください", L"");
 }
 
 // 一覧行の状態（排他。行の右クリックメニューのラジオ項目に対応する）
@@ -7008,21 +7057,9 @@ static void setIssueState(int issueId, IssueRowState target) {
             // ピン留め（未読には影響しない）
             g_hiddenIds.erase(issueId);
             nowUnread = g_unreadIds.count(issueId) != 0;
+            // 表示属性は IssueView の共通部分ごと複写する。（フィールド追加時の追記漏れを防ぐ）
             PinEntry p;
-            p.id              = item.id;
-            p.subject         = cur->subject;
-            p.projectName     = cur->projectName;
-            p.updatedOn       = cur->updatedOn;
-            p.closed          = cur->closed;
-            p.dueDate         = cur->dueDate;
-            p.createdOn       = cur->createdOn;
-            p.priorityId      = cur->priorityId;
-            p.assignedToGroup = cur->assignedToGroup;
-            p.isBugTracker    = cur->isBugTracker;
-            p.updaterDisplay  = cur->updaterDisplay;
-            p.updaterFirst    = cur->updaterFirstName;
-            p.authorDisplay    = cur->authorDisplay;
-            p.commenterDisplay = cur->commenterDisplay;
+            static_cast<IssueView&>(p) = *cur;
             if (it == g_pins.end()) g_pins.push_back(std::move(p));
             nowPinned = true;
         }
@@ -7075,7 +7112,7 @@ static std::wstring buildMarkdownLink(const std::wstring& label, const std::wstr
     return r + L"](" + url + L")";
 }
 
-// クリップボードへ文字列を置く（失敗はログのみ。利用者には貼り付け結果で分かるため通知しない）
+// クリップボードへ文字列を置く（失敗はログのみ。ユーザには貼り付け結果で分かるため通知しない）
 // html が空でなければ、同じ内容の CF_HTML（buildClipboardHtml の出力）も併せて置く。
 // 貼り付け先は、リッチテキストを受けるなら HTML を、受けなければ text を使う。
 static void setClipboardText(HWND owner, const std::wstring& text, const std::string& html = {}) {
@@ -7202,10 +7239,7 @@ static INT_PTR CALLBACK closeIssueDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LP
         }
         if (id == IDOK) {
             auto* data = reinterpret_cast<CloseIssueDialogData*>(GetWindowLongPtrW(hDlg, DWLP_USER));
-            HWND edit = GetDlgItem(hDlg, IDC_CLOSE_NOTES);
-            std::wstring text(static_cast<size_t>(GetWindowTextLengthW(edit)) + 1, L'\0');
-            text.resize(GetWindowTextW(edit, text.data(), static_cast<int>(text.size())));
-            data->notes = std::move(text);
+            data->notes = getControlText(GetDlgItem(hDlg, IDC_CLOSE_NOTES));
             EndDialog(hDlg, IDOK);
             return TRUE;
         }
@@ -7361,6 +7395,7 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
     forceForeground(g_hWnd);
     const UINT cmd = static_cast<UINT>(TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
                                                       screenPt.x, screenPt.y, 0, g_hWnd, nullptr));
+    PostMessage(g_hWnd, WM_NULL, 0, 0);  // 通知領域のメニューの定石（showTrayContextMenu と同じ）
     DestroyMenu(menu);
 
     // コピー系の共通素材（表示文字列は「#123 件名」、件名が空なら「#123」のみ）
@@ -7401,7 +7436,7 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
         std::wstring notes;
         if (showCloseIssueDialog(issueId, notes)) {
             startIssueUpdate(issueId, buildIssueCloseBody(closeStatusId, notes), closeStatusId,
-                             !trimRegisterText(notes).empty());
+                             !trimText(notes).empty());
         }
     }
 
@@ -7409,7 +7444,7 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
     updateListNavHotkeys();
     g_listOutsideTicks = 0;
     // フォアグラウンドを返す。（一覧はフォーカスを奪わない設計のため、前面化はメニューの間だけに留める）
-    // メニュー外で他アプリをクリックして閉じた場合は、利用者の切り替えを尊重して何もしない。
+    // メニュー外で他アプリをクリックして閉じた場合は、ユーザの切り替えを尊重して何もしない。
     // 自スレッドに残っていれば、入力モード中は一覧（登録欄のキー入力先）へ、それ以外は元の窓へ戻す。
     HWND fg = GetForegroundWindow();
     if (fg && GetWindowThreadProcessId(fg, nullptr) == GetCurrentThreadId()) {
@@ -7470,6 +7505,9 @@ static void enterDisabledMode(HWND hWnd, DisabledReason reason,
     // 一覧のトグルのショートカットキーを解除する。（無効モードでは一覧を出さず、復帰は再起動のみのため、
     // 登録を残すと他アプリからキーを奪ったまま何もしない。起動時から無効モードなら未登録で、解除は失敗するだけ）
     UnregisterHotKey(hWnd, HOTKEY_ID_TOGGLE);
+    // 表示中の一覧も閉じる。（古いデータの一覧と、登録欄・行メニュー・キー操作のホットキーを残さない）
+    // 非表示のときは呼ばない。（右クリックメニューの表示中に届くと g_popupShowing を落としてしまう）
+    if (g_listWnd && IsWindowVisible(g_listWnd)) hideListPopup(hWnd);
 
     // 設定ファイルを開く（不在ならテンプレートを生成してから）
     ensureLocalTomlTemplate(exeDir);
@@ -7480,29 +7518,24 @@ static void enterDisabledMode(HWND hWnd, DisabledReason reason,
     ShellExecuteW(nullptr, L"open", GUIDE_URL, nullptr, nullptr, SW_SHOWNORMAL);
 
     // 原因別のブラウザ誘導と Toast（permalink 空 = ボタンなし。silent=false で OS 通知音）
-    try {
-        if (reason == DisabledReason::InvalidUrl) {
-            showToast3(L"無効な Redmine URL",
-                       L"設定ファイルに url を設定してください",
-                       L"設定後は redntfy を再起動してください", L"");
-        }
-        else if (reason == DisabledReason::InvalidApiKey) {
-            std::wstring accountUrl = cfg.redmineUrl + L"/my/account";
-            ShellExecuteW(nullptr, L"open", accountUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            showToast3(L"認証エラー",
-                       L"Redmine の API アクセスキーを api_key に設定してください",
-                       L"設定後は redntfy を再起動してください", L"");
-        }
-        else {
-            std::wstring issuesUrl = cfg.redmineUrl + L"/issues";
-            ShellExecuteW(nullptr, L"open", issuesUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            showToast3(L"設定エラー",
-                       L"Redmine のマイカスタムクエリを query_ids に設定してください",
-                       L"設定後は redntfy を再起動してください", L"");
-        }
+    if (reason == DisabledReason::InvalidUrl) {
+        showToast3(L"無効な Redmine URL",
+                   L"設定ファイルに url を設定してください",
+                   L"設定後は redntfy を再起動してください", L"");
     }
-    catch (...) {
-        writeLog("enterDisabledMode: toast failed");
+    else if (reason == DisabledReason::InvalidApiKey) {
+        std::wstring accountUrl = cfg.redmineUrl + L"/my/account";
+        ShellExecuteW(nullptr, L"open", accountUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        showToast3(L"認証エラー",
+                   L"Redmine の API アクセスキーを api_key に設定してください",
+                   L"設定後は redntfy を再起動してください", L"");
+    }
+    else {
+        std::wstring issuesUrl = cfg.redmineUrl + L"/issues";
+        ShellExecuteW(nullptr, L"open", issuesUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        showToast3(L"設定エラー",
+                   L"グローバル保存クエリ（プロジェクト未指定で保存したクエリ）の id を query_ids に設定してください",
+                   L"設定後は redntfy を再起動してください", L"");
     }
 
     // トレイ表示を無効モードへ（アイコンは updateTrayTooltip 経由で切り替わる）
@@ -7661,7 +7694,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             SendMessageW(g_regDescToggle, BM_SETCHECK, BST_UNCHECKED, 0);
             resetRegisterDate();
             resetRegisterPriority();
-            g_registerPoll.store(true);
+            g_reflectPoll.store(true);
             if (isListPopupVisible()) showListPopup(hWnd, true);  // 説明欄を閉じた行高で組み直す
         }
         updateRegisterControls();
@@ -7671,7 +7704,7 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     // 行メニューからの更新の完了通知（成功なら即時ポーリングで更新結果を一覧へ反映する）
     if (msg == WM_ISSUE_UPDATE_DONE) {
         g_issueUpdateBusy = false;
-        if (wParam) g_registerPoll.store(true);
+        if (wParam) g_reflectPoll.store(true);
         return 0;
     }
     if (msg == WM_COMMAND) {
@@ -7681,21 +7714,26 @@ static LRESULT CALLBACK trayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     // オーナードローは右クリックメニューのバージョン更新通知行のみ（一覧は自前ウィンドウ描画）
     if (msg == WM_MEASUREITEM) {
         auto* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
-        if (mis->CtlType == ODT_MENU && mis->itemID == IDM_OPEN_GITHUB)
-            return measureVersionMenuItem(hWnd, mis) ? TRUE : DefWindowProcW(hWnd, msg, wParam, lParam);
+        if (mis->CtlType == ODT_MENU && mis->itemID == IDM_OPEN_GITHUB) {
+            measureVersionMenuItem(hWnd, mis);
+            return TRUE;
+        }
     }
     if (msg == WM_DRAWITEM) {
         auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
-        if (dis->CtlType == ODT_MENU && dis->itemID == IDM_OPEN_GITHUB)
-            return drawVersionMenuItem(dis) ? TRUE : DefWindowProcW(hWnd, msg, wParam, lParam);
+        if (dis->CtlType == ODT_MENU && dis->itemID == IDM_OPEN_GITHUB) {
+            drawVersionMenuItem(dis);
+            return TRUE;
+        }
     }
     if (msg == WM_DESTROY) {
         PostQuitMessage(0);
         return 0;
     }
-    // スリープ復帰・ロック解除：即時ポーリングをトリガー
+    // スリープ復帰・ロック解除：即時ポーリングをトリガー（復帰起点の失敗時は Toast を抑止する。g_resumePoll を参照）
     if ((msg == WM_POWERBROADCAST && wParam == PBT_APMRESUMEAUTOMATIC) ||
         (msg == WM_WTSSESSION_CHANGE && wParam == WTS_SESSION_UNLOCK)) {
+        if (msg == WM_POWERBROADCAST) g_resumePoll.store(true);
         g_forcePoll.store(true);
         writeLog(msg == WM_POWERBROADCAST ? "resume from sleep" : "session unlock");
         return msg == WM_POWERBROADCAST ? TRUE : 0;
@@ -7730,7 +7768,7 @@ static HWND createTrayWindow() {
     return hWnd;
 }
 
-// ==================== エントリポイント ====================
+// ==================== ポーリングの後処理と通知 ====================
 
 // ネットワークインターフェース変化コールバック
 //
@@ -7796,7 +7834,7 @@ static void refreshPins(const std::wstring& dataDir, const Config& cfg,
         // （fetchIssue）は journals を含まず updaterDisplay が空のため、保存済みの値を保つ
         if (!src->updaterDisplay.empty()) {
             candidate.updaterDisplay   = src->updaterDisplay;
-            candidate.updaterFirst     = src->updaterFirstName;
+            candidate.updaterFirst     = src->updaterFirst;
             candidate.authorDisplay    = src->authorDisplay;
             candidate.commenterDisplay = src->commenterDisplay;
         }
@@ -7975,32 +8013,24 @@ static std::optional<std::vector<NotifyTarget>> selectNotifyTargets(
 }
 
 // 選定済みの通知対象をユーザへ届ける（Toast・通知音・未読記録・内訳ログ）
-// targets は 1 件以上を前提とする。Toast の失敗はログのみ残して通知音・未読記録は続行する。
+// targets は 1 件以上を前提とする。Toast の失敗（showToast がログに残す）でも通知音・未読記録は続行する。
 // （音と未読バッジだけでも更新の発生は伝わるため）
 static void emitNotifications(const Config& cfg, const std::vector<NotifyTarget>& targets) {
-    try {
-        if (targets.size() == 1) {
-            // 1 件：チケット番号＋件名を出し、クリックでそのチケットを開く。
-            // 種別に更新者名を添える。（例「更新：山田太郎」。名前が取れない場合は種別のみ）
-            const NotifyTarget& nt = targets[0];
-            const Issue* t = nt.issue;
-            std::wstring kind = nt.kind == NotifyKind::New ? L"新規" : L"更新";
-            if (!nt.updaterName.empty()) kind += L"：" + toWide(nt.updaterName);
-            showToast(L"#" + std::to_wstring(t->id) + L" " + toWide(t->subject),
-                      kind, issueUrl(cfg, t->id));
-        }
-        else {
-            // 複数件：合計件数のみのサマリ 1 通とし、クリックで代表画面（queryUrl）を開く
-            showToast(L"チケットが " + std::to_wstring(targets.size()) + L" 件更新されました",
-                      L"",
-                      queryUrl(cfg));
-        }
+    if (targets.size() == 1) {
+        // 1 件：チケット番号＋件名を出し、クリックでそのチケットを開く。
+        // 種別に更新者名を添える。（例「更新：山田太郎」。名前が取れない場合は種別のみ）
+        const NotifyTarget& nt = targets[0];
+        const Issue* t = nt.issue;
+        std::wstring kind = nt.kind == NotifyKind::New ? L"新規" : L"更新";
+        if (!nt.updaterName.empty()) kind += L"：" + toWide(nt.updaterName);
+        showToast(L"#" + std::to_wstring(t->id) + L" " + toWide(t->subject),
+                  kind, issueUrl(cfg, t->id));
     }
-    catch (winrt::hresult_error const& e) {
-        writeLog("notify toast failed: " + winrt::to_string(e.message()));
-    }
-    catch (...) {
-        writeLog("notify toast failed: unknown exception");
+    else {
+        // 複数件：合計件数のみのサマリ 1 通とし、クリックで代表画面（queryUrl）を開く
+        showToast(L"チケットが " + std::to_wstring(targets.size()) + L" 件更新されました",
+                  L"",
+                  queryUrl(cfg));
     }
     // 通知音（ミーティング中ミュートの判定は発火時点の状態で行う）
     if (g_soundEnabled.load() && !(g_muteInMeeting.load() && isMeetingActive()))
@@ -8103,22 +8133,14 @@ static PollOutcome deliverPollResults(const std::wstring& dataDir, const Config&
 // 通知音は鳴らさない。（チケットの更新通知と違い、ユーザが待っている場面での応答のため）
 static void showPollDoneToast(int mutedOwn)
 {
-    try {
-        if (mutedOwn > 0)
-            showToast(L"自分の操作による更新 " + std::to_wstring(mutedOwn) + L" 件（通知なし）",
-                      L"", L"", true);
-        else
-            showToast(L"新しい更新はありません", L"", L"", true);
-    }
-    catch (winrt::hresult_error const& e) {
-        writeLog("poll done toast failed: " + winrt::to_string(e.message()));
-    }
-    catch (...) {
-        writeLog("poll done toast failed: unknown exception");
-    }
+    if (mutedOwn > 0)
+        showToast(L"自分の操作による更新 " + std::to_wstring(mutedOwn) + L" 件（通知なし）",
+                  L"", L"", true);
+    else
+        showToast(L"新しい更新はありません", L"", L"", true);
 }
 
-// shutdown と明示操作の即時ポーリング（g_manualPoll・g_registerPoll）だけを監視して待つ（100ms 刻み）
+// shutdown と明示操作の即時ポーリング（g_manualPoll・g_reflectPoll）だけを監視して待つ（100ms 刻み）
 // waitInterruptible と違い forcePoll では起きない。休止時間帯とクールダウン待ちで使う。
 // （forcePoll で即復帰すると NIC 変化の連発時に周回して待機の目的が破れるため）
 // waitInterruptible と同じ GetTickCount64 の期限方式とする。Sleep の積算方式は
@@ -8126,7 +8148,7 @@ static void showPollDoneToast(int mutedOwn)
 // ポーリングが最大 1 時間遅れるため使わない。（GetTickCount64 はサスペンド時間を含む）
 static void waitIgnoringForcePoll(ULONGLONG ms) {
     ULONGLONG end = GetTickCount64() + ms;
-    while (!g_shutdownRequested && !g_manualPoll.load() && !g_registerPoll.load()) {
+    while (!g_shutdownRequested && !g_manualPoll.load() && !g_reflectPoll.load()) {
         ULONGLONG now = GetTickCount64();
         if (end <= now) break;
         ULONGLONG remain = end - now;
@@ -8313,7 +8335,7 @@ static void resolvePollMetadata(const Config& cfg, PollSession& s, bool manualTr
 // メインスレッドからポーリング処理（HTTP I/O）を分離し、UI（右クリックメニュー等）の
 // 応答性をネットワーク状態に依存させないことが目的。
 // 実行内容：保存クエリの全件取得 → 通知判定・Toast・通知音 → 状態保存。
-// 中断は g_shutdownRequested の atomic フラグ経由。（waitInterruptible が 100 ms 単位で監視）
+// 中断は g_shutdownRequested の atomic フラグ経由。（waitInterruptible が 100ms 単位で監視）
 static void pollThreadFunc(std::wstring dataDir, Config cfg) {
     // WinRT アパートメント初期化
     // 本スレッドは JSON パースと Toast 表示（deliverPollResults / showErrorToast）を持つため、
@@ -8342,19 +8364,17 @@ static void pollThreadFunc(std::wstring dataDir, Config cfg) {
             // 起動直後の 1 回だけは例外として実行し、一覧を出せる状態にする。
             // calcSleepUntilNextPoll(0) は内部ガードで 1 回/時扱いになり「次の正時まで」を返す。
             // 「今すぐ更新」は明示のユーザ操作のため、休止時間帯・クールダウンの抑止を受けない。
-            // 登録欄での登録直後、または行メニューでの更新直後の反映（registerTriggered）も同じ扱いとする。（応答 Toast は出さない）
+            // 登録欄での登録直後、または行メニューでの更新直後の反映（reflectTriggered）も同じ扱いとする。（応答 Toast は出さない）
             bool manualTriggered   = g_manualPoll.exchange(false);
-            bool registerTriggered = g_registerPoll.exchange(false);
-            bool immediate         = manualTriggered || registerTriggered;
+            bool reflectTriggered = g_reflectPoll.exchange(false);
+            bool immediate         = manualTriggered || reflectTriggered;
 
             if (pollsPerHour == 0 && !startupPoll && !immediate) {
-                g_forcePoll.store(false);  // 休止中に積まれたトリガーは破棄する（次の稼働正時に自然に取得される）
+                g_forcePoll.store(false);   // 休止中に積まれたトリガーは破棄する（次の稼働正時に自然に取得される）
+                g_resumePoll.store(false);  // 復帰起点の印も破棄する（残すと翌朝の無関係な取得失敗の Toast を抑止してしまう）
                 waitIgnoringForcePoll(calcSleepUntilNextPoll(0));
                 continue;
             }
-
-            // 判定材料の確定・更新（HTTP を伴う。休止時間帯の判定より後 = 休止中は触れない）
-            resolvePollMetadata(cfg, session, manualTriggered);
 
             // 即時ポーリング判定。（forcePoll フラグ or 1 時間以上未ポーリング）
             // 前回ポーリングからクールダウン以内の即時要求は、残り時間を待ってから取得し直す
@@ -8375,8 +8395,15 @@ static void pollThreadFunc(std::wstring dataDir, Config cfg) {
                 waitIgnoringForcePoll(FORCE_POLL_COOLDOWN_MS - (tickNow - lastAttempt));
                 continue;
             }
+            // 判定材料の確定・更新（HTTP を伴う）。休止時間帯とクールダウンの判定より後に置き、
+            // 休止中と、NIC 変化の連発で延期した回には HTTP 要求を送らない。
+            resolvePollMetadata(cfg, session, manualTriggered);
+
+            // 復帰起点の判定はクールダウンの延期より後で消費する。（延期した回に消費すると、
+            // 延期後の取得が復帰起点と分からず、回線の再確立前の失敗で Toast が出る）
+            bool resumeTriggered = g_resumePoll.exchange(false);
             if (manualTriggered) writeLog("manual poll triggered");
-            if (registerTriggered) writeLog("register poll triggered");
+            if (reflectTriggered) writeLog("reflect poll triggered");
             if (forceTriggered && !startupPoll) writeLog("force poll triggered");
             if (stale && !startupPoll)
                 writeLog("stale poll triggered (" + std::to_string((tickNow - lastTick) / 1000) + "s since last poll)");
@@ -8414,8 +8441,12 @@ static void pollThreadFunc(std::wstring dataDir, Config cfg) {
                     break;
                 }
                 // 手動更新の失敗はクールダウンを無視して必ず知らせる。無音のままだと
-                // 操作が届いたのか失敗したのか区別できず、応答 Toast の目的を果たせない
-                showErrorToast(L"接続エラー", L"Redmine API に接続できません", manualTriggered);
+                // 操作が届いたのか失敗したのか区別できず、応答 Toast の目的を果たせない。
+                // スリープ復帰起点の失敗は回線の再確立前が大半のため知らせない。（g_resumePoll のコメントを参照）
+                if (resumeTriggered && !manualTriggered)
+                    writeLog("connection error toast suppressed (resume)");
+                else
+                    showErrorToast(L"接続エラー", L"Redmine API に接続できません", manualTriggered);
                 waitInterruptible(RETRY_WAIT_MS);
                 continue;
             }
@@ -8493,6 +8524,8 @@ static void waitSoundThreadOrExit(UINT exitCode) {
         ExitProcess(exitCode);
     }
 }
+
+// ==================== エントリポイント ====================
 
 // エントリポイント
 // ログ初期化 → 多重起動制御（Job Object、新プロセス優先）→ WinRT・トレイ・NIC 監視の初期化
@@ -8583,9 +8616,42 @@ int wmain() {
     // catch のログも終了コード 2 も残らない。（[thread.thread.destr]）
     std::thread updateThread;
     std::thread pollThread;
+    HANDLE hNetNotify = nullptr;  // NIC 変化監視の登録ハンドル（未登録・解除済みは nullptr）
+
+    // 正常終了と例外終了で共通の後始末（順序に意味がある。片方だけ変えないためここに集約する）
+    // 1. 停止要求を立て、NIC 変化監視を解除する。（コールバック発火を先に止める。CancelMibChangeNotify2 は
+    //    実行中コールバックの完了を待ってリターンするため UAF は発生しない。MSDN 保証）
+    // 2. トレイアイコンを消す。（ユーザから見た終了を、スレッドの join より先に完了させる）
+    // 3. PostMessage(g_hWnd, ...) を発火し得るスレッドを DestroyWindow より前に join する。
+    //    （無効モード起動時はポーリングスレッド未起動のため joinable で判定する。
+    //    joinable のまま静的破棄すると std::terminate になるため必ず join する）
+    // 4. ウィンドウを破棄し、ハンドルを null に戻す。（破棄済みハンドルの再利用を防ぐ）
+    // 5. 更新チェックスレッドを待つ。（HTTP がブロック中だとそのタイムアウト分だけ待ち得るため最後に置く）
+    auto teardown = [&]() {
+        g_shutdownRequested = true;
+        if (hNetNotify) {
+            CancelMibChangeNotify2(hNetNotify);
+            hNetNotify = nullptr;
+        }
+        if (g_hWnd) {
+            WTSUnRegisterSessionNotification(g_hWnd);
+            removeTrayIcon(g_hWnd);
+        }
+        if (pollThread.joinable()) pollThread.join();
+        if (g_registerThread.joinable()) g_registerThread.join();
+        if (g_issueUpdateThread.joinable()) g_issueUpdateThread.join();
+        if (g_hWnd) {
+            DestroyWindow(g_hWnd);
+            g_hWnd = nullptr;
+        }
+        if (updateThread.joinable()) updateThread.join();
+    };
 
     try {
-        winrt::init_apartment();
+        // メインスレッドは STA にする。ShellExecuteW（設定ファイル・ログ・URL を開く）と IShellLink は
+        // STA を要求し、MTA からの呼び出しはシェル拡張によって失敗やハングを起こし得る。
+        // Toast と JSON の WinRT 呼び出しは STA でも動く。（他のスレッドは各自 MTA を初期化する）
+        winrt::init_apartment(winrt::apartment_type::single_threaded);
         SetCurrentProcessExplicitAppUserModelID(APP_AUMID);
         ensureShortcut();
         WM_TASKBAR_CREATED = RegisterWindowMessageW(L"TaskbarCreated");
@@ -8600,7 +8666,6 @@ int wmain() {
 
         // NIC 変化（Wi-Fi 接続/切断、LAN 抜き差し等）の監視を登録
         // FALSE: 登録時に既存インターフェースの初期通知は不要
-        HANDLE hNetNotify = nullptr;
         if (NotifyIpInterfaceChange(AF_UNSPEC, onNetworkChange, nullptr, FALSE, &hNetNotify) != NO_ERROR) {
             writeLog("NotifyIpInterfaceChange failed: " + std::to_string(GetLastError()));
             hNetNotify = nullptr;
@@ -8726,35 +8791,8 @@ int wmain() {
             DispatchMessageW(&msg);
         }
 
-        // メッセージループ終了 → シャットダウン処理開始
-        g_shutdownRequested = true;
-
-        // NIC 変化監視を解除してからスレッドを停止（コールバック発火を先に止める）
-        // CancelMibChangeNotify2 は実行中コールバックの完了を待ってリターンするため UAF は発生しない（MSDN 保証）
-        if (hNetNotify) CancelMibChangeNotify2(hNetNotify);
-
-        // ループ終了後のクリーンアップ
-        WTSUnRegisterSessionNotification(g_hWnd);
-        removeTrayIcon(g_hWnd);
-
-        // ポーリングスレッドを停止（waitInterruptible が 100 ms 単位でフラグを監視している）
-        // 無効モード起動時はスレッド未起動のため joinable で判定する。
-        // トレイアイコン削除より後に置き、ユーザから見た終了は即座に完了させる。
-        // ただし PostMessage(g_hWnd, ...) を発火し得るため DestroyWindow より前で必ず join する。
-        if (pollThread.joinable()) pollThread.join();
-        // 登録・更新スレッドも完了通知を投函し得るため DestroyWindow より前に join する。
-        // （静的な std::thread を joinable のまま破棄すると std::terminate になるため必ず join する）
-        if (g_registerThread.joinable()) g_registerThread.join();
-        if (g_issueUpdateThread.joinable()) g_issueUpdateThread.join();
-
-        DestroyWindow(g_hWnd);
-        g_hWnd = nullptr;  // 破棄済みハンドルの再利用を防ぐ（catch の後始末ガードが誤発火しないため）
-
-        // 更新チェックスレッドの完了を待つ（未起動・起動失敗時は joinable が false）
-        // HTTP がブロック中だとそのタイムアウト分だけ待ち得るため、
-        // トレイアイコン削除より後に置き、ユーザから見た終了は即座に完了させる
-        if (updateThread.joinable()) updateThread.join();
-
+        // メッセージループ終了 → シャットダウン処理（順序は teardown のコメントを参照）
+        teardown();
         waitSoundThreadOrExit(0);
 
         writeLog("shutdown");
@@ -8763,21 +8801,10 @@ int wmain() {
         // 原因ログを最初に残す。後続の join（HTTP のタイムアウト分だけ待ち得る）や waitSoundThreadOrExit の
         // ExitProcess で、終了コード 2 の理由がログに残らないまま終わるのを防ぐ
         writeLog("unexpected initialization error");
-        // joinable なスレッドを残したまま return すると静的破棄と競合するため、
-        // 停止要求を立ててから join して畳む
-        g_shutdownRequested = true;
-        if (pollThread.joinable()) pollThread.join();
-        if (updateThread.joinable()) updateThread.join();
-        if (g_registerThread.joinable()) g_registerThread.join();
-        if (g_issueUpdateThread.joinable()) g_issueUpdateThread.join();
-        // 正常終了パスと同様にトレイ登録を後始末する。（怠るとプロセス消滅後も
-        // ゴーストアイコンが残る）通知音スレッドも待ち、静的破棄との競合を防ぐ
-        if (g_hWnd) {
-            WTSUnRegisterSessionNotification(g_hWnd);
-            removeTrayIcon(g_hWnd);
-            DestroyWindow(g_hWnd);
-            g_hWnd = nullptr;
-        }
+        // joinable なスレッドを残したまま return すると静的破棄と競合するため、正常終了と同じ手順で畳む。
+        // （トレイ登録の後始末を怠るとプロセス消滅後もゴーストアイコンが残る）
+        // 通知音スレッドも待ち、静的破棄との競合を防ぐ
+        teardown();
         waitSoundThreadOrExit(2);
         return 2;
     }

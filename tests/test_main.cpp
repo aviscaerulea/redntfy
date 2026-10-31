@@ -1164,9 +1164,9 @@ static void testAlignTowardCenter() {
 // ==================== 登録欄 ====================
 
 static void testRegisterSubject() {
-    CHECK_WSTR(trimRegisterText(L"  abc \t"), L"abc");
-    CHECK_WSTR(trimRegisterText(L"　タスク　"), L"タスク");  // 全角空白も除去
-    CHECK(!isRegisterSubjectValid(trimRegisterText(L" 　 ")));  // 空白のみ
+    CHECK_WSTR(trimText(L"  abc \t"), L"abc");
+    CHECK_WSTR(trimText(L"　タスク　"), L"タスク");  // 全角空白も除去
+    CHECK(!isRegisterSubjectValid(trimText(L" 　 ")));  // 空白のみ
     CHECK(!isRegisterSubjectValid(L"ab"));
     CHECK(isRegisterSubjectValid(L"abc"));
     CHECK(isRegisterSubjectValid(L"あいう"));

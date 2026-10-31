@@ -27,16 +27,8 @@ build.ps1 は `Microsoft.VisualStudio.DevShell.dll` + `Enter-VsDevShell` で VC+
 include して static 関数を直接検査する自前ミニハーネスだ。対象は純粋ロジックのみで、
 HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/redntfy.exe` を起動して行う。
 
-- `[redmine]` の url / api_key がどちらの toml にも無い場合、終了せず無効モードで常駐する（接続情報なしでの起動確認に使える）
-  - 無効モード：トレイが `app-disable.ico`、tooltip が原因別の案内文言、「今すぐ更新」非活性、一覧なし（ホバー・左クリックとも）、ポーリングなし。復帰は再起動のみ
-  - 静的 2 分岐とも `redntfy.local.toml` 不在ならテンプレートを自動生成して設定ファイルを開き、セットアップガイド（GitHub Pages）をブラウザで開く
-  - url 空・非 http(s)：Toast「無効な Redmine URL」（ブラウザはガイドのみ）
-  - api_key 空：Toast「認証エラー／Redmine の API アクセスキーを api_key に設定してください」＋ `<url>/my/account` もブラウザで開く
-- query_ids 空はフォールバックモードとして正常動作する（ゼロ設定起動：url と api_key だけで使える）
-  - 取得は `/issues.json?assigned_to_id=me`（me は Redmine がサーバ側で自分＋所属グループに展開するため、グループ宛も含まれる）
-  - state.json 上は擬似クエリ id 0（`FALLBACK_QUERY_ID`）で表現し、流入検知・黙って採用の既存ロジックにそのまま乗る（query_ids の設定・解除の切替も無通知で移行する）
-  - 複数件 Toast・一覧フッタの遷移先は `<url>/issues?set_filter=1&assigned_to_id=me`（Web 側も同じ展開のため表示集合と一致する）
-- ポーリング中の HTTP 401（api_key 無効）と、query_ids 設定時の 404（query_ids 無効）は確定的な設定不備として上記の無効モードへ遷移する（Toast・設定ファイル・ブラウザ誘導は 404 なら `<url>/issues` を開く）。フォールバックモードの 404 は通常の接続エラー扱い。それ以外の接続エラーは従来どおり 60 秒リトライ＋30 分クールダウンの Toast
+- 接続情報なしでも起動確認できる。`[redmine]` の url が不正、または api_key が空（キー不在を含む）なら無効モードで常駐する（挙動は「実装上の注意点」の無効モードの項）
+- query_ids 空でも url と api_key だけで動作確認できる（フォールバックモード。同じく「実装上の注意点」を参照）
 - ログは `%LOCALAPPDATA%\redntfy\logs\YYYY-MM-DD.log` へ出力する  
   `out/redntfy.exe` と Scoop 版は同じデータディレクトリを共有する。（置き場は「実装上の注意点」の永続化の項を参照）
   多重起動制御で先に動いていた方は終了するが、state.json・ピン・非表示・ログはそのまま引き継ぐ。
@@ -48,8 +40,27 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
 
 - 設定は `redntfy.toml` を読み、`redntfy.local.toml` が同名キーをキー単位で上書きする  
   ホットリロードはせず、変更反映には再起動が必要。
+  採否はキーの有無だけで決める（`loadConfig` の `findNode`）。local にキーがあれば値の型が合わなくても base の値は使わず、既定値（schedule は全時間帯で 1 時間に 1 回、他の配列は空）になる。（local の不正値で黙って base を拾わないため）
 
-- スレッド構成：メイン（メッセージループ・トレイ UI）／`pollThreadFunc`（HTTP・Toast・音・状態保存）／`soundThread`（WASAPI 再生）／`checkForUpdates`（起動時 1 回、シャットダウン時に join）／`registerIssueThreadFunc`（登録欄の送信 1 回ごとに起動、シャットダウン時に join）／`issueUpdateThreadFunc`（行メニューの更新送信 1 回ごとに起動、シャットダウン時に join）
+- `[redmine]` の url が不正、または api_key が空（キー不在を含む）の場合、終了せず無効モードで常駐する  
+  無効モード：トレイが `app-disable.ico`、tooltip が原因別の案内文言、「今すぐ更新」非活性、一覧なし（ホバー・左クリックとも）、ポーリングなし。復帰は再起動のみ。
+  起動時の静的検証は url 不正と api_key 空の 2 分岐で、どちらも `redntfy.local.toml` 不在ならテンプレートを自動生成して設定ファイルを開き、セットアップガイド（GitHub Pages）をブラウザで開く。
+  url 空・非 http(s)：Toast「無効な Redmine URL」（ブラウザはガイドのみ）。
+  api_key 空：Toast「認証エラー／Redmine の API アクセスキーを api_key に設定してください」＋ `<url>/my/account` もブラウザで開く。
+  ポーリング中の HTTP 401（api_key 無効）と、query_ids 設定時の 404（query_ids 無効）は確定的な設定不備として無効モードへ遷移する（`enterDisabledMode`）。Toast・設定ファイル・ブラウザ誘導は静的検証と同じで、401 は api_key 空と同じ `<url>/my/account`、404 は `<url>/issues` を開く。実行中の遷移では表示中の一覧も閉じ、ショートカットキーを解除する。
+  フォールバックモードの 404 は通常の接続エラー扱い。
+
+- query_ids 空はフォールバックモードとして正常動作する（ゼロ設定起動：url と api_key だけで使える）  
+  取得は `/issues.json?assigned_to_id=me`（me は Redmine がサーバ側で自分＋所属グループに展開するため、グループ宛も含まれる）。
+  state.json 上は擬似クエリ id 0（`FALLBACK_QUERY_ID`）で表現し、流入検知・黙って採用の既存ロジックにそのまま乗る。（query_ids の設定・解除の切替も無通知で移行する）
+  複数件 Toast・一覧フッタの遷移先は `<url>/issues?set_filter=1&assigned_to_id=me`。（Web 側も同じ展開のため表示集合と一致する）
+
+- 設定不備（401/404）以外の接続エラーは 60 秒リトライ＋30 分クールダウンの Toast  
+  例外として、スリープ復帰（`PBT_APMRESUMEAUTOMATIC`）を起点とする最初の取得が失敗したときだけは Toast を出さない（`g_resumePoll`）。回線の再確立前に失敗しやすいためで、60 秒後のリトライ以降の失敗は通常どおり出す。
+  「今すぐ更新」が同じ取得を要求していたときは、失敗しても従来どおり Toast を出す。ロック解除・NIC 変化の force poll は、復帰起点の取得に合流すれば Toast を出さず、復帰起点の取得が済んだ後に単独で走れば Toast を出す。
+
+- スレッド構成：メイン（メッセージループ・トレイ UI）／`pollThreadFunc`（HTTP・Toast・音・状態保存）／`soundThread`（WASAPI 再生）／`checkForUpdates`（起動時 1 回、シャットダウン時に join）／`registerIssueThreadFunc`（登録欄の送信 1 回ごとに起動、シャットダウン時に join）／`issueUpdateThreadFunc`（行メニューの更新送信 1 回ごとに起動、シャットダウン時に join）  
+  ワーカースレッドは各自 COM を MTA で初期化し、メインスレッドは STA で初期化する。（`ShellExecuteW` と `IShellLink` が STA を要求するため。Toast と JSON の WinRT 呼び出しは STA でも動く）
 
 - 共有状態は `g_mtx`（`g_issues`・`g_pins`・`g_unreadIds`・`g_hiddenIds`・`g_priorities`・`g_priorityPositions`・`g_latestVersion`・`g_registerProject`・`g_personalProjectName`）と atomic（`g_myUserId`・`g_assignedToMeOnly` など）で保護する  
   `g_currentConfig` は起動時に 1 回設定した後は不変で、ロック無しで読み取る。
@@ -61,7 +72,8 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   `state.json` は v2（チケット id → updated_on ＋所属クエリ＋最終更新者＋最後の主要変更（🆙 用。キー不在の旧エントリは journals を 1 回取り直す）、ルートに追跡クエリ id と前回ポーリングの取得開始時刻）。
   旧形式と `query_ids` への追加分は流入検知を見送り、現在の所属を黙って採用する。（通知の嵐の防止）
 
-- `fetchIssues` は 1 クエリでも失敗すると全体を失敗にして部分結果を破棄する（誤「新規」通知の防止）
+- `fetchIssues` は 1 クエリでも失敗すると全体を失敗にして部分結果を破棄する（誤「新規」通知の防止）  
+  `fetchQueryIssues` はページング中に total_count が変わると先頭ページから取り直す。（取り直しは 2 回までで、3 回目の変化で失敗にする。取り直さずに失敗にすると、集合の正常な更新が接続エラーの Toast になるため）
 
 - グループ担当（👥）の判定は初回ポーリング時（user id 取得後）に `/groups.json` を試し、403 なら自分の所属グループへ縮退する  
   admin 権限が無いと 403 になる。縮退時は他グループ宛の判定が漏れるが誤判定はしない。
@@ -75,6 +87,7 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
 - 一覧の行は `list_format`（[app]）のプレースホルダテンプレートで組み立てる  
   語彙は {id} {lastname} {firstname} {author} {commenter} {group} {project} {due} {new} {bug} {subject} {ago} {left} の
   13 要素で、`{要素:N}` で最大文字数を指定できる。（「…」は件名のみ）
+  `list_limit`（[app]、既定 20、1〜40）は通常行の表示件数の上限で、ピン・非表示の行は数えない。（上限 40 は `LIST_ROW_MAX`（50 行）の内側にピン・非表示の余地を残す値）
   `{要素@P}` で文字サイズを基準フォントの P%（50〜100、縮小のみ）にする。併用は `{subject:40@90!}` の順。
   縮小した要素はベースラインを基準フォントに揃えて描き、行の高さは変えない。
   閉じ括弧直前の `!`（`{due!}`・`{subject:40!}`）を付けた要素は、期限切れ行で赤の半太字になる。
@@ -94,10 +107,11 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   登録先プロジェクトのチケットは {project} を空にする。（判定は表示名の一致。`g_personalProjectName`）
   `subject_max_chars`・`project_max_chars` は廃止。（読み捨て＋廃止ログ）
 
-- schedule の 0（休止時間帯）は force poll・stale 判定より優先される  
-  この順序を崩すと深夜に通知が鳴る。起動直後の 1 回だけは休止時間帯でも実行する。
+- schedule の 0（休止時間帯）は force poll・stale 判定より先に評価する  
+  この順序を保つ。（崩すと深夜に通知が鳴る）起動直後の 1 回だけは休止時間帯でも実行する。
+  判定材料の取得（`resolvePollMetadata`）は休止時間帯とクールダウンの判定より後に置き、休止中と延期した回には HTTP 要求を送らない。
   トレイメニューの「今すぐ更新」（`g_manualPoll`）だけは明示操作として休止時間帯・クールダウンを無視する。
-  登録欄で登録した直後と、行コンテキストメニューで更新した直後の即時ポーリング（`g_registerPoll`）も休止時間帯・クールダウンを無視するが、応答 Toast は出さず、取得失敗時の接続エラー Toast も force にしない。（通常の 30 分クールダウンに従う）
+  登録欄で登録した直後と、行コンテキストメニューで更新した直後の即時ポーリング（`g_reflectPoll`）も休止時間帯・クールダウンを無視するが、応答 Toast は出さず、取得失敗時の接続エラー Toast も force にしない。（通常の 30 分クールダウンに従う）
 
 - 「今すぐ更新」は完了時に必ず応答を返す  
   成功時は `deliverPollResults` の戻り値の通知件数が 0 のときだけ応答 Toast（`showPollDoneToast`）を出す。
@@ -117,7 +131,7 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   モーダルループ中は `IDT_LIST_WATCH` が届き、カーソルがメニュー上だと一覧が閉じるため、`g_rowMenuOpen` で離脱監視を止める。
   同じくループ中にポーリングが一覧を組み直し得るため、対象は行の添字でなく id で扱う。
   閉じた後はフォアグラウンドを元の窓へ返す。（他アプリのクリックで閉じたときは何もしない）
-  優先度・期日（今日・明日・1 週間後・期日なし）・終了は `PUT /issues/{id}.json` で 1 項目ずつ送り、成功時は `g_registerPoll` で即時ポーリングする。
+  優先度・期日（今日・明日・1 週間後・期日なし）・終了は `PUT /issues/{id}.json` で 1 項目ずつ送り、成功時は `g_reflectPoll` で即時ポーリングする。
   失敗時だけ Toast を出す。終了だけはコメント入力を兼ねた確認ダイアログ（`showCloseIssueDialog`、リソース `IDD_CLOSE_ISSUE`）を出す。（Enter は改行、Ctrl+Enter で終了、Esc でキャンセル）
   コメント欄の案内文は `cueBannerSubclassProc` が描く。（`EM_SETCUEBANNER` は複数行 Edit に効かないため）
   ダイアログの表示中は一覧を `EnableWindow` で無効化する。（`DialogBoxParamW` が無効化するのは所有者のトレイウィンドウだけで、TOPMOST の一覧を裏で操作できてしまうため）
@@ -143,9 +157,10 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   作成日順は created_on 降順、優先度順は順位降順で、どちらも同順位は期日順の規則で並べる。
   優先度順（期日考慮）は、期日が当日以前（JST）の未クローズ行の順位を「最上位の 1 つ下」（順位昇順の `g_priorities` の末尾から 2 番目。標準構成の「急いで」）まで繰り上げて優先度順に並べる。
   繰り上げ先を名前で探さないのは、優先度の表記が違うサーバでも効かせるためだ。
+  有効な優先度が 1 つだけならその順位を繰り上げ先にし（実質的に繰り上げない。行背景の強調を最上位だけにする縮退と揃えるため）、未取得なら繰り上げずに優先度順と同じになる。繰り上げは下げる方向には働かない。
   繰り上げは並べ替えだけに使い、表示と Redmine 上の優先度は変えない。
   繰り上げで多数の行が上位に集まると埋もれるため、優先度順と別の方式にして使うかを選べるようにした。
-  繰り上げ先（末尾から 2 番目）は、一覧の行背景の強調（`priorityHighlightOf`）で淡く塗る段と同じ位置だ。
+  有効な優先度が 2 つ以上のとき、繰り上げ先（末尾から 2 番目）は、一覧の行背景の強調（`priorityHighlightOf`）で淡く塗る段と同じ位置だ。
   どちらかの位置を変えるときは、もう一方も同じ位置へ揃える。
   優先度は `/enumerations/issue_priorities.json` から取得して `g_priorities`（`active` のみ、順位昇順。登録欄の選択肢）と `g_priorityPositions`（id → 順位。無効化済みも含む全件）に置く。
   （API は `position` を返さず配列が position 昇順のため添字 + 1 を順位にし、`position` があればその値を優先する）
@@ -224,8 +239,8 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   クリック判定を旧方式の生マウスメッセージ（`WM_LBUTTONUP` / `WM_RBUTTONUP`）で受ける。
   （`WM_CONTEXTMENU` は方式によらず受ける。失敗時はホバー自動表示が無効となり、
   一覧は左クリックでのみ開ける）
-  オーバーフロー領域のアイコンは、`v4` 化以前の実装では矩形不一致でホバーが機能しなかった。
-  `v4` のホバー通知は座標に依存しないため改善が見込めるが未検証。（左クリックでは開ける）
+  オーバーフロー領域のアイコンは、`NOTIFYICON_VERSION_4` 化以前の実装では矩形不一致でホバーが機能しなかった。
+  `NOTIFYICON_VERSION_4` のホバー通知は座標に依存しないため改善が見込めるが未検証。（左クリックでは開ける）
 
 - 一覧は、一覧の表示中に Ctrl+F で先頭に出す検索欄（1 行 Edit、`g_searchEdit`）で検索する  
   一覧は非アクティブでキーが届かないため、Ctrl+F は表示中だけトレイウィンドウへ `RegisterHotKey` する。（新規表示で登録、`hideListPopup` で解除。表示中は前面アプリの Ctrl+F より優先する）
@@ -266,12 +281,11 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   位置の基準はカーソルでなくトレイアイコンの中心で、`showListPopup` の `anchor` で渡す。（`trayListAnchor`）
   アイコン矩形は実ピクセル座標のため `PhysicalToLogicalPointForPerMonitorDPI` で本プロセスの座標系へ直す。
   アイコンがタスクバー上に無い（隠れているインジケーター内）ときは、タスクバーの通知領域側の端を基準にする。
+  基準点の DPI 変換（`PhysicalToLogicalPointForPerMonitorDPI`）に失敗したときと、変換後の点がタスクバー上に無いときもタスクバーの端を基準にする。（表示スケール 100% 超での変換結果は実機で未確認）
   検索欄で入力モードに入るため、カーソルが一覧から離れていても閉じない。他アプリへ切り替えると入力モードを抜け、離脱監視が閉じる。
   検索を解除（Ctrl+F・Esc）しても入力モードに留まり、一覧自体にフォーカスを置く。（`g_listKeyboardOpened`。前面窓へ返すとカーソルが離れているため離脱監視が直ちに閉じるため）
   一覧自体にフォーカスがある間は、`WM_GETDLGCODE` で Tab 以外に `DLGC_WANTALLKEYS` を返して上下キー・Enter・Esc を `listWndProc` の `WM_KEYDOWN` で受ける。（Tab は `IsDialogMessageW` に渡し登録欄へ移れるようにする。Enter・Esc はキーリピートを無視する）
-  トレイの右クリックメニューの表示中（`g_popupShowing` が立ち一覧が非表示）も何もしない。（メニュー終了時にフラグと可視状態が食い違うため）
-  基準点の DPI 変換（`PhysicalToLogicalPointForPerMonitorDPI`）に失敗したときと、変換後の点がタスクバー上に無いときもタスクバーの端を基準にする。（表示スケール 100% 超での変換結果は実機で未確認）
-  行コンテキストメニュー・終了の確認ダイアログの表示中も何もしない。
+  ショートカットキーは、トレイの右クリックメニューの表示中（`g_popupShowing` が立ち一覧が非表示。メニュー終了時にフラグと可視状態が食い違うため）と、行コンテキストメニュー・終了の確認ダイアログの表示中には何もしない。
 
 - 一覧末尾の登録欄（登録先の確定時のみ）は 6 個の子コントロール  
   件名 Edit、優先度コンボ、期日 DTP、登録ボタン、説明トグル、説明 Edit の順に並ぶ。
@@ -287,7 +301,7 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
   `g_priorities` が空の間（未取得、または有効な優先度が 0 件）はコンボを隠し、`priority_id` を送らず Redmine の既定に任せる。（接続不可でも登録を止めない）
   コンボの選択肢は表示のたびに `syncRegisterPriorities` が `g_priorities` と突き合わせ、id の並びが同じなら選択を保つ。
   新規表示で書きかけの件名が無ければ、期日と同じく優先度も既定へ戻す。
-  送信は `POST /issues.json`（担当＝自分、トラッカーはプロジェクト既定）で、成功時は入力を空にし期日・優先度を既定へ戻して `g_registerPoll` で即時ポーリングする。
+  送信は `POST /issues.json`（担当＝自分、トラッカーはプロジェクト既定）で、成功時は入力を空にし期日・優先度を既定へ戻して `g_reflectPoll` で即時ポーリングする。
   失敗時は Toast を出して入力を残す。成功の Toast は出さない。（新チケットが一覧に載ることを応答とする）
   説明欄はトグル（登録ボタンの右端。`BS_PUSHLIKE`。表示は閉で ▾、開で ▴）で開閉し、閉じていても入力があれば `description` として送る。
   新規表示では入力の有無に合わせてトグルを開閉し、登録が成功すると入力を消して説明欄を閉じる。（永続化なし）
@@ -296,6 +310,6 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
 
 - Toast には AUMID 付きスタートメニューショートカットが必須（`ensureShortcut` が自動作成）
 
-## References
+## 参考
 
 - README.md

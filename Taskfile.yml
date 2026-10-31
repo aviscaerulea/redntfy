@@ -48,7 +48,7 @@ tasks:
     deps: [kill]
     cmds:
       - mkdir -p {{.OUT_DIR}}
-      - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}}
+      - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}} -OutDir {{.OUT_DIR}}
       - task: copy-assets
 
   test:
@@ -56,7 +56,7 @@ tasks:
     cmds:
       - mkdir -p {{.OUT_DIR}}
       # ビルド直後の exe がウイルス対策ソフトに隔離される前に実行するため、同一コマンドで連結する
-      - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}} -Test && {{.OUT_DIR}}/redntfy_test.exe
+      - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}} -OutDir {{.OUT_DIR}} -Test && {{.OUT_DIR}}/redntfy_test.exe
 
   rebuild:
     desc: 実行中のバイナリを停止し、クリーンビルドして再起動する
@@ -70,11 +70,11 @@ tasks:
     deps: [clean]
     cmds:
       - mkdir -p {{.OUT_DIR}}
-      - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}} -Release
+      - pwsh -NonInteractive -File build.ps1 -Version {{.VERSION}} -OutDir {{.OUT_DIR}} -Release
       - task: copy-assets
       - >-
         pwsh -NonInteractive -Command '
         Compress-Archive
-        -Path out\{{.APP_NAME}}.exe, {{.APP_NAME}}.toml, out\sound.wav, out\app.ico
-        -DestinationPath "out\{{.APP_NAME}}-{{.VERSION}}-{{.ARCH}}.zip"
+        -Path {{.OUT_DIR}}\{{.APP_NAME}}.exe, {{.APP_NAME}}.toml, {{.OUT_DIR}}\sound.wav, {{.OUT_DIR}}\app.ico
+        -DestinationPath "{{.OUT_DIR}}\{{.APP_NAME}}-{{.VERSION}}-{{.ARCH}}.zip"
         -Force'
