@@ -55,8 +55,8 @@ Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments 
 # 単体テストのビルド（-Test 時のみ。rc は不要で、最適化なしでコンパイル時間を優先する）
 # テストはコンソール exe のため main をエントリに明示し、main.cpp 側の wmain と共存させる
 if ($Test) {
-    cl /nologo /utf-8 /std:c++20 /EHsc /Od /I "$out\" /I "$vcpkgInclude" `
-        /Fo"$out\" /Fe"$out\redntfy_test.exe" `
+    cl /nologo /utf-8 /std:c++20 /EHsc /Od /I "$out" /I "$vcpkgInclude" `
+        "/Fo$out\\" "/Fe$out\redntfy_test.exe" `
         tests\test_main.cpp `
         /link /SUBSYSTEM:CONSOLE /ENTRY:mainCRTStartup `
         "$vcpkgLib\ebur128.lib"
@@ -96,8 +96,11 @@ $clExtra   = if ($Release) { @('/DNDEBUG', '/GL', '/Gy') } else { @() }
 $linkExtra = if ($Release) { @('/LTCG', '/OPT:REF', '/OPT:ICF') } else { @() }
 
 # /MANIFEST:EMBED は main.cpp の manifestdependency（common controls v6）を exe へ埋め込むため
-cl /nologo /utf-8 /std:c++20 /EHsc /O2 @clExtra /I "$out\" /I "$vcpkgInclude" `
-    /Fo"$out\" /Fe"$out\redntfy.exe" `
+# /Fo の末尾は \\ と 2 重にする。出力先に空白があると引数全体が引用符で囲まれ、末尾の \ の扱いが
+# pwsh の版で変わる（\" を引用符のエスケープにする版と、\ を自動で 2 重にする版がある）が、
+# \\ ならどちらでも cl に \ 終端のディレクトリとして届く（連続する \ は同じ場所を指す）。
+cl /nologo /utf-8 /std:c++20 /EHsc /O2 @clExtra /I "$out" /I "$vcpkgInclude" `
+    "/Fo$out\\" "/Fe$out\redntfy.exe" `
     src\main.cpp "$out\resource.res" `
     /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup /MANIFEST:EMBED @linkExtra `
     "$vcpkgLib\ebur128.lib"

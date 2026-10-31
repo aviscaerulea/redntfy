@@ -428,6 +428,9 @@ struct IssueView {
 };
 
 struct Issue : IssueView {
+    // 等価比較は禁止する。（基底の == に解決されて表示属性しか比べず、全体比較と誤認するため）
+    bool operator==(const Issue&) const = delete;
+
     int         authorId  = 0;     // 自分の起票を通知対象から外すために保持する
     std::string authorName;        // 起票者名（新規流入 Toast の表示用。更新者名が取れない場合のフォールバック）
     int         assignedToId = 0;  // 担当者 id（0 = 未割当）
@@ -1694,10 +1697,19 @@ static Config loadConfig(const std::wstring& exeDir) {
         return {};
     };
 
-    // [app] の文字列配列（キーが存在する側を採用する。空配列でも local を採る）
+    // 型不一致のログ。キーはあるが値の型が違うとき、既定値へ落とした事実を残す。
+    // （採否をキーの有無で決めるため、書き間違いが黙って既定値になる。ログで気付けるようにする）
+    auto logTypeMismatch = [](const char* section, const char* key, const char* expected) {
+        writeLog(std::string("config: [") + section + "] " + key + " must be " + expected
+            + "; using default");
+    };
+
+    // [app] の文字列配列（キーが存在する側を採用する。空配列でも local を採る。配列でなければ空）
     auto readStrArray = [&](const char* key) -> std::vector<std::string> {
         std::vector<std::string> out;
-        if (const auto* arr = findNode("app", key).as_array()) {
+        auto node = findNode("app", key);
+        if (node && !node.is_array()) logTypeMismatch("app", key, "an array of strings");
+        if (const auto* arr = node.as_array()) {
             for (const auto& el : *arr) {
                 if (auto s = el.value<std::string>()) out.push_back(*s);
             }
@@ -1706,31 +1718,39 @@ static Config loadConfig(const std::wstring& exeDir) {
     };
 
     Config cfg;
-    // schedule も他のキーと同じく、キーが存在する側を採用する
-    if (auto s = readSchedule(findNode("app", "schedule").as_array())) cfg.schedule = std::move(*s);
-    else cfg.schedule.resize(24, 1);
+    // schedule も他のキーと同じく、キーが存在する側を採用する。（配列でなければログを残して全時間帯 1 回/時）
+    {
+        auto node = findNode("app", "schedule");
+        if (node && !node.is_array()) logTypeMismatch("app", "schedule", "an array of 24 integers");
+        if (auto s = readSchedule(node.as_array())) cfg.schedule = std::move(*s);
+        else cfg.schedule.resize(24, 1);
+    }
 
     cfg.bugTrackers = readStrArray("bug_trackers");
     // ダッキング対象はプロセス名の比較に wstring を使うため、ここで変換する
     for (const auto& s : readStrArray("duck_targets")) cfg.duckTargets.push_back(toWide(s));
 
-    // スカラー読み込み（findNode の側の値が型に合わなければ既定値）
+    // スカラー読み込み（findNode の側の値が型に合わなければログを残して既定値）
     auto readBool = [&](const char* section, const char* key, bool def) -> bool {
         auto node = findNode(section, key);
+        if (node && !node.is_boolean()) logTypeMismatch(section, key, "true or false");
         return node.is_boolean() ? **node.as_boolean() : def;
     };
     auto readFloat = [&](const char* section, const char* key, float def, float lo, float hi) -> float {
         auto node = findNode(section, key);
+        if (node && !node.is_number()) logTypeMismatch(section, key, "a number");
         const double v = node.is_number() ? node.value_or(static_cast<double>(def)) : def;
         return static_cast<float>((std::max)((double)lo, (std::min)((double)hi, v)));
     };
     auto readInt = [&](const char* section, const char* key, int def, int lo, int hi) -> int {
         auto node = findNode(section, key);
+        if (node && !node.is_integer()) logTypeMismatch(section, key, "an integer");
         const long long v = node.is_integer() ? **node.as_integer() : def;
         return static_cast<int>((std::max)((long long)lo, (std::min)((long long)hi, v)));
     };
     auto readString = [&](const char* section, const char* key) -> std::wstring {
         auto node = findNode(section, key);
+        if (node && !node.is_string()) logTypeMismatch(section, key, "a string");
         return node.is_string() ? toWide(**node.as_string()) : std::wstring{};
     };
 
@@ -1748,11 +1768,17 @@ static Config loadConfig(const std::wstring& exeDir) {
         if (node.is_string())       cfg.registerProject = toWide(**node.as_string());
         else if (node.is_integer()) cfg.registerProject = std::to_wstring(**node.as_integer());
     }
-    // close_status_id は 1〜INT_MAX の整数だけ採用する（範囲外・非整数は未設定扱い）
-    if (auto v = findNode("redmine", "close_status_id").value<int64_t>(); v && *v > 0 && *v <= INT_MAX)
-        cfg.closeStatusId = static_cast<int>(*v);
+    // close_status_id は 1〜INT_MAX の整数だけ採用する（範囲外・非整数はログを残して未設定扱い）
+    if (auto node = findNode("redmine", "close_status_id")) {
+        auto v = node.value<int64_t>();
+        if (v && *v > 0 && *v <= INT_MAX) cfg.closeStatusId = static_cast<int>(*v);
+        else logTypeMismatch("redmine", "close_status_id", "a positive integer");
+    }
     // query_ids は 0 以下・非整数の要素と重複 id を除外する。（同じ HTTP を 2 回叩かない）
-    if (const auto* arr = findNode("redmine", "query_ids").as_array()) {
+    // 配列でなければログを残して空（フォールバックモード）にする
+    auto queryNode = findNode("redmine", "query_ids");
+    if (queryNode && !queryNode.is_array()) logTypeMismatch("redmine", "query_ids", "an array of integers");
+    if (const auto* arr = queryNode.as_array()) {
         for (const auto& el : *arr) {
             auto v = el.value<int64_t>();
             if (!v || *v <= 0 || *v > INT_MAX) continue;
@@ -2177,7 +2203,10 @@ static bool fetchQueryIssues(const Config& cfg, int queryId, std::vector<Issue>&
     outIssues.clear();
 
     const std::string logTag = "fetchQueryIssues(" + std::to_string(queryId) + ")";
-    static constexpr int PAGING_RESTART_MAX = 2;  // total_count の変化による先頭からの取り直しの上限
+    // total_count の変化による先頭からの取り直しの上限。超えたら失敗を返し次回ポーリングに委ねる。
+    // （更新の多い Redmine で毎回失敗にならないよう 3 回まで許す。1 回の取り直しは 100 件単位の
+    // 数ページで、変化がそれだけ続くのはまれ）
+    static constexpr int PAGING_RESTART_MAX = 3;
     int restarts = 0;
     int offset = 0;
     int total  = -1;  // 初回ページの total_count で確定する（-1 は未確定）
@@ -4347,6 +4376,7 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
         bool         literal    = false;
         std::wstring text;
         bool         emptyValue = false;  // 空に展開された値（区切り・括弧対の除去の起点）
+        bool         sepRemoved = false;  // 空の値の直前の区切りを取り除いたか（1 つの空の値につき 1 文字だけ）
         bool         hasRange   = false;  // 範囲を持つ値（色・ウェイト・サイズ・透明のいずれかが既定でない）
         ColorRange   range{};
     };
@@ -4418,16 +4448,12 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
     // （直前の要素の値が "/" や開き括弧で終わるとき＝"docs/" で終わる件名や "Alpha[" に切り詰めた
     // プロジェクト名は値の一部）
     // 区切りの除去は、"{author}/{commenter}" でコメントが無い行に "山田/" を残さないために行い、
-    // 括弧対の判定より先に行う。（"(/" → "(" の後で括弧対を判定する）
-    // {author} が空で "/佐藤" になる場合は、"/" が空の値の後ろにあるため対象外。
-    for (size_t i = 1; i < pieces.size(); ++i) {
-        if (!pieces[i].emptyValue) continue;
-        std::wstring& prev = pieces[i - 1].text;
-        if (pieces[i - 1].literal && !prev.empty() && (prev.back() == L'/' || prev.back() == L'／'))
-            prev.pop_back();
-    }
-    // 空の値をリテラルの括弧対が直接囲んでいれば括弧ごと取り除く。変化がなくなるまで繰り返し、
-    // 入れ子の括弧対は内側から何重でも取り除く。（"[({a})]" の a が空なら全体が消える）
+    // 空の値 1 つにつき直前の 1 文字だけを取り除く。{author} が空で "/佐藤" になる場合は、
+    // "/" が空の値の後ろにあるため対象外。
+    // 括弧対の除去は、空の値をリテラルの括弧対が直接囲んでいれば括弧ごと取り除く。
+    // 区切りと括弧対の除去は変化がなくなるまで繰り返し、入れ子の括弧対は内側から何重でも取り除く。
+    // （"[({a})]" の a が空なら全体が消える。"{a}/({b})" の b が空なら括弧の除去で "/" が直前に出て、
+    // 次の繰り返しで区切りとして消える）
     // 繰り返しの先頭で、空になったリテラルを除き、隣り合う空の値を 1 つにまとめる。
     // （"[{a}{b}]" の両方が空なら括弧ごと消す。"[({a}){b}]" は内側の除去で a と b が隣り合う）
     for (bool changed = true; changed;) {
@@ -4435,10 +4461,21 @@ static IssueLabel buildIssueLabel(const ListRow& row, const DueDateView& due,
         std::vector<Piece> merged;
         for (auto& p : pieces) {
             if (p.literal && p.text.empty()) continue;
+            // まとめた片の区切りの判定は先頭の空の値のものを保つ。（後続の空の値の直前は値であって
+            // リテラルの区切りではないため、その判定を持ち込むと先頭の値の区切りが残る）
             if (p.emptyValue && !merged.empty() && merged.back().emptyValue) continue;
             merged.push_back(std::move(p));
         }
         pieces = std::move(merged);
+        for (size_t i = 1; i < pieces.size(); ++i) {
+            if (!pieces[i].emptyValue || pieces[i].sepRemoved) continue;
+            std::wstring& prev = pieces[i - 1].text;
+            if (pieces[i - 1].literal && !prev.empty() && (prev.back() == L'/' || prev.back() == L'／')) {
+                prev.pop_back();
+                pieces[i].sepRemoved = true;
+                changed = true;
+            }
+        }
         for (size_t i = 1; i + 1 < pieces.size(); ++i) {
             if (!pieces[i].emptyValue) continue;
             Piece& l = pieces[i - 1];
@@ -6920,8 +6957,11 @@ static void handleListEsc(HWND trayWnd) {
 // アイコンがタスクバー上に無い（隠れているインジケーター内）か矩形を取れないときは、
 // タスクバーの通知領域側の端（水平なら右端、垂直なら下端）を返す。タスクバーの位置も取れなければカーソル座標を返す。
 // アイコン矩形は実ピクセル座標のため、PhysicalToLogicalPointForPerMonitorDPI で DPI 非対応の本プロセスの座標系
-// （カーソル座標・タスクバー矩形と同じ）へ直してから使う。変換の基準はトレイウィンドウのモニタの DPI だ。
-// 変換に失敗したとき、または変換後の点がタスクバー上に無いときは、アイコン矩形を使わずタスクバーの端へ退避する。
+// （カーソル座標・タスクバー矩形と同じ）へ直してから使う。変換の基準はタスクバー（Shell_TrayWnd）のモニタの DPI だ。
+// （本プロセスのトレイウィンドウは不可視の 0×0 で、基準にすると変換が失敗して常にタスクバーの端へ退避し、
+// ホバーで開いたときと位置が食い違った。通知領域は主タスクバーにしか無いため Shell_TrayWnd で足りる）
+// 変換に失敗したとき、または変換後の点がタスクバー上に無いときは、アイコン矩形を使わずタスクバーの端へ退避し、
+// 退避した理由をログに残す。
 // （表示スケール 100% 超・モニタ別スケールでの変換結果は実機で未確認。ずれても showListPopup が作業領域へ収める）
 static POINT trayListAnchor(HWND trayWnd) {
     APPBARDATA abd = { sizeof(abd) };
@@ -6929,7 +6969,16 @@ static POINT trayListAnchor(HWND trayWnd) {
     RECT icon = {};
     if (getTrayIconRect(trayWnd, icon)) {
         POINT c = { (icon.left + icon.right) / 2, (icon.top + icon.bottom) / 2 };
-        if (PhysicalToLogicalPointForPerMonitorDPI(trayWnd, &c) && (!haveBar || PtInRect(&abd.rc, c))) return c;
+        HWND bar = FindWindowW(L"Shell_TrayWnd", nullptr);
+        if (!PhysicalToLogicalPointForPerMonitorDPI(bar ? bar : trayWnd, &c))
+            writeLog("list: anchor fallback (PhysicalToLogicalPoint failed)");
+        else if (haveBar && !PtInRect(&abd.rc, c))
+            writeLog("list: anchor fallback (icon point outside taskbar: " + std::to_string(c.x) + "," + std::to_string(c.y) + ")");
+        else
+            return c;
+    }
+    else {
+        writeLog("list: anchor fallback (Shell_NotifyIconGetRect failed)");
     }
     if (haveBar) {
         if (abd.uEdge == ABE_LEFT || abd.uEdge == ABE_RIGHT)
@@ -7443,6 +7492,9 @@ static void showRowContextMenu(int issueId, POINT screenPt) {
     g_rowMenuOpen = false;
     updateListNavHotkeys();
     g_listOutsideTicks = 0;
+    // メニューの表示中に無効モードへ遷移していたら、enterDisabledMode が見送った一覧のクローズをここで行う。
+    // （残すと古いデータの一覧が開いたままで、無効化した api_key で更新を送ってしまう）
+    if (isDisabled() && isListPopupVisible()) hideListPopup(g_hWnd);
     // フォアグラウンドを返す。（一覧はフォーカスを奪わない設計のため、前面化はメニューの間だけに留める）
     // メニュー外で他アプリをクリックして閉じた場合は、ユーザの切り替えを尊重して何もしない。
     // 自スレッドに残っていれば、入力モード中は一覧（登録欄のキー入力先）へ、それ以外は元の窓へ戻す。
@@ -7507,7 +7559,9 @@ static void enterDisabledMode(HWND hWnd, DisabledReason reason,
     UnregisterHotKey(hWnd, HOTKEY_ID_TOGGLE);
     // 表示中の一覧も閉じる。（古いデータの一覧と、登録欄・行メニュー・キー操作のホットキーを残さない）
     // 非表示のときは呼ばない。（右クリックメニューの表示中に届くと g_popupShowing を落としてしまう）
-    if (g_listWnd && IsWindowVisible(g_listWnd)) hideListPopup(hWnd);
+    // 行メニュー・終了の確認ダイアログの表示中（g_rowMenuOpen）も閉じない。（モーダルループの戻り後に
+    // 非表示の一覧へ行の操作が走るため。一覧は無効化した api_key で更新を送るだけで実害はない）
+    if (g_listWnd && IsWindowVisible(g_listWnd) && !g_rowMenuOpen) hideListPopup(hWnd);
 
     // 設定ファイルを開く（不在ならテンプレートを生成してから）
     ensureLocalTomlTemplate(exeDir);
