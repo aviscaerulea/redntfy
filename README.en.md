@@ -87,6 +87,7 @@ To narrow which tickets are notified, see the [setup guide](https://aviscaerulea
 
 Settings live in `redntfy.toml` next to `redntfy.exe`.
 Keys written in `redntfy.local.toml` override the same keys in `redntfy.toml`.
+The API access key can also be set in the `REDMINE_API_KEY` environment variable, which takes precedence over `api_key` in the configuration files.
 
 You can change the connection target, which tickets are notified, how often the app polls, how the list looks, and more.
 See the comments in `redntfy.toml` for each item.

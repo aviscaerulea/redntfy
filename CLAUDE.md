@@ -27,7 +27,8 @@ build.ps1 は `Microsoft.VisualStudio.DevShell.dll` + `Enter-VsDevShell` で VC+
 include して static 関数を直接検査する自前ミニハーネスだ。対象は純粋ロジックのみで、
 HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/redntfy.exe` を起動して行う。
 
-- 接続情報なしでも起動確認できる。`[redmine]` の url が不正、または api_key が空（キー不在を含む）なら無効モードで常駐する（挙動は「実装上の注意点」の無効モードの項）
+- 接続情報なしでも起動確認できる。`[redmine]` の url が不正、または api_key が空（キー不在を含む）なら無効モードで常駐する（挙動は「実装上の注意点」の無効モードの項）  
+  環境変数 `REDMINE_API_KEY` に値があると api_key が空にならず、api_key 空による無効モードを再現できないため、確認時はこの環境変数を外して起動する。
 - query_ids 空でも url と api_key だけで動作確認できる（フォールバックモード。同じく「実装上の注意点」を参照）
 - ログは `%LOCALAPPDATA%\redntfy\logs\YYYY-MM-DD.log` へ出力する  
   `out/redntfy.exe` と Scoop 版は同じデータディレクトリを共有する。（置き場は「実装上の注意点」の永続化の項を参照）
@@ -44,11 +45,14 @@ HTTP・UI・音声は含まない。アプリ全体の動作確認は `out/rednt
 - 設定は `redntfy.toml` を読み、`redntfy.local.toml` が同名キーをキー単位で上書きする  
   ホットリロードはせず、変更反映には再起動が必要。
   採否はキーの有無だけで決める（`loadConfig` の `findNode`）。local にキーがあれば値の型が合わなくても base の値は使わず、ログを残して既定値（schedule は全時間帯で 1 時間に 1 回、他の配列は空）になる。（local の不正値で黙って base を拾わないため）
+  ファイル間の上書きの例外として、api_key は環境変数 `REDMINE_API_KEY` が空でなければ両ファイルより優先する。
 
 - `[redmine]` の url が不正、または api_key が空（キー不在を含む）の場合、終了せず無効モードで常駐する  
+  api_key が空かどうかは、環境変数 `REDMINE_API_KEY` を適用した後の値で判定する。
   無効モード：トレイが `app-disable.ico`、tooltip が原因別の案内文言、「今すぐ更新」非活性、一覧なし、ポーリングなし。復帰は再起動のみ。
   起動時の静的検証は url 不正と api_key 空の 2 分岐で、どちらも `redntfy.local.toml` 不在ならテンプレートを自動生成して設定ファイルを開き、セットアップガイド（GitHub Pages）をブラウザで開く。
   ポーリング中の HTTP 401（api_key 無効）と、query_ids 設定時の 404（query_ids 無効）は確定的な設定不備として無効モードへ遷移する（`enterDisabledMode`）。401 は `<url>/my/account`、404 は `<url>/issues` を開く。
+  401 の tooltip と Toast は、api_key の取得元（環境変数か設定ファイルか、`Config::apiKeyFromEnv`）に合わせて、環境変数 `REDMINE_API_KEY` と設定ファイルの api_key のどちらを直すかを案内する。
   フォールバックモードの 404 は通常の接続エラー扱い。
 
 - query_ids 空はフォールバックモードとして正常動作する（ゼロ設定起動：url と api_key だけで使える）  

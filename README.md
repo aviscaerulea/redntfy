@@ -87,6 +87,7 @@ Windows へのスタートアップ登録は、削除の前にトレイメニュ
 
 設定は `redntfy.exe` と同じフォルダの `redntfy.toml` に記載します。
 `redntfy.local.toml` に書いたキーは、`redntfy.toml` の同じキーを上書きします。
+API アクセスキーは環境変数 `REDMINE_API_KEY` にも設定でき、設定ファイルの `api_key` より優先します。
 
 接続先、通知の対象、ポーリングの頻度、一覧の見た目などを変えられます。
 各項目の説明は `redntfy.toml` のコメントを参照してください。

@@ -499,7 +499,8 @@ static constexpr int FALLBACK_QUERY_ID = 0;
 struct Config {
     // [redmine] 接続設定（url・api_key は必須。いずれか欠けると無効モードで常駐する）
     std::wstring redmineUrl;       // Redmine の URL（末尾スラッシュを除去して保持する）
-    std::wstring apiKey;           // 個人 API アクセスキー
+    std::wstring apiKey;           // 個人 API アクセスキー（環境変数 REDMINE_API_KEY が設定ファイルより優先）
+    bool apiKeyFromEnv = false;    // apiKey を環境変数から採ったか（無効モードの案内文言の切り替えに使う）
     // 追跡対象のグローバル保存クエリ id（省略可。設定の記述順を保持し std::set にしない）
     // 先頭要素は「代表クエリ」で、複数件 Toast と一覧フッタから開く URL に使う。
     // 空のときはフォールバックモードとして、自分（と所属グループ）が担当のチケットを追跡する。
@@ -1674,7 +1675,23 @@ static std::optional<std::vector<int>> readSchedule(const toml::array* arr) {
     return sched;
 }
 
+// api_key を上書きする環境変数の名前
+static constexpr wchar_t API_KEY_ENV_VAR[] = L"REDMINE_API_KEY";
+
+// 環境変数の値を返す（未設定・空・取得失敗はいずれも空文字列）
+static std::wstring readEnvVar(const wchar_t* name) {
+    DWORD size = GetEnvironmentVariableW(name, nullptr, 0);  // 終端 NUL を含む必要サイズ
+    if (size == 0) return {};
+    std::wstring value(size, L'\0');
+    DWORD len = GetEnvironmentVariableW(name, value.data(), size);
+    if (len == 0 || len >= size) return {};  // 2 回の呼び出しの間に値が変わった場合も空扱い
+    value.resize(len);
+    return value;
+}
+
 // redntfy.toml と redntfy.local.toml を読み込んで Config を構築する
+//
+// api_key だけは環境変数 REDMINE_API_KEY が両ファイルより優先する。（起動時に 1 回だけ読む）
 //
 // local.toml のキーが優先。（キー単位でオーバーライド）
 // 配列は「local にキーが存在するか」で採否を決める。（空配列でも local を採用）
@@ -1759,7 +1776,13 @@ static Config loadConfig(const std::wstring& exeDir) {
     cfg.redmineUrl = readString("redmine", "url");
     while (!cfg.redmineUrl.empty() && cfg.redmineUrl.back() == L'/')
         cfg.redmineUrl.pop_back();  // 末尾スラッシュを除去して URL 連結を単純化する
-    cfg.apiKey  = readString("redmine", "api_key");
+    // api_key は環境変数 REDMINE_API_KEY が空でなければそちらを優先する。
+    // （空の環境変数は未設定とみなして設定ファイルの値を使う）
+    // ログには取得元だけを残し、値は書かない。
+    cfg.apiKey = readEnvVar(API_KEY_ENV_VAR);
+    cfg.apiKeyFromEnv = !cfg.apiKey.empty();
+    if (cfg.apiKeyFromEnv) writeLog("config: api_key taken from environment variable REDMINE_API_KEY");
+    else cfg.apiKey = readString("redmine", "api_key");
     // register_project は識別子の文字列、または数値 id の整数。
     // 整数は 10 進文字列に変換して識別子と同じ扱いにする。（Redmine の API はどちらも受ける。
     // 整数を黙って無視すると、ログイン名由来の別プロジェクトへ登録されるため）
@@ -4024,7 +4047,11 @@ static void updateTrayTooltip(HWND hWnd) {
         std::wstring dtip;
         switch (disabledReason()) {
         case DisabledReason::InvalidUrl:      dtip = L"設定ファイルの url を確認してください"; break;
-        case DisabledReason::InvalidApiKey:   dtip = L"設定ファイルの api_key を確認してください"; break;
+        // api_key を環境変数から採ったときは、無効なキーの在りかである環境変数を案内する
+        case DisabledReason::InvalidApiKey:
+            dtip = g_currentConfig.apiKeyFromEnv ? L"環境変数 REDMINE_API_KEY を確認してください"
+                                                 : L"設定ファイルの api_key を確認してください";
+            break;
         default:                              dtip = L"設定ファイルの query_ids を確認してください"; break;
         }
         auto dnid = makeTrayNid(hWnd);
@@ -7525,6 +7552,7 @@ static void ensureLocalTomlTemplate(const std::wstring& exeDir) {
         "# Redmine 接続設定（url と api_key は必須）\n"
         "# url       ：Redmine の URL（http:// または https:// で始まる）\n"
         "# api_key   ：Redmine の「個人設定」→「API アクセスキー」で取得した値\n"
+        "#             環境変数 REDMINE_API_KEY に値があれば、そちらを優先する。\n"
         "# query_ids ：プロジェクトを指定せずに保存したグローバル保存クエリの id を配列で指定する。\n"
         "#             省略時は自分（と所属グループ）が担当のオープンチケットを対象にする。\n"
         "[redmine]\n"
@@ -7580,8 +7608,10 @@ static void enterDisabledMode(HWND hWnd, DisabledReason reason,
     else if (reason == DisabledReason::InvalidApiKey) {
         std::wstring accountUrl = cfg.redmineUrl + L"/my/account";
         ShellExecuteW(nullptr, L"open", accountUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        // 環境変数のキーは設定ファイルより優先するため、環境変数から採ったときは環境変数の修正を案内する
         showToast3(L"認証エラー",
-                   L"Redmine の API アクセスキーを api_key に設定してください",
+                   cfg.apiKeyFromEnv ? L"Redmine の API アクセスキーを環境変数 REDMINE_API_KEY に設定してください"
+                                     : L"Redmine の API アクセスキーを api_key に設定してください",
                    L"設定後は redntfy を再起動してください", L"");
     }
     else {
@@ -8739,7 +8769,7 @@ int wmain() {
             initReason = DisabledReason::InvalidUrl;
         }
         else if (cfg.apiKey.empty()) {
-            writeLog("config error: [redmine] api_key is empty - disabled mode");
+            writeLog("config error: [redmine] api_key is empty and REDMINE_API_KEY is not set - disabled mode");
             initReason = DisabledReason::InvalidApiKey;
         }
         // query_ids 省略はフォールバックモード（担当チケット追跡）として正常動作する
