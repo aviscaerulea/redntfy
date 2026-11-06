@@ -94,7 +94,7 @@ See the comments in `redntfy.toml` for each item.
 
 ## Limitations
 
-- Changes to the configuration file take effect only after a restart
+- Changes to the configuration files or the environment variable take effect only after a restart
 - Only global custom queries, which do not belong to a project, can be used to choose the notified tickets
 - If the connection settings are wrong, the app stops notifications and shows how to fix them on the tray icon
 
